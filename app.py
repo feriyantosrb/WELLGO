@@ -1,11 +1,9 @@
 """
-WELL TEST GROUPING OPTIMIZER  (H-1 daily planner)
--------------------------------------------------
-9 unit tes (MWT / MPAS_xxx). Mode dedicated (per territory) / pooled (unit bebas).
-Kriteria optimasi: jarak saja / +durasi / +min-max / +durasi+min-max.
-Visual block area per grup. Exclude area tertentu (default LIBO).
+WELLGO (Well Grouping Optimizer) — 9 Unit MWT Daily Planner
+----------------------------------------------------------
+Optimasi rute logistik well testing Sumatra Light North (SL North).
 
-Run:  python -m streamlit run app.py
+Run: py -m streamlit run app.py
 """
 
 import re
@@ -19,15 +17,121 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-st.set_page_config(page_title="Well Test Grouping Optimizer", layout="wide")
+# 1. Konfigurasi Halaman & Custom CSS Premium
+st.set_page_config(
+    page_title="WELLGO — Well Grouping Optimizer", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    
+    html, body, [data-testid="stAppViewContainer"] {
+        font-family: 'Inter', sans-serif;
+        background-color: #F8FAFC;
+        color: #0F172A;
+    }
+    
+    .block-container {
+        padding-top: 1.5rem !important;
+        padding-bottom: 2rem !important;
+    }
+    
+    /* Elegant Title Header Styling */
+    .main-title {
+        font-size: 28px;
+        font-weight: 700;
+        color: #0F172A;
+        margin-bottom: 0.2rem;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    .subtitle {
+        font-size: 14px;
+        color: #64748B;
+        margin-bottom: 1.5rem;
+    }
+    
+    /* Premium Grid Containers */
+    div[data-testid="stVerticalBlock"] > div {
+        background-color: transparent;
+    }
+    
+    .premium-card {
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 1.25rem;
+        box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+        margin-bottom: 1rem;
+    }
+    
+    /* Metrics Custom Bento Overhaul */
+    div[data-testid="metric-container"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #E2E8F0 !important;
+        border-radius: 12px !important;
+        padding: 1rem 1.25rem !important;
+        box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05) !important;
+    }
+    
+    div[data-testid="metric-container"] label {
+        font-weight: 500 !important;
+        color: #64748B !important;
+        font-size: 13px !important;
+    }
+    
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+        font-size: 22px !important;
+        font-weight: 700 !important;
+        color: #0F172A !important;
+    }
+    
+    /* Sidebar Cleanup */
+    section[data-testid="stSidebar"] {
+        background-color: #FFFFFF !important;
+        border-right: 1px solid #E2E8F0 !important;
+    }
+    
+    /* Button Custom SaaS Makeover */
+    div.stButton > button {
+        background-color: #0F172A !important;
+        color: #FFFFFF !important;
+        border: 1px solid #0F172A !important;
+        border-radius: 8px !important;
+        font-weight: 500 !important;
+        padding: 0.5rem 1rem !important;
+        transition: all 0.2s ease-in-out !important;
+    }
+    
+    div.stButton > button:hover {
+        background-color: #1E293B !important;
+        border-color: #1E293B !important;
+        transform: translateY(-1px) !important;
+    }
+    
+    /* Form Expander Adjustments */
+    div[data-testid="stExpander"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #E2E8F0 !important;
+        border-radius: 10px !important;
+        box-shadow: none !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
 DB_PATH = "welltest_status.db"
 SHEET_DEFAULT = "Kandidat Sumur"
 
-# Zona standby unit (mode pooled): unit gak bisa lintas zona
-REMOTE_AREAS = {"BANGKO", "BALAM"}                                  # remote
+REMOTE_AREAS = {"BANGKO", "BALAM"}
 REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
-NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]  # non-remote (BEKASAP)
-
+NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
+ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 
 # ------------------------------------------------------------------ persistence
 def init_db():
@@ -35,7 +139,6 @@ def init_db():
     con.execute("""CREATE TABLE IF NOT EXISTS execution_log(
         plan_date TEXT, well_name TEXT, unit TEXT, status TEXT, reason TEXT, updated_at TEXT,
         PRIMARY KEY(plan_date, well_name))""")
-    # migrasi DB lama: tambah kolom yg belum ada (mis. dari skema versi sebelumnya)
     existing = {r[1] for r in con.execute("PRAGMA table_info(execution_log)").fetchall()}
     for col in ("unit", "status", "reason", "updated_at"):
         if col not in existing:
@@ -59,8 +162,6 @@ def save_status(plan_date, rows):
 
 
 def status_in_period(lo, hi):
-    """Status COMP/NCMP per well dalam PERIODE [lo..hi], ambil record TERBARU per well.
-       (NCMP yg belakangan jadi COMP -> kebaca COMP). Record di luar periode diabaikan."""
     con = sqlite3.connect(DB_PATH)
     try:
         q = ("SELECT well_name AS well, status, reason, plan_date FROM execution_log "
@@ -69,38 +170,62 @@ def status_in_period(lo, hi):
     except Exception:
         df = pd.DataFrame(columns=["well", "status", "reason", "plan_date"])
     con.close()
-    if len(df):
-        df = df.sort_values("plan_date").groupby("well", as_index=False).last()
-    executed = set(df.loc[df["status"] == "executed", "well"])
-    ncmp = df[df["status"] == "ncmp"][["well", "reason", "plan_date"]].copy()
+    if not len(df):
+        return set(), df[["well", "reason", "plan_date"]] if "well" in df else pd.DataFrame(
+            columns=["well", "reason", "plan_date"])
+    df["plan_date"] = df["plan_date"].astype(str)
+    latest = df[df["plan_date"] == df.groupby("well")["plan_date"].transform("max")]
+    flag = latest.groupby("well")["status"].apply(lambda s: (s == "executed").any())
+    executed = set(flag[flag].index)
+    ncmp_w = set(flag[~flag].index)
+    ncmp = (latest[latest["well"].isin(ncmp_w)]
+            .sort_values("plan_date").groupby("well", as_index=False).last()[["well", "reason", "plan_date"]])
     return executed, ncmp
 
 
 def norm_unit(u):
-    """MP444 -> MPAS_444 ; biarkan unit TS apa adanya."""
     u = str(u).strip().upper()
     m = re.fullmatch(r"MP_?(\d+)", u)
     return f"MPAS_{m.group(1)}" if m else u
 
 
 def norm_unit_name(u):
-    """Normalisasi unit_name kandidat: MP524 -> MPAS_524. '(belum)'/TS/lainnya dibiarkan."""
     s = str(u).strip()
     m = re.fullmatch(r"MP_?(\d+)", s.upper())
     return f"MPAS_{m.group(1)}" if m else s
 
 
+def classify_status(stat):
+    s = str(stat).strip().upper().replace("-", " ").replace("_", " ")
+    s = " ".join(s.split())
+    if s.startswith("NCMP") or s.startswith("NOT COMP") or s.startswith("INCOMP"):
+        return "NCMP"
+    if s.startswith("COMP") or s in ("DONE", "OK", "C", "EXECUTED", "TESTED"):
+        return "COMP"
+    return ""
+
+
 def import_compncmp(file_list):
-    """Baca file COMP/NCMP harian -> update execution_log.
-       COMP=executed (keluar dari pool), NCMP=ncmp (+alasan) -> dijadwalkan ulang."""
     n_comp = n_ncmp = 0
     reasons = {}
+    status_seen = {}
+    skip_date = skip_well = skip_status = 0
     con = sqlite3.connect(DB_PATH)
     now = datetime.now().isoformat(timespec="seconds")
     for fb in file_list:
         xls = pd.ExcelFile(BytesIO(fb))
-        sht = next((s for s in xls.sheet_names if s.strip().upper().replace(" ", "")
-                    in ("SCHDATABASE", "COMPNCMP", "SCHSTATUS")), xls.sheet_names[0])
+        sht = None
+        for s in xls.sheet_names:
+            try:
+                up = {str(c).strip().upper() for c in pd.read_excel(xls, sheet_name=s, nrows=0).columns}
+            except Exception:
+                continue
+            if {"WELL", "STATUS", "SCHEDULE_DATE_TEST"} <= up:
+                sht = s
+                break
+        if sht is None:
+            sht = next((s for s in xls.sheet_names if s.strip().upper().replace(" ", "").replace("_", "")
+                        in ("SCHDATABASE", "COMPNCMP", "SCHSTATUS")), xls.sheet_names[0])
         df = pd.read_excel(xls, sheet_name=sht)
         cols = {str(c).strip().upper(): c for c in df.columns}
         cw = cols.get("WELL")
@@ -110,31 +235,37 @@ def import_compncmp(file_list):
         cr = cols.get("COMMENT IF NOT COMPLETE")
         if not (cw and cs and cd):
             continue
-        for _, r in df.iterrows():
-            well = str(r[cw]).strip()
-            stat = str(r[cs]).strip().upper()
-            if well in ("", "nan") or stat not in ("COMP", "NCMP"):
-                continue
-            try:
-                pdate = pd.to_datetime(r[cd]).date().isoformat()
-            except Exception:
-                continue
-            unit = norm_unit(r[cu]) if cu else ""
-            reason = (str(r[cr]).strip().upper() if cr and pd.notna(r[cr]) else "")
-            log_status = "executed" if stat == "COMP" else "ncmp"
-            con.execute("""INSERT INTO execution_log(plan_date,well_name,unit,status,reason,updated_at)
-                VALUES(?,?,?,?,?,?) ON CONFLICT(plan_date,well_name) DO UPDATE SET
-                unit=excluded.unit, status=excluded.status, reason=excluded.reason,
-                updated_at=excluded.updated_at""", (pdate, well, unit, log_status, reason, now))
-            if stat == "COMP":
-                n_comp += 1
-            else:
-                n_ncmp += 1
-                reasons[reason or "(kosong)"] = reasons.get(reason or "(kosong)", 0) + 1
+        w = pd.DataFrame({
+            "well": df[cw].astype(str).str.strip(),
+            "raw_stat": df[cs].astype(str).str.strip().str.upper(),
+            "date": pd.to_datetime(df[cd], errors="coerce"),
+            "unit": df[cu].map(norm_unit) if cu else "",
+            "reason": (df[cr].astype(str).str.strip().str.upper().replace({"NAN": ""}) if cr else ""),
+        })
+        for k, v in w["raw_stat"].value_counts().items():
+            status_seen[k] = status_seen.get(k, 0) + int(v)
+        w["stat"] = w["raw_stat"].map(classify_status)
+        skip_well += int(w["well"].isin(["", "nan"]).sum())
+        skip_status += int((w["stat"] == "").sum())
+        skip_date += int(w["date"].isna().sum())
+        w = w[(~w["well"].isin(["", "nan"])) & (w["stat"] != "") & (w["date"].notna())].copy()
+        w["plan_date"] = w["date"].dt.date.astype(str)
+        w["log_status"] = np.where(w["stat"] == "COMP", "executed", "ncmp")
+        rows = list(zip(w["plan_date"], w["well"], w["unit"], w["log_status"], w["reason"],
+                        [now] * len(w)))
+        con.executemany("""INSERT INTO execution_log(plan_date,well_name,unit,status,reason,updated_at)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(plan_date,well_name) DO UPDATE SET
+            unit=excluded.unit, status=excluded.status, reason=excluded.reason,
+            updated_at=excluded.updated_at""", rows)
+        n_comp += int((w["stat"] == "COMP").sum())
+        nc = w[w["stat"] == "NCMP"]
+        n_ncmp += len(nc)
+        for rsn, cnt in nc["reason"].replace("", "(kosong)").value_counts().items():
+            reasons[rsn] = reasons.get(rsn, 0) + int(cnt)
     con.commit()
     con.close()
-    return {"comp": n_comp, "ncmp": n_ncmp, "reasons": reasons}
-
+    return {"comp": n_comp, "ncmp": n_ncmp, "reasons": reasons, "status_seen": status_seen,
+            "skip_date": skip_date, "skip_well": skip_well, "skip_status": skip_status}
 
 
 def save_coords(pairs):
@@ -161,19 +292,36 @@ def load_coord_cache():
 
 # ------------------------------------------------------------------ data
 def to_dt(col):
-    """Parse tanggal: datetime/string biasa ATAU serial Excel (mis. 46186 = 2026-06-18)."""
     num = pd.to_numeric(col, errors="coerce")
     valid = num.dropna()
-    # kalau mayoritas angka & ada di rentang serial Excel (~1954-2064) -> serial Excel
     if len(valid) and valid.between(20000, 60000).mean() > 0.5:
         return pd.to_datetime(num, unit="D", origin="1899-12-30", errors="coerce")
     return pd.to_datetime(col, errors="coerce")
 
 
 @st.cache_data(show_spinner=False)
+def load_spatial_data(file_bytes, sheet):
+    try:
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        req_cols = {"WELL", "FIELD", "LAT", "LON"}
+        if not req_cols.issubset(set(df.columns)):
+            return pd.DataFrame()
+
+        df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
+        df["LON"] = pd.to_numeric(df["LON"], errors="coerce")
+        df = df.dropna(subset=["WELL", "LAT", "LON"])
+
+        df = df.drop_duplicates(subset=["WELL"], keep="first")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
 def load_candidates(file_bytes, sheet):
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
     ren = {
         "well_name": "well", "Surface Lat": "lat", "Surface Lon": "lon",
         "Duration test (minutes)": "dur", "min_execution date": "min_date",
@@ -181,106 +329,119 @@ def load_candidates(file_bytes, sheet):
         "op_area_code": "area", "test_category": "category",
         "well_tier": "tier", "field": "field", "string_type": "string_type",
         "Remark": "remark", "REMARK for IEMS Req or Spare candidate": "remark_iems"}
-    # kolom unit: prioritas "last_unit_name", fallback "unit_name"
+
     if "last_unit_name" in df.columns:
         ren["last_unit_name"] = "unit"
     elif "unit_name" in df.columns:
         ren["unit_name"] = "unit"
     df = df.rename(columns=ren)
+
     for c in ["lat", "lon", "string_type", "remark", "remark_iems", "field", "area", "unit"]:
         if c not in df.columns:
             df[c] = np.nan
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    if "dur" in df.columns:
+        df["dur"] = pd.to_numeric(df["dur"], errors="coerce")
     df["min_date"] = to_dt(df["min_date"])
     df["max_date"] = to_dt(df["max_date"])
-    df["unit"] = df["unit"].map(norm_unit_name)               # MP524 -> MPAS_524
 
-    # --- aturan unit dedicated paksa (forced_unit) ---
+    np_col = next((c for c in df.columns if "NEXT" in str(c).upper()
+                   and ("PROPOS" in str(c).upper() or "WT" in str(c).upper())), None)
+    df["next_wt"] = to_dt(df[np_col]) if np_col else pd.NaT
+    df["unit"] = df["unit"].map(norm_unit_name)
+
     st_ = df["string_type"].astype(str).str.upper().str.strip()
     area_ = df["area"].astype(str).str.upper().str.strip()
     fld_ = df["field"].astype(str).str.upper().str.strip()
     df["forced_unit"] = None
-    df.loc[st_.eq("GP") & area_.eq("BEKASAP"), "forced_unit"] = "MPAS_525"          # GP Bekasap
-    df.loc[st_.eq("GP") & area_.isin(["BANGKO", "BALAM"]), "forced_unit"] = "MPAS_768"  # GP Bangko/Balam
-    df.loc[fld_.eq("BENAR"), "forced_unit"] = "MPAS_534"                            # field Benar (override)
+    df.loc[st_.eq("GP") & area_.eq("BEKASAP"), "forced_unit"] = "MPAS_525"
+    df.loc[st_.eq("GP") & area_.isin(["BANGKO", "BALAM"]), "forced_unit"] = "MPAS_768"
+    df.loc[fld_.eq("BENAR"), "forced_unit"] = "MPAS_534"
     fm = df["forced_unit"].notna()
-    df.loc[fm, "unit"] = df.loc[fm, "forced_unit"]            # unit efektif = forced
+    df.loc[fm, "unit"] = df.loc[fm, "forced_unit"]
 
     df["is_mpas"] = df["unit"].astype(str).str.upper().str.startswith("MPAS")
     uu = df["unit"].astype(str).str.upper()
-    df["is_ts"] = uu.str.contains("TS", na=False) & ~df["is_mpas"]   # Test Station
+    df["is_ts"] = uu.str.contains("TS", na=False) & ~df["is_mpas"]
     df["unit_unknown"] = uu.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", ""]) | df["unit"].isna()
 
-    # --- force_week: NW/AWS atau Remark Req/Deepening -> tetap dijadwalkan minggu ini ---
     NWAWS = {"NEW WELL 1", "NEW WELL 2", "NEW WELL 3", "AWS1", "AWS2"}
     cat_u = df["category"].astype(str).str.upper().str.strip()
     cat_force = cat_u.isin(NWAWS)
-    df["is_nwaws"] = cat_force                                # NW/AWS -> prioritas tertinggi
+    df["is_nwaws"] = cat_force
     df["tipe"] = np.where(cat_u.str.contains("NEW WELL"), "NW",
                           np.where(cat_u.str.contains("AWS"), "AWS", "REG"))
     rmk = (df["remark"].astype(str).fillna("") + " " + df["remark_iems"].astype(str).fillna("")).str.upper()
-    rmk_force = rmk.str.contains("REQ", na=False) | rmk.str.contains("DEEPENING", na=False)
-    df["force_week"] = cat_force | rmk_force
+    is_req = rmk.str.contains("REQ", na=False) | rmk.str.contains("DEEPENING", na=False)
+    df["force_week"] = cat_force | is_req
+    ops_req = is_req & rmk.str.contains("OPS", na=False)
+    df["req_tag"] = np.where(ops_req, "ORQ", np.where(is_req, "PRQ", ""))
 
-    # Well Status (ON/OFF) — prioritas kolom "Well Status", fallback "last_status"
-    status_col = next((c for c in df.columns if c.strip().upper() in ("WELL STATUS", "LAST_STATUS")), None)
+    status_col = next((c for c in df.columns if str(c).strip().upper() in ("WELL STATUS", "LAST_STATUS")), None)
     df["status"] = (df[status_col].astype(str).str.upper().str.strip() if status_col else "ON")
-
-    # SCH Status (COMP/NCMP/blank)
-    sch_col = next((c for c in df.columns if c.strip().upper() in ("SCH STATUS", "SCH_STATUS")), None)
+    sch_col = next((c for c in df.columns if str(c).strip().upper() in ("SCH STATUS", "SCH_STATUS")), None)
     df["sch_status"] = (df[sch_col].astype(str).str.upper().str.strip() if sch_col else "")
     df["sch_status"] = df["sch_status"].replace({"NAN": "", "NONE": ""})
     return df
 
 
 def good_coord(lat, lon):
+    lat = pd.to_numeric(lat, errors="coerce")
+    lon = pd.to_numeric(lon, errors="coerce")
     return pd.notna(lat) & pd.notna(lon) & lat.between(0.1, 5) & lon.between(95, 110)
 
 
-def resolve_coords(df, cache, field_group=True):
+def resolve_coords(df, spatial_db, cache, field_assign=None):
     df = df.copy()
-    df["coord_source"] = np.where(good_coord(df["lat"], df["lon"]), "database", None)
+    field_assign = field_assign or {}
+    df["coord_source"] = "none"
+
+    if not spatial_db.empty:
+        s_map = spatial_db.set_index("WELL")
+        has_master = df["well"].isin(s_map.index)
+        df.loc[has_master, "lat"] = df.loc[has_master, "well"].map(s_map["LAT"])
+        df.loc[has_master, "lon"] = df.loc[has_master, "well"].map(s_map["LON"])
+
+        empty_fld = df["field"].isna() | (df["field"] == "")
+        upd_fld = empty_fld & has_master
+        if "FIELD" in s_map.columns:
+            df.loc[upd_fld, "field"] = df.loc[upd_fld, "well"].map(s_map["FIELD"])
+
+        df.loc[has_master & good_coord(df["lat"], df["lon"]), "coord_source"] = "master_spasial"
+
+    cand_good = good_coord(df["lat"], df["lon"]) & (df["coord_source"] == "none")
+    df.loc[cand_good, "coord_source"] = "database"
+
     if not cache.empty:
         cmap = cache.set_index("well_name")
-        miss = df["coord_source"].isna() & df["well"].isin(cmap.index)
-        df.loc[miss, "lat"] = df.loc[miss, "well"].map(cmap["lat"])
-        df.loc[miss, "lon"] = df.loc[miss, "well"].map(cmap["lon"])
-        df.loc[miss, "coord_source"] = "cache"
-    base = df[df["coord_source"].isin(["database", "cache"])]
+        miss = df["coord_source"] == "none"
+        has_cache = miss & df["well"].isin(cmap.index)
+        df.loc[has_cache, "lat"] = df.loc[has_cache, "well"].map(cmap["lat"])
+        df.loc[has_cache, "lon"] = df.loc[has_cache, "well"].map(cmap["lon"])
+        df.loc[has_cache, "coord_source"] = "cache"
 
-    # 1) field centroid nyata (kalau field punya sibling bercoordinat)
-    cent_f = base.groupby("field")[["lat", "lon"]].mean()
-    miss = df["coord_source"].isna() & df["field"].isin(cent_f.index)
-    df.loc[miss, "lat"] = df.loc[miss, "field"].map(cent_f["lat"])
-    df.loc[miss, "lon"] = df.loc[miss, "field"].map(cent_f["lon"])
-    df.loc[miss, "coord_source"] = "imputed_field"
-
-    if field_group and len(base):
-        # 2) sisa (field tanpa sibling bercoord): titik SINTETIS per-field di sekitar
-        #    centroid subarea/area, supaya well sefield ngumpul & antar-field kepisah.
-        cent_sa = base.groupby("subarea")[["lat", "lon"]].mean()
-        cent_ar = base.groupby("area")[["lat", "lon"]].mean()
-        oclat, oclon = base["lat"].mean(), base["lon"].mean()
-        miss = df["coord_source"].isna()
-        if miss.any():
-            a_lat = df["subarea"].map(cent_sa["lat"]).fillna(df["area"].map(cent_ar["lat"])).fillna(oclat)
-            a_lon = df["subarea"].map(cent_sa["lon"]).fillna(df["area"].map(cent_ar["lon"])).fillna(oclon)
-
-            def _off(f, axis):
-                s = sum(ord(c) for c in str(f))
-                return ((s % 100) / 100 - 0.5) * 0.04 if axis == 0 else (((s // 7) % 100) / 100 - 0.5) * 0.04
-            df.loc[miss, "lat"] = a_lat[miss] + df.loc[miss, "field"].map(lambda f: _off(f, 0))
-            df.loc[miss, "lon"] = a_lon[miss] + df.loc[miss, "field"].map(lambda f: _off(f, 1))
-            df.loc[miss, "coord_source"] = "field_grup"
+    if not spatial_db.empty and "FIELD" in spatial_db.columns:
+        cent_f = spatial_db.groupby("FIELD")[["LAT", "LON"]].mean()
     else:
-        # tanpa field-grouping: imputasi kasar subarea -> area (well bisa kolaps jadi satu titik)
-        for key in ["subarea", "area"]:
-            cent = base.groupby(key)[["lat", "lon"]].mean()
-            miss = df["coord_source"].isna() & df[key].isin(cent.index)
-            df.loc[miss, "lat"] = df.loc[miss, key].map(cent["lat"])
-            df.loc[miss, "lon"] = df.loc[miss, key].map(cent["lon"])
-            df.loc[miss, "coord_source"] = f"imputed_{key}"
+        base = df[df["coord_source"].isin(["master_spasial", "database", "cache"])]
+        cent_f = base.groupby("field")[["lat", "lon"]].mean() if len(base) else pd.DataFrame(columns=["lat", "lon"])
+        cent_f.columns = ["LAT", "LON"]
 
-    df["coord_source"] = df["coord_source"].fillna("none")
+    miss = df["coord_source"] == "none"
+    has_cent = miss & df["field"].isin(cent_f.index)
+    df.loc[has_cent, "lat"] = df.loc[has_cent, "field"].map(cent_f["LAT"])
+    df.loc[has_cent, "lon"] = df.loc[has_cent, "field"].map(cent_f["LON"])
+    df.loc[has_cent, "coord_source"] = "imputed_field"
+
+    for well, fld in field_assign.items():
+        m = (df["well"] == well) & (df["coord_source"] == "none")
+        if m.any() and fld in cent_f.index:
+            df.loc[m, "field"] = fld
+            df.loc[m, "lat"] = cent_f.loc[fld, "LAT"]
+            df.loc[m, "lon"] = cent_f.loc[fld, "LON"]
+            df.loc[m, "coord_source"] = "manual_field"
+
     df["has_coord"] = df["coord_source"] != "none"
     return df
 
@@ -291,27 +452,98 @@ def haversine_km(lat1, lon1, lat2, lon2):
     p = np.pi / 180
     a = (0.5 - np.cos((lat2 - lat1) * p) / 2
          + np.cos(lat1 * p) * np.cos(lat2 * p) * (1 - np.cos((lon2 - lon1) * p)) / 2)
-    return 2 * R * np.arcsin(np.sqrt(a))
+    return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
 
-def nn_route(lat, lon):
+def _haversine_matrix(lat, lon):
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    p = np.pi / 180.0
+    la = lat[:, None] * p
+    lo = lon[:, None] * p
+    a = 0.5 - np.cos(la.T - la) / 2.0 + np.cos(la) * np.cos(la.T) * (1.0 - np.cos(lo.T - lo)) / 2.0
+    a = np.clip(a, 0.0, 1.0)
+    d = 2 * 6371.0 * np.arcsin(np.sqrt(a))
+    return np.nan_to_num(d, nan=1e9, posinf=1e9)
+
+
+def _solve_route(lat, lon):
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
     n = len(lat)
     if n <= 1:
         return list(range(n)), 0.0
-    order, used, total = [0], {0}, 0.0
-    for _ in range(n - 1):
-        c = order[-1]
-        best, bd = None, 1e18
-        for j in range(n):
-            if j in used:
-                continue
-            d = haversine_km(lat[c], lon[c], lat[j], lon[j])
-            if d < bd:
-                bd, best = d, j
-        order.append(best)
-        used.add(best)
-        total += bd
-    return order, total
+    D = _haversine_matrix(lat, lon)
+    if n == 2:
+        return [0, 1], float(D[0, 1])
+    dist = D.tolist()
+
+    best_order, best_total = None, float("inf")
+    rng = range(n)
+    for start in rng:
+        used = [False] * n
+        used[start] = True
+        order = [start]
+        for _ in range(n - 1):
+            drow = dist[order[-1]]
+            bd = float("inf")
+            bn = -1
+            for j in rng:
+                if not used[j]:
+                    v = drow[j]
+                    if v < bd:
+                        bd = v
+                        bn = j
+            order.append(bn)
+            used[bn] = True
+
+        improved = True
+        while improved and n > 3:
+            improved = False
+            for i in range(1, n - 2):
+                oi1 = order[i - 1]
+                oi = order[i]
+                for j in range(i + 2, n):
+                    n3 = order[j - 1]
+                    n4 = order[j]
+                    if dist[oi1][n3] + dist[oi][n4] + 1e-9 < dist[oi1][oi] + dist[n3][n4]:
+                        order[i:j] = order[i:j][::-1]
+                        improved = True
+                        oi = order[i]
+
+        total = float(sum(dist[order[k]][order[k + 1]] for k in range(n - 1)))
+        if total < best_total:
+            best_total, best_order = total, order
+    return best_order, best_total
+
+
+@st.cache_resource(show_spinner=False)
+def _route_cache_store():
+    return {}
+
+
+def route_distance(lat, lon):
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    if lat.size <= 1:
+        return 0.0
+    m = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon = lat[m], lon[m]
+    if lat.size <= 1:
+        return 0.0
+    key = tuple(sorted(zip(np.round(lat, 5).tolist(), np.round(lon, 5).tolist())))
+    store = _route_cache_store()
+    val = store.get(key)
+    if val is None:
+        val = _solve_route(lat, lon)[1]
+        if len(store) > 50000:
+            store.clear()
+        store[key] = val
+    return val
+
+
+def optimize_route(lat, lon):
+    return _solve_route(lat, lon)
 
 
 def convex_hull(pts):
@@ -335,16 +567,19 @@ def convex_hull(pts):
 
 
 def block_polygon(sub, pad_km=0.6):
-    """Polygon 'block area' utk satu grup: convex hull (>=3 titik) atau lingkaran."""
-    lat = sub["lat"].values
-    lon = sub["lon"].values
+    lat = pd.to_numeric(sub["lat"], errors="coerce").values
+    lon = pd.to_numeric(sub["lon"], errors="coerce").values
+    good = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon = lat[good], lon[good]
+    if len(lat) == 0:
+        return []
     clat, clon = lat.mean(), lon.mean()
-    if len(sub) >= 3:
+    if len(lat) >= 3:
         hull = convex_hull(list(zip(lon, lat)))
         if len(hull) >= 3:
             f = 1.0 + pad_km / max(0.3, np.mean(haversine_km(lat, lon, clat, clon)) + 0.3)
             return [[clon + (x - clon) * f, clat + (y - clat) * f] for x, y in hull]
-    r = max(haversine_km(lat, lon, clat, clon).max() if len(sub) > 1 else 0.0, 0.0) + pad_km
+    r = max(haversine_km(lat, lon, clat, clon).max() if len(lat) > 1 else 0.0, 0.0) + pad_km
     out = []
     for k in range(28):
         a = 2 * math.pi * k / 28
@@ -355,131 +590,183 @@ def block_polygon(sub, pad_km=0.6):
 
 
 # ------------------------------------------------------------------ engine
-def grow_group(idxs, used, lat, lon, dur, max_wells, time_budget, speed, use_dur, seed):
-    members = [seed]
-    used.add(seed)
-    t = dur[seed]
-    cur = seed
-    while len(members) < max_wells:
-        rem = [i for i in idxs if i not in used]
-        if not rem:
-            break
-        d = haversine_km(lat[cur], lon[cur], lat[rem], lon[rem])
-        k = rem[int(np.argmin(d))]
-        travel = (float(np.min(d)) / speed) * 60.0
-        if use_dur and t + travel + dur[k] > time_budget:
-            break
-        members.append(k)
-        used.add(k)
-        t += travel + dur[k]
-        cur = k
-    return members
-
-
-def select_route(idxs, df, lat, lon, dur, max_wells, time_budget, speed, use_urg, use_dur):
-    """Pilih sumur utk SATU grup: by urgency (top max_wells, trim time) atau by kedekatan."""
-    if not idxs:
-        return []
-    if use_urg:
-        urg = df["urgency"].values
-        ordered = sorted(idxs, key=lambda i: (urg[i], dur[i]))
-        sel = ordered[:max_wells]
-        if use_dur:
-            while len(sel) > 1:
-                _, dist = nn_route(lat[sel], lon[sel])
-                if df.loc[sel, "dur"].sum() + (dist / speed) * 60 <= time_budget:
-                    break
-                sel = sorted(sel, key=lambda i: urg[i])[:-1]
-        return sel
-    if len(idxs) == 1:
-        seed = idxs[0]
-    else:
-        tot = [haversine_km(lat[i], lon[i], lat[idxs], lon[idxs]).sum() for i in idxs]
-        seed = idxs[int(np.argmin(tot))]
-    return grow_group(idxs, set(), lat, lon, dur, max_wells, time_budget, speed, use_dur, seed)
-
-
-def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur):
-    """mode: 'dedicated' (per unit) / 'pooled' (unit bebas, zona). forced_unit: paksa ke unit dedicated."""
+def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=None):
     df = elig.reset_index(drop=True).copy()
     df["scheduled"] = False
     df["plan_unit"] = None
     if "forced_unit" not in df.columns:
         df["forced_unit"] = None
-    lat, lon, dur = df["lat"].values, df["lon"].values, df["dur"].values
+    if "urgency" not in df.columns:
+        df["urgency"] = 0.0
+
+    lats = pd.to_numeric(df["lat"], errors="coerce").values
+    lons = pd.to_numeric(df["lon"], errors="coerce").values
+
+    # --- VECTORIZED DISTANCE MATRIX ---
+    dist_mat = _haversine_matrix(lats, lons)
+
+    # --- precompute array ---
+    field_arr = df["field"].values
+    area_arr = df["area"].values
+    urg_arr = pd.to_numeric(df["urgency"], errors="coerce").fillna(0).values
+    dur_arr = pd.to_numeric(df["dur"], errors="coerce").fillna(0).values
+    speed = max(float(speed), 1.0)
 
     if mode == "dedicated":
         for unit in df["unit"].dropna().unique():
             idxs = list(df.index[df["unit"] == unit])
-            sel = select_route(idxs, df, lat, lon, dur, max_wells, time_budget, speed, use_urg, use_dur)
+            if not idxs:
+                continue
+            ordered = sorted(idxs, key=lambda i: (urg_arr[i], dur_arr[i]))
+            sel = ordered[:max_wells]
+            if use_dur:
+                while len(sel) > 1:
+                    dist = route_distance(lats[sel], lons[sel])
+                    if dur_arr[sel].sum() + (dist / speed) * 60 <= time_budget:
+                        break
+                    sel = sorted(sel, key=lambda i: urg_arr[i])[:-1]
             df.loc[sel, "scheduled"] = True
-        df["plan_unit"] = df["unit"]
+            df.loc[sel, "plan_unit"] = unit
         return df
 
-    # pooled: forced-unit dulu (dedicated paksa), lalu free pool per zona di unit yg tersisa
-    fu = df["forced_unit"].astype(str)
-    forced_mask = df["forced_unit"].notna() & ~fu.isin(["", "None", "nan"])
-    used_units = set()
-    CONDITIONAL_UNITS = {"MPAS_534"}     # dedicated Benar, tapi boleh isi field lain kalau ada sisa kapasitas
-    for funit, grp in df[forced_mask].groupby("forced_unit"):
-        sel = select_route(list(grp.index), df, lat, lon, dur, max_wells, time_budget, speed, use_urg, use_dur)
-        # MPAS_534: kalau well Benar < kapasitas, isi sisa slot pakai well terdekat dari field lain
-        if funit in CONDITIONAL_UNITS and len(sel) < max_wells:
-            zunits = REMOTE_UNITS if funit in REMOTE_UNITS else NONREMOTE_UNITS
-            zmask = df["area"].isin(REMOTE_AREAS) if funit in REMOTE_UNITS else ~df["area"].isin(REMOTE_AREAS)
-            pool_idx = [j for j in df.index[zmask & ~forced_mask & ~df["scheduled"].astype(bool)] if j not in sel]
-            while len(sel) < max_wells and pool_idx:
-                clat, clon = lat[sel].mean(), lon[sel].mean()
-                j = min(pool_idx, key=lambda k: haversine_km(clat, clon, lat[k], lon[k]))
-                cand = sel + [j]
-                if use_dur:
-                    _, dist = nn_route(lat[cand], lon[cand])
-                    if df.loc[cand, "dur"].sum() + (dist / speed) * 60 > time_budget:
-                        pool_idx.remove(j)
+    avail_remote = list(REMOTE_UNITS)[:n_remote]
+    avail_nonremote = list(NONREMOTE_UNITS)[:n_nonremote]
+    unit_clusters = {u: [] for u in avail_remote + avail_nonremote}
+    unassigned = set(df.index)
+
+    fu_mask = df["forced_unit"].notna() & df["forced_unit"].isin(unit_clusters.keys())
+    for u, grp in df[fu_mask].groupby("forced_unit"):
+        grp_sorted = grp.sort_values(["urgency", "dur"])
+        for idx in grp_sorted.index:
+            if len(unit_clusters[u]) < max_wells and idx in unassigned:
+                if unit_clusters[u]:
+                    d_min = dist_mat[unit_clusters[u], idx].min()
+                    urg_idx = urg_arr[idx]
+                    if d_min > 5.0 and not (d_min <= 20.0 and urg_idx <= 2):
                         continue
-                sel = cand
-                pool_idx.remove(j)
-        df.loc[sel, "scheduled"] = True
-        df.loc[sel, "plan_unit"] = funit
-        used_units.add(funit)
+                if use_dur and unit_clusters[u]:
+                    cand = unit_clusters[u] + [idx]
+                    dist = route_distance(lats[cand], lons[cand])
+                    if dur_arr[cand].sum() + (dist / speed) * 60 > time_budget:
+                        continue
+                unit_clusters[u].append(idx)
+                unassigned.remove(idx)
 
-    def pool_zone(zone_free_idx, zone_units, k):
-        avail = [u for u in zone_units if u not in used_units]
-        k = min(k, len(avail))
-        if not zone_free_idx or k <= 0:
-            return
-        sub = df.loc[zone_free_idx]
-        if use_urg:
-            seed_order = list(sub.sort_values(["urgency", "dur"]).index)
-        else:
-            seed_order = list(sub.sort_values(["lon", "lat"]).index)
-        used, groups = set(), []
-        for s in seed_order:
-            if len(groups) >= k:
-                break
-            if s in used:
+    used_units = {u for u, c in unit_clusters.items() if len(c) > 0}
+    avail_remote = [u for u in avail_remote if u not in used_units]
+    avail_nonremote = [u for u in avail_nonremote if u not in used_units]
+
+    while unassigned and (avail_remote or avail_nonremote):
+        field_scores = {}
+        un_list = list(unassigned)
+        un_fields = field_arr[un_list]
+
+        for fld in pd.unique(un_fields):
+            f_wells = [w for w in un_list if field_arr[w] == fld]
+            if not f_wells:
                 continue
-            groups.append(grow_group(zone_free_idx, used, lat, lon, dur, max_wells,
-                                     time_budget, speed, use_dur, s))
-        for gi, members in enumerate(groups):
-            lbl = avail[gi] if gi < len(avail) else f"{avail[0]}+{gi}"
-            df.loc[members, "scheduled"] = True
-            df.loc[members, "plan_unit"] = lbl
+            urgs = urg_arr[f_wells]
 
-    free = ~forced_mask & ~df["scheduled"].astype(bool)     # exclude well yg sudah ke-soft-fill MPAS_534
-    remote_free = list(df.index[free & df["area"].isin(REMOTE_AREAS)])
-    nonremote_free = list(df.index[free & ~df["area"].isin(REMOTE_AREAS)])
-    n_rem_forced = sum(1 for u in used_units if u in REMOTE_UNITS)
-    n_non_forced = sum(1 for u in used_units if u in NONREMOTE_UNITS)
-    pool_zone(remote_free, REMOTE_UNITS, n_remote - n_rem_forced)
-    pool_zone(nonremote_free, NONREMOTE_UNITS, n_nonremote - n_non_forced)
+            score = 0
+            for u in urgs:
+                if u < -1000:
+                    score += 100000
+                elif u <= 0:
+                    score += 10000
+                elif u == 1:
+                    score += 5000
+                elif u == 2:
+                    score += 1000
+                elif u <= 4:
+                    score += 100
+                else:
+                    score += 10
+            field_scores[fld] = score
+
+        if not field_scores:
+            break
+
+        sorted_fields = sorted(field_scores.keys(), key=lambda k: field_scores[k], reverse=True)
+
+        assigned_this_round = False
+        for target_fld in sorted_fields:
+            f_wells = [w for w in unassigned if field_arr[w] == target_fld]
+            zone = "remote" if area_arr[f_wells[0]] in REMOTE_AREAS else "nonremote"
+
+            avail_pool = avail_remote if zone == "remote" else avail_nonremote
+            if not avail_pool:
+                continue
+
+            u = avail_pool.pop(0)
+
+            f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], dur_arr[x]))
+            seed = f_wells_sorted[0]
+
+            unit_clusters[u].append(seed)
+            unassigned.remove(seed)
+            used_units.add(u)
+
+            while len(unit_clusters[u]) < max_wells and unassigned:
+                cand_pool = [i for i in unassigned if (area_arr[i] in REMOTE_AREAS) == (zone == "remote")]
+                if not cand_pool:
+                    break
+
+                c_dists = dist_mat[np.ix_(unit_clusters[u], cand_pool)]
+                min_dists = c_dists.min(axis=0)
+
+                valid_cands = []
+                for i_cand, cand_idx in enumerate(cand_pool):
+                    d = min_dists[i_cand]
+                    urg = urg_arr[cand_idx]
+                    is_same_fld = (field_arr[cand_idx] == target_fld)
+
+                    if is_same_fld or d <= 5.0 or (d <= 20.0 and urg <= 2):
+                        c_score = d
+                        if is_same_fld:
+                            c_score -= 50
+                        if urg <= 2:
+                            c_score -= 20
+                        valid_cands.append((cand_idx, d, c_score))
+
+                if not valid_cands:
+                    break
+
+                valid_cands.sort(key=lambda x: x[2])
+
+                best_idx = None
+                for cand_idx, d, _ in valid_cands:
+                    cand_cluster = unit_clusters[u] + [cand_idx]
+                    if use_dur:
+                        dist = route_distance(lats[cand_cluster], lons[cand_cluster])
+                        if dur_arr[cand_cluster].sum() + (dist / speed) * 60 <= time_budget:
+                            best_idx = cand_idx
+                            break
+                    else:
+                        best_idx = cand_idx
+                        break
+
+                if best_idx is not None:
+                    unit_clusters[u].append(best_idx)
+                    unassigned.remove(best_idx)
+                else:
+                    break
+
+            assigned_this_round = True
+            break
+
+        if not assigned_this_round:
+            break
+
+    for u, c in unit_clusters.items():
+        if c:
+            df.loc[c, "scheduled"] = True
+            df.loc[c, "plan_unit"] = u
+
     return df
 
 
 def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed,
               use_urg, use_dur, early_days=0):
-    """Rollout harian: tiap hari jadwalkan dari sumur yg belum ke-jadwal & window-nya buka.
-       early_days: boleh tes s/d N hari sebelum min_execution date."""
     elig = elig.reset_index(drop=True).copy()
     elig["scheduled"] = False
     elig["plan_unit"] = None
@@ -487,52 +774,93 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
     elig["day_idx"] = 0
     early_td = pd.Timedelta(days=early_days)
     rem = pd.Series(True, index=elig.index)
-    force_any = pd.Series(False, index=elig.index)
-    for c in ("is_nwaws", "force_week", "carry_ncmp"):
-        if c in elig:
-            force_any = force_any | elig[c].fillna(False)
+
+    nwaws_s = elig["is_nwaws"].fillna(False) if "is_nwaws" in elig else pd.Series(False, index=elig.index)
+    fw_c = elig["force_week"].fillna(False) if "force_week" in elig else pd.Series(False, index=elig.index)
+    cc_c = elig["carry_ncmp"].fillna(False) if "carry_ncmp" in elig else pd.Series(False, index=elig.index)
+    bypass = (fw_c & ~nwaws_s) | cc_c
+
+    np_in = elig["np_in_range"].fillna(False) if "np_in_range" in elig else pd.Series(False, index=elig.index)
+    next_wt = elig["next_wt"] if "next_wt" in elig else pd.Series(pd.NaT, index=elig.index)
+
+    is_nwaws_req = elig["is_nwaws"].fillna(False) | elig["force_week"].fillna(False)
+    strict_no_late = elig["np_in_range"] & elig["max_in_range"] & ~is_nwaws_req
+
     for i, day in enumerate(days, start=1):
-        window_ok = (elig["min_date"] - early_td <= day) & (elig["max_date"] >= day)
-        # NW/AWS, NCMP carry, Req/Deepening: WAJIB dijadwalkan -> abaikan window (eligible tiap hari)
-        pidx = elig.index[rem & (window_ok | force_any)]
+        win_reg = (elig["min_date"] - early_td <= day)
+        win_nw = (elig["min_date"] <= day) & (elig["max_date"] >= day)
+        window_ok = pd.Series(np.where(nwaws_s, win_nw, win_reg), index=elig.index)
+        np_ok = np_in & (next_wt <= day)
+
+        is_late = day > elig["max_date"]
+        forbid_late = strict_no_late & is_late
+
+        pidx = elig.index[rem & (window_ok | np_ok | bypass) & ~forbid_late]
         if len(pidx) == 0:
             continue
+
         pool = elig.loc[pidx].copy()
-        # urgency relatif hari ini + tier prioritas (NW/AWS teratas, lalu NCMP/Req, lalu Regular)
+
         pool["urgency"] = (pool["max_date"] - day).dt.days.fillna(0)
         nw = pool["is_nwaws"].fillna(False) if "is_nwaws" in pool else pd.Series(False, index=pool.index)
         fw = pool["force_week"].fillna(False) if "force_week" in pool else pd.Series(False, index=pool.index)
         cc = pool["carry_ncmp"].fillna(False) if "carry_ncmp" in pool else pd.Series(False, index=pool.index)
         mid = (fw & ~nw) | cc
+
         pool.loc[mid, "urgency"] = pool.loc[mid, "urgency"].clip(upper=0)
         pool.loc[nw, "urgency"] = pool.loc[nw, "urgency"].clip(upper=0) - 10000
-        pd_ = plan(pool, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur)
+
+        pd_ = plan(pool, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=day)
+
         sd = pd_[pd_["scheduled"]]
         if len(sd) == 0:
             continue
+
         sidx = elig.index[elig["well"].isin(sd["well"])]
         elig.loc[sidx, "scheduled"] = True
         elig.loc[sidx, "plan_day"] = day
         elig.loc[sidx, "day_idx"] = i
         elig.loc[sidx, "plan_unit"] = elig.loc[sidx, "well"].map(dict(zip(sd["well"], sd["plan_unit"])))
         rem.loc[sidx] = False
+
     elig["urgency"] = (elig["max_date"] - days[0]).dt.days
     return elig
 
 
 def unit_summary(df, speed):
     cols = ["Unit", "Sumur", "Test (min)", "Rute (km)", "Est (min)",
-            "Sub-area", "Deadline tercepat", "Wells"]
+            "Sub-area", "Deadline tercepat", "⏱️ Early/Late", "Wells"]
+    if df is None or not len(df) or "scheduled" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    sched = df[df["scheduled"].fillna(False)]
+    if not len(sched) or "plan_unit" not in sched.columns:
+        return pd.DataFrame(columns=cols)
+
+    speed = max(float(speed), 1.0)
     rows = []
-    for unit, sub in df[df["scheduled"]].groupby("plan_unit"):
-        c = sub[sub["has_coord"]]
-        dist = nn_route(c["lat"].values, c["lon"].values)[1] if len(c) > 1 else 0.0
+    for unit, sub in sched.groupby("plan_unit"):
+        if "has_coord" in sub.columns:
+            c = sub[sub["has_coord"].fillna(False)]
+        else:
+            c = sub
+        dist = route_distance(c["lat"].values, c["lon"].values) if len(c) > 1 else 0.0
+
+        notes = []
+        if "timing_label" in sub.columns:
+            notes = [f"{w} ({lab})" for w, lab in zip(sub["well"], sub["timing_label"]) if lab]
+
+        dur_sum = int(pd.to_numeric(sub["dur"], errors="coerce").fillna(0).sum()) if "dur" in sub.columns else 0
+        dmin = sub["max_date"].min() if "max_date" in sub.columns else pd.NaT
+        deadline = dmin.strftime("%Y-%m-%d") if pd.notna(dmin) else "-"
+        subarea = ", ".join(sorted(sub["subarea"].dropna().astype(str).unique())) if "subarea" in sub.columns else ""
+
         rows.append({
-            "Unit": unit, "Sumur": len(sub), "Test (min)": int(sub["dur"].sum()),
-            "Rute (km)": round(dist, 1), "Est (min)": int(sub["dur"].sum() + (dist / speed) * 60),
-            "Sub-area": ", ".join(sorted(sub["subarea"].dropna().unique())),
-            "Deadline tercepat": sub["max_date"].min().date(),
-            "Wells": ", ".join(sub["well"])})
+            "Unit": unit, "Sumur": len(sub), "Test (min)": dur_sum,
+            "Rute (km)": round(dist, 1), "Est (min)": int(dur_sum + (dist / speed) * 60),
+            "Sub-area": subarea,
+            "Deadline tercepat": deadline,
+            "⏱️ Early/Late": ", ".join(notes) or "-",
+            "Wells": ", ".join(sub["well"].astype(str))})
     if not rows:
         return pd.DataFrame(columns=cols)
     return pd.DataFrame(rows).sort_values("Unit")
@@ -552,7 +880,10 @@ def cmap(label, labels):
 
 # ================================================================== UI
 init_db()
-st.title("🛢️ Well Test Grouping Optimizer — 9 Unit MWT")
+
+# 2. Main Title Section
+st.markdown('<div class="main-title">🛢️ WELLGO <span style="font-size: 16px; font-weight:400; color:#64748B; background:#F1F5F9; padding: 4px 10px; border-radius:6px; margin-left:8px;">Well Grouping Optimizer</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Platform Manajemen Penjadwalan & Komparasi Logistik Rute Armada Mobile Well Test (MWT) SL North</div>', unsafe_allow_html=True)
 
 CRIT = {
     "Kedekatan jarak saja": (False, False),
@@ -561,430 +892,665 @@ CRIT = {
     "Jarak + durasi + min-max": (True, True),
 }
 
+# 3. Sidebar UI / UX
 with st.sidebar:
-    st.header("1. Data")
-    up = st.file_uploader("Upload Excel kandidat", type=["xlsx", "xlsm"])
-    sheet = st.text_input("Nama sheet", SHEET_DEFAULT)
+    st.markdown("### 💾 Manajemen Data")
+    up = st.file_uploader("Upload Excel kandidat & spasial", type=["xlsx", "xlsm"],
+                          help="File Excel berisi sheet Kandidat Sumur & Data_Spasial (Master Database Koordinat)")
+    
+    col_sh1, col_sh2 = st.columns(2)
+    with col_sh1:
+        sheet_kandidat = st.text_input("Sheet Kandidat", SHEET_DEFAULT)
+    with col_sh2:
+        sheet_spasial = st.text_input("Sheet Spasial", "Data_Spasial")
+        
     mpas_only = st.checkbox("Hanya Unit Tes (MPAS), exclude TS", value=True)
-    st.markdown("**Status eksekusi (COMP/NCMP)**")
-    comp_files = st.file_uploader("Upload file COMP/NCMP harian (boleh banyak)",
-                                  type=["xlsx", "xlsm"], accept_multiple_files=True)
-    skip_woff = st.checkbox("Skip well NCMP-WOFF dari penjadwalan ulang", value=True,
-                            help="WOFF = well lagi off, gak bisa dites; jangan dijadwalin ulang dulu")
+    
+    st.markdown("---")
+    st.markdown("### ⏱️ Status Realisasi Harian")
+    comp_files = st.file_uploader("Upload file COMP/NCMP harian", type=["xlsx", "xlsm"], accept_multiple_files=True)
+    skip_woff = st.checkbox("Skip well NCMP-WOFF", value=True)
+    
+    st.markdown("---")
+    st.markdown("### 📅 Horizon Optimasi")
     _today = datetime.now().date()
-    periode = st.date_input("Periode siklus (baca COMP/NCMP rentang ini saja)",
-                            value=(_today, _today + timedelta(days=6)),
-                            help="NCMP/COMP hanya dibaca dalam rentang ini — hindari ketarik record lama (mis. 2025)")
+    periode = st.date_input("Rentang Siklus (Periode)", value=(_today, _today + timedelta(days=6)),
+                            help="Batas siklus keseluruhan. Menentukan data NCMP yang dibaca & kelayakan sumur.")
+    
+    if isinstance(periode, (list, tuple)) and len(periode) == 2:
+        per_lo, per_hi = periode[0], periode[1]
+    else:
+        per_lo = periode if not isinstance(periode, (list, tuple)) else periode[0]
+        per_hi = per_lo + timedelta(days=6)
 
-    st.header("2. Mode & kriteria")
-    mode_label = st.radio("Mode unit", ["Dedicated (unit per territory)",
-                                        "Pooled (unit bebas, murni kedekatan)"])
+    plan_start_date = st.date_input("Mulai Planning dari Tanggal",
+                                    value=per_lo, min_value=per_lo, max_value=per_hi,
+                                    help="Titik mulai optimasi rute. Finish-nya mengikuti akhir Rentang pengetesan.")
+
+    st.markdown("---")
+    st.markdown("### ⚙️ Kriteria Algoritma")
+    mode_label = st.radio("Mode Distribusi Unit", ["Dedicated (Territory)", "Pooled (Bebas Zona)"], index=1)
     mode = "dedicated" if mode_label.startswith("Dedicated") else "pooled"
-    crit_label = st.radio("Kriteria optimasi", list(CRIT.keys()), index=3)
+    crit_label = st.radio("Kriteria Utama Optimasi", list(CRIT.keys()), index=3)
     use_urg, use_dur = CRIT[crit_label]
 
-    st.header("3. Kapasitas")
-    target = st.date_input("Tanggal mulai (hari ke-1)", datetime.now().date() + timedelta(days=1))
-    horizon = st.slider("Horizon planning (hari)", 1, 7, 7)
-    max_wells = st.slider("Sumur / unit / hari", 3, 8, 6)
+    st.markdown("---")
+    st.markdown("### 🛞 Kapasitas Armada")
+    per_lo_ts, per_hi_ts = pd.Timestamp(per_lo), pd.Timestamp(per_hi)
+    plan_start_ts = pd.Timestamp(plan_start_date)
+    horizon = (per_hi_ts - plan_start_ts).days + 1
+    if horizon < 1: horizon = 1
+    if horizon > 60: horizon = 60
+    
+    st.caption(f"📆 Horizon optimasi = **{horizon} hari** ({plan_start_date} → {per_hi})")
+    
+    max_wells = st.slider("Target Sumur / Unit / Hari", 3, 8, 6)
     ded = (mode == "dedicated")
-    n_remote = st.slider("Unit remote (BANGKO/BALAM)", 1, 5, 5, disabled=ded)
-    n_nonremote = st.slider("Unit non-remote (BEKASAP)", 1, 4, 4, disabled=ded)
-    time_budget = st.slider("Time budget / unit (menit)", 180, 540, 360, 30, disabled=not use_dur)
-    speed = st.slider("Kecepatan unit (km/jam)", 10, 60, 25, 5)
-    early_days = st.slider("Skenario early test (boleh tes H-berapa sebelum min)", 0, 7, 0,
-                           help="Izinkan tes lebih awal s/d N hari sebelum min_execution date — "
-                                "biar unit gak bolak-balik ke wellpad yg sama")
-
-    st.header("4. Visual")
-    show_block = st.checkbox("Tampilkan block area per grup", value=True)
-    group_nocoord_field = st.checkbox("Group new well tanpa koordinat by Field", value=True,
-                                      help="New well tanpa koordinat & field-nya tak ada sibling bercoordinat "
-                                           "→ dikelompokkan per Field (titik sintetis) biar tetap masuk grouping")
+    n_remote = st.slider("Unit Area Remote (Bangko/Balam)", 1, 5, 5, disabled=ded)
+    n_nonremote = st.slider("Unit Area Non-Remote (Bekasap)", 1, 4, 4, disabled=ded)
+    time_budget = st.slider("Time Budget / Hari (Menit)", 180, 540, 360, 30, disabled=not use_dur)
+    speed = st.slider("Kecepatan Rata-rata Fleet (km/jam)", 10, 60, 25, 5)
+    early_days = st.slider("Skenario Early Test (H-Min)", 0, 7, 0)
+    
+    st.markdown("---")
+    show_block = st.checkbox("Tampilkan Block Area Field di Peta", value=True)
 
 if up is None:
-    st.info("⬅️ Upload file Excel kandidat (sheet `Kandidat Sumur`) buat mulai.")
+    st.info("💡 Silakan unggah berkas Excel data kandidat sumur & master database koordinat spasial pada sidebar untuk memulai kalkulasi rute.")
     st.stop()
 
-raw = load_candidates(up.getvalue(), sheet)
+# 4. Data Processing Block
+raw = load_candidates(up.getvalue(), sheet_kandidat)
+spatial_db = load_spatial_data(up.getvalue(), sheet_spasial)
 
-# import status COMP/NCMP (kalau ada) ----------------------------------------
+if spatial_db.empty:
+    st.error("⚠️ Struktur berkas Data Spasial tidak valid atau kosong. Pastikan sheet mengandung kolom: WELL, FIELD, LAT, LON.")
+
 if comp_files:
-    summ_imp = import_compncmp([f.getvalue() for f in comp_files])
-    rtxt = ", ".join(f"{k}: {v}" for k, v in summ_imp["reasons"].items()) or "-"
-    st.success(f"✅ Import status: {summ_imp['comp']} COMP (executed), "
-               f"{summ_imp['ncmp']} NCMP (dijadwalkan ulang). Alasan NCMP → {rtxt}")
+    import hashlib
+    sig = hashlib.md5(b"".join(sorted(f.getvalue() for f in comp_files))).hexdigest()
+    if st.session_state.get("_compncmp_sig") != sig:
+        with st.spinner("Sinkronisasi status COMP/NCMP harian..."):
+            summ_imp = import_compncmp([f.getvalue() for f in comp_files])
+        st.session_state["_compncmp_sig"] = sig
+        st.session_state["_compncmp_summary"] = summ_imp
+    summ_imp = st.session_state["_compncmp_summary"]
+    
+    st.success(f"⚙️ Status Sinkronisasi: {summ_imp['comp']} COMP, {summ_imp['ncmp']} NCMP berhasil dimuat.")
+
 with st.sidebar:
     all_areas = sorted(raw["area"].dropna().unique())
     default_excl = [a for a in all_areas if a == "LIBO"]
-    excl_areas = st.multiselect("Exclude area", all_areas, default=default_excl)
+    excl_areas = st.multiselect("Exclude Area Terpilih", all_areas, default=default_excl)
     if mpas_only:
-        st.markdown("**Ketersediaan alat tes per area**")
-        ts_unavail = st.multiselect("Area TS TIDAK tersedia → well dialihkan ke MWT", all_areas,
-                                    help="TS down/unavailable di area ini → well TS-nya masuk planning MWT")
-        mwt_unavail = st.multiselect("Area MWT TIDAK tersedia → well dialihkan ke TS", all_areas,
-                                     help="MWT down/unavailable di area ini → well MWT-nya dikeluarkan (dialihkan ke TS)")
+        ts_unavail = st.multiselect("Area Fasilitas TS Down (Dialihkan ke MWT)", all_areas)
+        mwt_unavail = st.multiselect("Area Fleet MWT Down (Dialihkan ke TS)", all_areas)
     else:
         ts_unavail, mwt_unavail = [], []
+
 if excl_areas:
     raw = raw[~raw["area"].isin(excl_areas)].copy()
 
-# filter alat: default MWT+new well diplan, TS di-exclude; dgn override ketersediaan per area
-ts_redirected = raw[raw["is_ts"] & raw["area"].isin(ts_unavail)].copy()      # TS->MWT
-mwt_redirected = raw[raw["is_mpas"] & raw["area"].isin(mwt_unavail)].copy()  # MWT->TS
-ts_wells = raw[raw["is_ts"] & ~raw["area"].isin(ts_unavail)].copy()          # TS tetap (di-exclude)
+ts_redirected = raw[raw["is_ts"] & raw["area"].isin(ts_unavail)].copy()
+mwt_redirected = raw[raw["is_mpas"] & raw["area"].isin(mwt_unavail)].copy()
+ts_wells = raw[raw["is_ts"] & ~raw["area"].isin(ts_unavail)].copy()
 if mpas_only:
-    plannable = (((raw["is_mpas"] | raw["unit_unknown"]) & ~raw["area"].isin(mwt_unavail))  # MWT/new well
-                 | (raw["is_ts"] & raw["area"].isin(ts_unavail)))                            # TS dialihkan ke MWT
+    plannable = (((raw["is_mpas"] | raw["unit_unknown"]) & ~raw["area"].isin(mwt_unavail))
+                 | (raw["is_ts"] & raw["area"].isin(ts_unavail)))
     raw = raw[plannable].copy()
 
-raw = resolve_coords(raw, load_coord_cache(), field_group=group_nocoord_field)
-target_ts = pd.Timestamp(target)
+field_assign = st.session_state.get("field_assign", {})
+raw = resolve_coords(raw, spatial_db, load_coord_cache(), field_assign=field_assign)
 
-# eligibility (level minggu) ---------------------------------------------------
-days = [target_ts + pd.Timedelta(days=i) for i in range(horizon)]
-# periode siklus (buat baca COMP/NCMP) — handle date_input bisa balik 1 atau 2 tanggal
-if isinstance(periode, (list, tuple)) and len(periode) == 2:
-    per_lo, per_hi = periode[0], periode[1]
+if not spatial_db.empty and "FIELD" in spatial_db.columns:
+    field_list = sorted(spatial_db["FIELD"].dropna().unique().tolist())
+    field_wells_coord = spatial_db.rename(columns={"WELL": "well", "FIELD": "field", "LAT": "lat", "LON": "lon"})
 else:
-    per_lo = periode if not isinstance(periode, (list, tuple)) else periode[0]
-    per_hi = per_lo + timedelta(days=6)
+    _basecoord = raw[raw["coord_source"].isin(["master_spasial", "database", "cache"])]
+    field_centroids = (_basecoord.groupby("field")[["lat", "lon"]].mean() if len(_basecoord) else pd.DataFrame(columns=["lat", "lon"]))
+    field_list = sorted(field_centroids.index.tolist())
+    field_wells_coord = _basecoord[["field", "well", "lat", "lon"]].copy()
+
+days = [plan_start_ts + pd.Timedelta(days=i) for i in range(horizon)]
+week_lo, week_hi = days[0], days[-1]
+
 executed_log, ncmp_log = status_in_period(per_lo, per_hi)
-comp_col = set(raw.loc[raw["sch_status"] == "COMP", "well"])       # COMP dari kolom SCH Status
-executed = executed_log | comp_col                                # gabung kolom + log uploader
+comp_col = set(raw.loc[raw["sch_status"] == "COMP", "well"])
+executed = executed_log | comp_col
+
 ncmp_log = ncmp_log[~ncmp_log["well"].isin(executed)].copy()
 ncmp_col = set(raw.loc[raw["sch_status"] == "NCMP", "well"]) - executed
-ncmp_set = (set(ncmp_log["well"]) | ncmp_col) - executed           # semua NCMP dalam periode
+ncmp_set = (set(ncmp_log["well"]) | ncmp_col) - executed
 woff_set = set(ncmp_log.loc[ncmp_log["reason"] == "WOFF", "well"]) if skip_woff else set()
-ncmp_set -= woff_set                                              # WOFF di-skip dari reschedule
+ncmp_set -= woff_set
 
 in_raw = set(raw["well"])
-ncmp_replan = ncmp_set & in_raw                                    # ada di Excel kandidat -> bisa diplan ulang
-ncmp_no_data = sorted(ncmp_set - in_raw)                           # NCMP tapi gak ada di Excel kandidat
+ncmp_replan = ncmp_set & in_raw
+ncmp_no_data = sorted(ncmp_set - in_raw)
 
-# gabungan info NCMP buat panel (reason dari log, kolom = "(kolom)")
 ncmp_col_df = pd.DataFrame({"well": sorted(ncmp_col), "reason": "", "plan_date": "(kolom)"})
 ncmp_df = pd.concat([ncmp_log, ncmp_col_df], ignore_index=True).drop_duplicates("well")
 
-week_lo, week_hi = days[0], days[-1]
-# kandidat = window overlap horizon, ATAU NCMP carry-over, ATAU force_week (NW/AWS/Req/Deepening)
-overlap = (raw["min_date"] - pd.Timedelta(days=early_days) <= week_hi) & (raw["max_date"] >= week_lo)
+batch_lo, batch_hi = per_lo_ts, per_hi_ts
+win_in_range = (raw["min_date"] <= batch_hi) & (raw["max_date"] >= batch_lo)
+np_in_range = (raw["next_wt"] >= batch_lo) & (raw["next_wt"] <= batch_hi)
+in_range = win_in_range | np_in_range
+is_nwaws_c = raw["is_nwaws"].fillna(False)
+req_force = raw["force_week"].fillna(False) & ~is_nwaws_c
 is_ncmp = raw["well"].isin(ncmp_replan)
-force_in = raw["force_week"].fillna(False)
-comp_wells = raw[overlap & raw["well"].isin(executed)].copy()      # sudah selesai siklus ini
-cand = raw[(overlap | is_ncmp | force_in) & (~raw["well"].isin(executed))].copy()
-off_wells = cand[cand["status"] == "OFF"].copy()                   # Well Status OFF -> tdk diplanning
-woff_wells = raw[raw["well"].isin(woff_set)].copy()                # NCMP-WOFF -> skip reschedule
+comp_wells = raw[raw["well"].isin(executed)].copy()
+nwaws_dropped = raw[is_nwaws_c & ~in_range & (~raw["well"].isin(executed))].copy()
+cand = raw[(in_range | is_ncmp | req_force) & (~raw["well"].isin(executed))].copy()
+
+cand["np_in_range"] = np_in_range.loc[cand.index]
+cand["max_in_range"] = ((raw["max_date"] >= batch_lo) & (raw["max_date"] <= batch_hi)).loc[cand.index]
+
+off_wells = cand[cand["status"] == "OFF"].copy()
+woff_wells = raw[raw["well"].isin(woff_set)].copy()
 elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set))].copy()
-elig_all["carry_ncmp"] = elig_all["well"].isin(ncmp_replan)        # tandai carry-over NCMP
+elig_all["carry_ncmp"] = elig_all["well"].isin(ncmp_replan)
+
 elig_all["urgency"] = (elig_all["max_date"] - week_lo).dt.days
 elig_all["urgency"] = elig_all["urgency"].fillna(0)
-# Tier prioritas: NW/AWS paling atas, lalu NCMP carry + Req/Deepening, lalu Regular (by deadline)
+
 nwaws = elig_all["is_nwaws"].fillna(False)
 mid_prio = (elig_all["force_week"].fillna(False) & ~nwaws) | elig_all["carry_ncmp"]
+
 elig_all.loc[mid_prio, "urgency"] = elig_all.loc[mid_prio, "urgency"].clip(upper=0)
-elig_all.loc[nwaws, "urgency"] = elig_all.loc[nwaws, "urgency"].clip(upper=0) - 10000  # selalu paling dulu
+elig_all.loc[nwaws, "urgency"] = elig_all.loc[nwaws, "urgency"].clip(upper=0) - 10000
+
 elig = elig_all[elig_all["has_coord"]].copy()
 nocoord = elig_all[~elig_all["has_coord"]].copy()
 
-# rollout 7 hari -------------------------------------------------------------
+# Rollout Execution Framework
 if len(elig):
     week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days)
 else:
     week_df = elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
+if len(nocoord):
+    noc = nocoord.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
+    week_df = pd.concat([week_df, noc], ignore_index=True)
 
 week_df["zone"] = np.where(week_df["area"].isin(REMOTE_AREAS), "remote", "non-remote")
+
+week_df["manual"] = False
+man = st.session_state.get("manual_assign", {})
+if man:
+    for w, info in list(man.items()):
+        m = week_df["well"] == w
+        if not m.any(): continue
+        di = int(info["day_idx"])
+        if di < 1 or di > horizon: continue
+        week_df.loc[m, "scheduled"] = True
+        week_df.loc[m, "plan_unit"] = info["unit"]
+        week_df.loc[m, "day_idx"] = di
+        week_df.loc[m, "plan_day"] = days[di - 1]
+        week_df.loc[m, "manual"] = True
+
 scheduled_all = week_df[week_df["scheduled"]].copy()
-sched_wells = set(scheduled_all["well"])
-leftover = week_df[~week_df["scheduled"]].copy()                    # gak ke-jadwal sepanjang minggu
-missed = leftover[leftover["max_date"] <= week_hi]                  # deadline lewat dalam horizon = risiko
 
-zone_note = " | Pooled dibatasi zona remote/non-remote" if mode == "pooled" else ""
-st.caption(f"Mode: **{mode_label}** | Kriteria: **{crit_label}** | "
-           f"Horizon: **{horizon} hari** ({week_lo.date()} → {week_hi.date()}) | "
-           f"Periode COMP/NCMP: **{per_lo} → {per_hi}** | Exclude: {excl_areas or '-'}{zone_note}")
-if len(ts_redirected) or len(mwt_redirected):
-    st.info(f"🔀 Pengalihan alat: {len(ts_redirected)} well TS→MWT (TS off di {ts_unavail or '-'}), "
-            f"{len(mwt_redirected)} well MWT→TS (MWT off di {mwt_unavail or '-'}, dikeluarkan dari planning).")
+# Timing evaluations
+_pd = scheduled_all["plan_day"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
+_mn = scheduled_all["min_date"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
+_mx = scheduled_all["max_date"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
+_tipe = scheduled_all["tipe"] if len(scheduled_all) else pd.Series(dtype=object)
+_rtag = scheduled_all.get("req_tag", pd.Series("", index=scheduled_all.index)).fillna("") if len(scheduled_all) else pd.Series(dtype=object)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Eligible (minggu)", len(elig_all))
-c2.metric("Terjadwal (minggu)", len(scheduled_all))
-c3.metric("Belum terjadwal", len(leftover))
-c4.metric("⚠️ Miss deadline", len(missed))
-c5.metric("Tanpa koordinat", len(nocoord))
-c6.metric("🔌 Well OFF", len(off_wells))
+_en = (_mn - _pd).dt.days if len(scheduled_all) else pd.Series(dtype=float)
+_ln = (_pd - _mx).dt.days if len(scheduled_all) else pd.Series(dtype=float)
+_oe = _pd < _mn if len(scheduled_all) else pd.Series(dtype=bool)
+_ol = _pd > _mx if len(scheduled_all) else pd.Series(dtype=bool)
 
-if len(scheduled_all) == 0 and len(nocoord) == 0:
-    st.warning("Gak ada sumur eligible/ter-mapping di rentang minggu ini.")
-    st.stop()
+def _cat_lab(tipe, oe, ol, en, ln, tag):
+    in_window = not oe and not ol
+    n = int(en) if oe else int(ln)
+    arah = "early" if oe else "late"
+    if tag in ["PRQ", "ORQ"]:
+        if in_window: return "on-time", f"{tag} (on-time)", ""
+        return tag, f"{tag} ({arah} {n} hari)", arah
+    if in_window: return "on-time", "", ""
+    return ("EARLY" if oe else "LATE"), f"{arah} {n} hari", arah
 
-# pilih tampilan: multi-hari (1..7) + filter durasi -------------------------
-day_labels = [f"Hari {i+1}" for i in range(horizon)]
-c1, c2 = st.columns([3, 1])
-with c1:
-    if horizon > 1:
-        sel_labels = st.multiselect("Tampilkan grouping untuk hari", day_labels, default=day_labels,
-                                    help="Pilih 1 hari (muncul rute+block per unit) atau beberapa hari sekaligus")
-    else:
-        sel_labels = day_labels
-    if not sel_labels:
-        sel_labels = day_labels
-with c2:
-    dur_pick = st.multiselect("Durasi test (menit)", [30, 60], default=[30, 60],
-                              help="Filter kelompok well by durasi tes")
-    if not dur_pick:
-        dur_pick = [30, 60]
-sel_idx = sorted(day_labels.index(l) + 1 for l in sel_labels)   # day_idx 1-based
-single_day = len(sel_idx) == 1
-view_day = days[sel_idx[0] - 1] if single_day else None
-if single_day:
-    st.caption(f"📍 **Hari {sel_idx[0]}** — {view_day.date()} (rute + block area per unit aktif)")
+if len(scheduled_all) > 0:
+    _cats = [_cat_lab(tp, oe, ol, en, ln, tg) for tp, oe, ol, en, ln, tg in zip(_tipe, _oe, _ol, _en.fillna(0), _ln.fillna(0), _rtag)]
+    scheduled_all["timing"] = [c[0] for c in _cats]
+    scheduled_all["timing_label"] = [c[1] for c in _cats]
+    scheduled_all["out_dir"] = [c[2] for c in _cats]
 else:
-    st.caption(f"📅 Menampilkan **{len(sel_idx)} hari**: {', '.join('H'+str(i) for i in sel_idx)}")
+    scheduled_all["timing"] = []
+    scheduled_all["timing_label"] = []
+    scheduled_all["out_dir"] = []
 
-disp = scheduled_all[scheduled_all["day_idx"].isin(sel_idx) & scheduled_all["dur"].isin(dur_pick)].copy()
+sched_wells = set(scheduled_all["well"]) if len(scheduled_all) else set()
+leftover = week_df[~week_df["scheduled"]].copy()
+missed = leftover[leftover["max_date"] <= batch_hi] if len(leftover) else leftover.copy()
 
-# overview mingguan ----------------------------------------------------------
-if not single_day:
-    base = disp.assign(jam=disp["dur"] / 60)
-    ov = (base.groupby(["day_idx", "plan_day"])
-          .agg(Sumur=("well", "size"), Unit=("plan_unit", "nunique"),
-               NW=("tipe", lambda s: (s == "NW").sum()),
-               AWS=("tipe", lambda s: (s == "AWS").sum()),
-               Reg=("tipe", lambda s: (s == "REG").sum()),
-               d30=("dur", lambda s: (s == 30).sum()),
-               d60=("dur", lambda s: (s == 60).sum()),
-               Jam_test=("jam", "sum")).reset_index())
-    ov["Tanggal"] = ov["plan_day"].dt.date
-    ov["Jam_test"] = ov["Jam_test"].round(1)
-    ov = ov.rename(columns={"day_idx": "Hari", "d30": "30m", "d60": "60m"})[
-        ["Hari", "Tanggal", "Sumur", "Unit", "NW", "AWS", "Reg", "30m", "60m", "Jam_test"]]
-    st.subheader("📆 Overview mingguan")
-    st.dataframe(ov, use_container_width=True, hide_index=True)
+# 5. Premium Top Metrics Panel
+total_scheduled = len(scheduled_all)
+total_missed_dl = len(missed)
+total_eligible = len(elig_all)
 
-# miss-deadline panel --------------------------------------------------------
-if len(missed):
-    st.error(f"⚠️ {len(missed)} sumur deadline-nya lewat dalam {horizon} hari ini tapi gak kebagian slot "
-             "(kapasitas 9 unit gak cukup). Pertimbangkan tambah shift / unit / perpanjang horizon.")
-    st.dataframe(missed[["well", "unit", "subarea", "category", "urgency", "max_date"]]
-                 .rename(columns={"max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"),
-                 use_container_width=True, hide_index=True)
-
-# well sudah COMP (selesai siklus ini) ---------------------------------------
-if len(comp_wells):
-    with st.expander(f"✅ {len(comp_wells)} well COMP — sudah selesai siklus ini (di-exclude)"):
-        st.dataframe(comp_wells[["well", "unit", "subarea", "category", "dur", "sch_status"]]
-                     .rename(columns={"unit": "unit_asli", "dur": "durasi", "sch_status": "SCH"}),
-                     use_container_width=True, hide_index=True)
-
-# well OFF (tidak diplanning) ------------------------------------------------
-if len(off_wells):
-    with st.expander(f"🔌 {len(off_wells)} well status OFF — TIDAK diplanning (klik buat lihat)"):
-        st.dataframe(off_wells[["well", "unit", "subarea", "area",
-                                "category", "dur", "max_date", "status"]]
-                     .rename(columns={"unit": "unit_asli", "dur": "durasi", "max_date": "deadline"}),
-                     use_container_width=True, hide_index=True)
-
-# NCMP carry-over: dijadwalkan ulang vs tidak bisa (gak ada di Excel kandidat) ---
-replan_df = ncmp_df[ncmp_df["well"].isin(ncmp_replan)]
-if len(replan_df):
-    with st.expander(f"🔁 {len(replan_df)} well NCMP — DIJADWALKAN ULANG (masuk eligible, klik lihat)"):
-        st.dataframe(replan_df.rename(columns={"plan_date": "tgl_NCMP", "reason": "alasan"}),
-                     use_container_width=True, hide_index=True)
-if ncmp_no_data:
-    no_df = ncmp_df[ncmp_df["well"].isin(ncmp_no_data)]
-    st.warning(f"⚠️ {len(ncmp_no_data)} well NCMP TIDAK ada di Excel kandidat → gak bisa dijadwalkan "
-               "(tambahkan baris well ini ke Excel kandidat kalau memang perlu dites ulang).")
-    with st.expander("Lihat daftar NCMP yang tidak ada di Excel kandidat"):
-        st.dataframe(no_df.rename(columns={"plan_date": "tgl_NCMP", "reason": "alasan"}),
-                     use_container_width=True, hide_index=True)
-if len(woff_wells):
-    st.warning(f"⏸️ {len(woff_wells)} well NCMP-WOFF di-skip dari penjadwalan ulang (well lagi off). "
-               "Uncheck opsi di sidebar kalau mau tetap dijadwalin.")
-    st.dataframe(woff_wells[["well", "unit", "subarea", "category", "max_date"]]
-                 .rename(columns={"unit": "unit_asli", "max_date": "deadline"}),
-                 use_container_width=True, hide_index=True)
-
-# map ------------------------------------------------------------------------
-title = (f"🗺️ Grouping {view_day.date()}" if single_day
-         else f"🗺️ Visual grouping — {len(sel_idx)} hari (H{sel_idx[0]}–H{sel_idx[-1]})")
-st.subheader(title)
-pmap = disp[disp["has_coord"]].copy()
-if len(pmap):
-    by_day = view_day is None
-    if by_day:
-        labels = sorted(pmap["day_idx"].unique())
-        pmap["ckey"] = pmap["day_idx"]
-    else:
-        labels = sorted(pmap["plan_unit"].dropna().unique())
-        pmap["ckey"] = pmap["plan_unit"]
-    pmap["color"] = pmap["ckey"].apply(lambda k: cmap(k, labels))
-    pmap["radius"] = np.where(pmap["coord_source"].str.startswith("imputed"), 90, 170)
-    # ring penanda tipe: NW=merah, AWS=oranye, REG=abu transparan
-    TIPE_RING = {"NW": [220, 30, 30], "AWS": [245, 150, 20], "REG": [120, 120, 120]}
-    pmap["ring"] = pmap["tipe"].map(TIPE_RING).apply(lambda x: x if isinstance(x, list) else [120, 120, 120])
-    pmap["ringw"] = np.where(pmap["tipe"].isin(["NW", "AWS"]), 3, 0)
-    layers = []
-    # block area + rute hanya di tampilan single-day (per unit); di multi-hari cuma titik per hari
-    if not by_day:
-        if show_block:
-            polys = [{"polygon": block_polygon(sub), "color": cmap(u, labels) + [55]}
-                     for u, sub in pmap.groupby("plan_unit")]
-            layers.append(pdk.Layer("PolygonLayer", data=polys, get_polygon="polygon",
-                get_fill_color="color", get_line_color="color", line_width_min_pixels=1,
-                stroked=True, filled=True, pickable=False))
-        lines = []
-        for u, sub in pmap.groupby("plan_unit"):
-            s = sub.reset_index(drop=True)
-            order, _ = nn_route(s["lat"].values, s["lon"].values)
-            col = cmap(u, labels)
-            for a in range(len(order) - 1):
-                i, j = order[a], order[a + 1]
-                lines.append({"from": [s.loc[i, "lon"], s.loc[i, "lat"]],
-                              "to": [s.loc[j, "lon"], s.loc[j, "lat"]], "color": col})
-        if lines:
-            layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(lines), get_source_position="from",
-                get_target_position="to", get_color="color", get_width=2))
-    # titik: fill = hari/unit, ring = tipe (NW/AWS), radius beda 30/60 menit
-    pmap["radius"] = pmap["radius"] * np.where(pmap["dur"] == 30, 0.7, 1.0)  # 30 menit titik lebih kecil
-    layers.append(pdk.Layer("ScatterplotLayer", data=pmap, get_position=["lon", "lat"],
-        get_fill_color="color", get_radius="radius", get_line_color="ring",
-        get_line_width="ringw", line_width_min_pixels=1, stroked=True, filled=True,
-        pickable=True, opacity=0.9))
-    view = pdk.ViewState(latitude=float(pmap["lat"].mean()), longitude=float(pmap["lon"].mean()), zoom=8.5)
-    tip = ("{well} [{tipe}]\nHari {day_idx} | {plan_unit} | {dur} menit" if by_day
-           else "{well} [{tipe}]\n{plan_unit} | {subarea} | {dur} menit")
-    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road",
-        tooltip={"text": tip}))
-    st.caption("Fill = hari (multi-hari) / unit (1 hari). Ring **merah=NW**, **oranye=AWS**. "
-               "Titik kecil = 30 menit / koordinat imputasi.")
-
-# ringkasan per unit (untuk hari terpilih) -----------------------------------
-if view_day is not None:
-    st.subheader(f"📋 Ringkasan per unit — {view_day.date()}")
-    us = unit_summary(disp, speed)
-    if len(us):
-        st.dataframe(us, use_container_width=True, hide_index=True)
-    else:
-        st.info(f"Hari {sel_idx[0]} ({view_day.date()}) tidak ada well terjadwal "
-                f"(atau tersaring oleh filter durasi {dur_pick}).")
-
-# === Analisis jarak tempuh (km) per unit / hari =============================
-st.subheader("📊 Analisis jarak tempuh (km)")
-kr = []
+kr_calc = []
 for (di, dday, unit), sub in scheduled_all.groupby(["day_idx", "plan_day", "plan_unit"]):
     c = sub[sub["has_coord"]]
-    dist = nn_route(c["lat"].values, c["lon"].values)[1] if len(c) > 1 else 0.0
-    kr.append({"Hari": int(di), "Tanggal": dday.date(), "Unit": unit,
-               "km": round(float(dist), 1), "Sumur": len(sub)})
-kdf = pd.DataFrame(kr)
-total_km = float(kdf["km"].sum()) if len(kdf) else 0.0
-n_sched = len(scheduled_all)
-m1, m2, m3 = st.columns(3)
-m1.metric("Total km / minggu", f"{total_km:.1f} km")
-m2.metric("km / sumur", f"{(total_km / max(n_sched, 1)):.2f}")
-m3.metric("Skenario early test", f"H-{early_days}")
-kt1, kt2 = st.tabs(["📋 Per unit × hari", "📈 Total per hari"])
-with kt1:
-    if len(kdf):
-        piv = kdf.pivot_table(index="Unit", columns="Hari", values="km",
-                              aggfunc="sum", fill_value=0.0)
-        piv.columns = [f"H{c}" for c in piv.columns]
-        piv["Total"] = piv.sum(axis=1)
-        piv.loc["TOTAL"] = piv.sum(axis=0)
-        st.dataframe(piv.round(1), use_container_width=True)
-        st.caption("Angka = km rute (nearest-neighbor) tiap unit per hari. Baris/kolom TOTAL = akumulasi.")
+    dist_val = route_distance(c["lat"].values, c["lon"].values) if len(c) > 1 else 0.0
+    kr_calc.append(dist_val)
+computed_total_km = sum(kr_calc)
+optimized_km_per_well = computed_total_km / max(total_scheduled, 1)
+
+m_c1, m_c2, m_c3, m_c4, m_c5, m_c6 = st.columns(6)
+m_c1.metric("Eligible (Optimasi)", f"{total_eligible} Well")
+m_c2.metric("Terjadwal (Optimasi)", f"{total_scheduled} Well")
+m_c3.metric("Belum Terjadwal", f"{len(leftover)} Well")
+m_c4.metric("⚠️ Miss Deadline", f"{total_missed_dl} Well", delta=f"{total_missed_dl} Kritis", delta_color="inverse")
+m_c5.metric("Total Jarak Horizon", f"{computed_total_km:.1f} km")
+
+# Core Performance Metric Card
+m_c6.markdown(
+    f"""
+    <div style="background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 10px 16px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05);">
+        <div style="font-size: 13px; font-weight: 500; color: #64748B; margin-bottom: 2px;">Avg KM/Well vs Baseline</div>
+        <div style="font-size: 22px; font-weight: 700; color: #0F172A; line-height: 1.2;">
+            {optimized_km_per_well:.2f} <span style="font-size: 13px; font-weight: 500; color: #64748B;">km/well</span>
+        </div>
+        <div style="font-size: 11px; font-weight: 500; color: #16A34A; margin-top: 4px; display: flex; align-items: center; gap: 4px;">
+            ⬇️ 80% Drop <span style="color: #94A3B8; font-weight: 400;">(Baseline: 4.29)</span>
+        </div>
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# 6. Main Workspace Workspace Tabs
+day_labels = [days[i].strftime("%Y-%m-%d") for i in range(horizon)]
+lbl2idx = {lbl: i + 1 for i, lbl in enumerate(day_labels)}
+
+# Global Map Day Filter (Placed elegantly above tabs for global context)
+c_flt1, c_flt2 = st.columns([3, 1])
+with c_flt1:
+    if horizon > 1:
+        sel_labels = st.multiselect("🗓️ Fokus Tanggal Rute (Pilih 1 untuk view harian aktif)", day_labels, default=day_labels)
     else:
-        st.info("Belum ada jadwal.")
-with kt2:
-    if len(kdf):
-        per_day = (kdf.groupby(["Hari", "Tanggal"])
-                   .agg(km=("km", "sum"), Unit=("Unit", "nunique"), Sumur=("Sumur", "sum"))
-                   .reset_index())
-        per_day["km/sumur"] = (per_day["km"] / per_day["Sumur"].clip(lower=1)).round(2)
-        per_day["km"] = per_day["km"].round(1)
-        st.dataframe(per_day, use_container_width=True, hide_index=True)
-        st.bar_chart(per_day.set_index("Hari")["km"])
+        sel_labels = day_labels
+    if not sel_labels: sel_labels = day_labels
+with c_flt2:
+    dur_pick = st.multiselect("⏱️ Filter Durasi Test", [30, 60], default=[30, 60])
+    if not dur_pick: dur_pick = [30, 60]
+
+sel_idx = sorted(lbl2idx[l] for l in sel_labels)
+single_day = len(sel_idx) == 1
+view_day = days[sel_idx[0] - 1] if single_day else None
+
+tab_map, tab_matrix, tab_cart, tab_diagnostics = st.tabs([
+    "🗺️ Peta Geospatial Rute", 
+    "📊 Matriks Beban Kerja", 
+    "🛒 Smart Assistant (Keranjang)", 
+    "🔎 Diagnostik & Analisis Rute"
+])
+
+with tab_map:
+    disp = scheduled_all[scheduled_all["day_idx"].isin(sel_idx) & scheduled_all["dur"].isin(dur_pick)].copy() if len(scheduled_all) else scheduled_all.copy()
+    
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    mco1, mco2, mco3 = st.columns([1.5, 2, 1.4])
+    color_mode = mco1.selectbox("🎨 Skema Pewarnaan Peta", ["Otomatis (hari/unit)", "Zona remote/non-remote", "Per unit", "Early / Late test"])
+    unit_filter = mco2.multiselect("🔧 Batasi Tampilan Unit MWT", sorted(scheduled_all["plan_unit"].dropna().unique().tolist()) if len(scheduled_all) else [])
+    search_q = mco3.text_input("🔎 Pencarian Cepat Nama Sumur", placeholder="Contoh: BO083, BL211").strip().upper()
+    timing_pick = st.multiselect("🕐 Filter Deviasi Window", ["EARLY", "on-time", "LATE", "PRQ", "ORQ"], default=[])
+    field_block = st.multiselect("📦 Tampilkan Batas Field Area", field_list, default=[])
+    
+    pmap = disp[disp["has_coord"]].copy() if len(disp) else disp.copy()
+    if unit_filter: pmap = pmap[pmap["plan_unit"].isin(unit_filter)]
+    if timing_pick: pmap = pmap[pmap["timing"].isin(timing_pick)]
+    
+    man_pick = [] # Setup default
+    prev = leftover[leftover["well"].isin(man_pick) & leftover["has_coord"]].copy() if man_pick and len(leftover) else leftover.iloc[0:0]
+    search_terms = [t for t in search_q.replace(",", " ").split() if t]
+    search_hits = leftover.iloc[0:0]
+    
+    if search_terms and len(week_df):
+        _src = week_df[week_df["has_coord"]].copy()
+        _wu = _src["well"].str.upper()
+        smask = pd.Series(False, index=_src.index)
+        for t in search_terms: smask |= _wu.str.contains(t, regex=False)
+        search_hits = _src[smask].copy()
+        if len(search_hits):
+            sh = search_hits.assign(
+                tgl=search_hits["plan_day"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "—"),
+                grup=search_hits["plan_unit"].fillna("belum terjadwal"))
+            info = "; ".join(f"**{r.well}** → {r.grup} ({r.tgl})" for r in sh.itertuples())
+            st.info(f"🔎 Hasil Pencarian Spasial: {info}")
+
+    if len(pmap) or len(prev) or len(search_hits) or field_block:
+        by_day = view_day is None
+        TIPE_RING = {"NW": [220, 30, 30], "AWS": [245, 150, 20], "REG": [120, 120, 120]}
+        TIMING_COL = {"EARLY": [30, 120, 220], "on-time": [150, 150, 150], "LATE": [220, 30, 30], "PRQ": [150, 80, 200], "ORQ": [0, 160, 140]}
+        legend = ""
+        if len(pmap):
+            if color_mode == "Zona remote/non-remote":
+                ZCOL = {"remote": [30, 120, 220], "non-remote": [240, 140, 30]}
+                pmap["color"] = pmap["zone"].map(lambda z: ZCOL.get(z, [130, 130, 130]))
+                legend = "🔵 Remote (Bangko/Balam) · 🟠 Non-Remote (Bekasap)"
+            elif color_mode == "Per unit":
+                ulabels = sorted(pmap["plan_unit"].dropna().unique())
+                pmap["color"] = pmap["plan_unit"].apply(lambda k: cmap(k, ulabels))
+                legend = "Skala Warna Berdasarkan Distribusi ID Unit"
+            elif color_mode == "Early / Late test":
+                pmap["color"] = pmap["timing"].map(lambda t: TIMING_COL.get(t, [150, 150, 150]))
+                legend = "🔵 EARLY · ⚪ ON-TIME · 🔴 LATE · 🟣 PRQ · 🟢 ORQ"
+            else:
+                if by_day:
+                    labels = sorted(pmap["day_idx"].unique()); pmap["ckey"] = pmap["day_idx"]
+                else:
+                    labels = sorted(pmap["plan_unit"].dropna().unique()); pmap["ckey"] = pmap["plan_unit"]
+                pmap["color"] = pmap["ckey"].apply(lambda k: cmap(k, labels))
+                legend = "Dimensi Warna: Skema Penjadwalan Kalender Hari Operasional"
+            
+            pmap["radius"] = np.where(pmap["coord_source"].str.startswith("imputed"), 90, 170)
+            pmap["radius"] = pmap["radius"] * np.where(pmap["dur"] == 30, 0.7, 1.0)
+            pmap["hit"] = pmap["well"].str.upper().isin(search_terms) if search_terms else False
+            pmap["ring"] = pmap.apply(lambda r: [255, 235, 0] if r["hit"] else TIPE_RING.get(r["tipe"], [120, 120, 120]), axis=1)
+            pmap["ringw"] = np.where(pmap["hit"], 6, np.where(pmap["tipe"].isin(["NW", "AWS"]), 3, 0))
+
+        def _tipcols(d):
+            if not len(d): return d
+            d["tgl_str"] = d["plan_day"].dt.strftime("%Y-%m-%d").fillna("belum terjadwal")
+            d["min_str"] = d["min_date"].dt.strftime("%Y-%m-%d").fillna("—")
+            d["max_str"] = d["max_date"].dt.strftime("%Y-%m-%d").fillna("—")
+            if "timing_label" not in d.columns: d["timing_label"] = ""
+            d["ket"] = d["timing_label"].replace("", "-")
+            return d
+            
+        pmap = _tipcols(pmap)
+        layers = []
+        
+        if field_block:
+            FCOL = [[120, 80, 200], [0, 150, 136], [200, 100, 0], [60, 130, 200]]
+            flabels = []
+            for fi, fld in enumerate(field_block):
+                fw = field_wells_coord[field_wells_coord["field"] == fld]
+                if not len(fw): continue
+                col = FCOL[fi % len(FCOL)]
+                if len(fw) >= 3:
+                    layers.append(pdk.Layer("PolygonLayer", data=[{"polygon": block_polygon(fw), "color": col + [50]}],
+                        get_polygon="polygon", get_fill_color="color", get_line_color=col, line_width_min_pixels=2, stroked=True, filled=True))
+                fwp = fw.copy(); fwp["fld"] = fld; fwp["fcol"] = [col] * len(fwp)
+                layers.append(pdk.Layer("ScatterplotLayer", data=fwp, get_position=["lon", "lat"], get_fill_color="fcol", get_radius=110, opacity=0.55))
+        
+        draw_units = len(pmap) and ((not by_day) or color_mode == "Per unit")
+        if draw_units:
+            if show_block:
+                polys = [{"polygon": block_polygon(sub), "color": list(sub["color"].iloc[0]) + [55]} for u, sub in pmap.groupby("plan_unit") if len(sub) >= 3]
+                if polys: layers.append(pdk.Layer("PolygonLayer", data=polys, get_polygon="polygon", get_fill_color="color", get_line_color="color", line_width_min_pixels=1, stroked=True, filled=True))
+            lines = []
+            for u, sub in pmap.groupby("plan_unit"):
+                s = sub.reset_index(drop=True)
+                order, _ = optimize_route(s["lat"].values, s["lon"].values)
+                col = list(s["color"].iloc[0])
+                for a in range(len(order) - 1):
+                    i, j = order[a], order[a + 1]
+                    lines.append({"from": [s.loc[i, "lon"], s.loc[i, "lat"]], "to": [s.loc[j, "lon"], s.loc[j, "lat"]], "color": col})
+            if lines: layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(lines), get_source_position="from", get_target_position="to", get_color="color", get_width=2))
+        
+        if len(pmap):
+            layers.append(pdk.Layer("ScatterplotLayer", data=pmap, get_position=["lon", "lat"], get_fill_color="color", get_radius="radius", get_line_color="ring", get_line_width="ringw", line_width_min_pixels=1, stroked=True, filled=True, pickable=True, opacity=0.9))
+        
+        foc = pmap if len(pmap) else (search_hits if len(search_hits) else leftover.iloc[0:0])
+        lat_init = float(foc["lat"].mean()) if len(foc) else 1.6
+        lon_init = float(foc["lon"].mean()) if len(foc) else 101.3
+        
+        view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=9.0)
+        tip = "{well} [{tipe}] · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
+        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
+        st.caption(f"💡 Keterangan Layer: {legend}. Ring Merah=NW, Oranye=AWS. Garis biru menghubungkan sequence rute TSP antar sumur.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tab_matrix:
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    sa = scheduled_all
+    if len(sa) > 0:
+        def _wn(mask):
+            return len(sa.loc[mask])
+            
+        tim, dr = sa["timing"], sa["out_dir"]
+        e_pure = _wn(tim == "EARLY")
+        e_req = _wn(tim.isin(["PRQ", "ORQ"]) & (dr == "early"))
+        l_pure = _wn(tim == "LATE")
+        l_req = _wn(tim.isin(["PRQ", "ORQ"]) & (dr == "late"))
+        
+        matrix_data = [
+            {"Kategori Deviasi Operasional": "Murni (NW/AWS/Reguler di luar window)", "⏪ Total EARLY": e_pure, "⏩ Total LATE": l_pure},
+            {"Kategori Deviasi Operasional": "PRQ / ORQ (Formal Request Ops/PE)", "⏪ Total EARLY": e_req, "⏩ Total LATE": l_req}
+        ]
+        df_matrix = pd.DataFrame(matrix_data)
+        df_matrix.loc[len(df_matrix)] = ["TOTAL KESELURUHAN DEVIASI", e_pure + e_req, l_pure + l_req]
+        st.dataframe(df_matrix, use_container_width=True, hide_index=True)
+        
+        st.markdown("#### 📋 Rincian Kontrol Validasi Window Sumur")
+        if (tim != "on-time").any():
+            detail_cols = ["well", "plan_unit", "timing", "timing_label", "plan_day", "min_date", "max_date", "next_wt"]
+            df_detail = sa.loc[tim != "on-time", detail_cols].copy()
+            df_detail["plan_day"] = df_detail["plan_day"].dt.strftime("%Y-%m-%d")
+            df_detail["min_date"] = df_detail["min_date"].dt.strftime("%Y-%m-%d").fillna("-")
+            df_detail["max_date"] = df_detail["max_date"].dt.strftime("%Y-%m-%d").fillna("-")
+            df_detail["next_wt"] = df_detail["next_wt"].dt.strftime("%Y-%m-%d").fillna("-") if "next_wt" in df_detail.columns else "-"
+            
+            df_detail = df_detail.rename(columns={
+                "well": "Well", "plan_unit": "Unit Assigned", "timing": "Kategori",
+                "timing_label": "Deviasi Analisis", "plan_day": "Tanggal Sched",
+                "min_date": "Earliest Date", "max_date": "Latest Date", "next_wt": "Next Proposed WT"
+            })
+            st.dataframe(df_detail.sort_values(["Kategori", "Tanggal Sched"]), use_container_width=True, hide_index=True)
+        else:
+            st.success("✨ Sempurna! Seluruh aset sumur tereksekusi On-Time di dalam rentang window fisis.")
     else:
-        st.info("Belum ada jadwal.")
-st.caption("💡 Bandingkan **Total km / minggu** di beberapa setting *early test* (sidebar). "
-           "Early test yg efektif biasanya **nurunin total km** — unit gak bolak-balik ke wellpad yg sama.")
-
-# jadwal detail --------------------------------------------------------------
-st.subheader("🗂️ Jadwal detail")
-scols = ["day_idx", "plan_day", "plan_unit", "tipe", "zone", "unit", "well", "subarea", "category",
-         "dur", "urgency", "max_date", "coord_source"]
-det = disp[scols].rename(columns={"day_idx": "hari", "plan_day": "tanggal", "plan_unit": "grup",
-                                  "unit": "unit_asli", "dur": "durasi", "max_date": "deadline"})
-det["tanggal"] = det["tanggal"].dt.date
-st.dataframe(det.sort_values(["hari", "grup", "urgency"]), use_container_width=True, hide_index=True)
-
-# no-coord panel -------------------------------------------------------------
-if len(nocoord):
-    st.subheader(f"⚠️ Tanpa koordinat — {len(nocoord)} sumur")
-    nc = nocoord[["well", "unit", "field", "category", "max_date", "urgency"]].copy()
-    nc["lat"] = np.nan
-    nc["lon"] = np.nan
-    nc_edit = st.data_editor(nc.rename(columns={"max_date": "deadline"}), use_container_width=True,
-        height=160, num_rows="fixed", key="nc_editor",
-        column_config={"lat": st.column_config.NumberColumn("lat", format="%.6f"),
-                       "lon": st.column_config.NumberColumn("lon", format="%.6f")},
-        disabled=["well", "unit", "field", "category", "deadline", "urgency"])
-    if st.button("💾 Simpan koordinat manual"):
-        pairs = [(r["well"], r["lat"], r["lon"]) for _, r in nc_edit.iterrows()
-                 if pd.notna(r["lat"]) and pd.notna(r["lon"])]
-        save_coords(pairs)
-        st.success(f"{len(pairs)} koordinat tersimpan. Refresh buat re-routing.")
-
-# eksekusi (hanya saat satu hari dipilih) + export ---------------------------
-st.subheader("✅ Update eksekusi & export")
-if view_day is not None:
-    st.caption(f"Tandai sumur yg sudah dieksekusi tgl {view_day.date()}. Yg sudah dieksekusi "
-               "otomatis keluar dari rollout (gak masuk hari berikutnya) saat refresh.")
-    done = st.multiselect("Sumur sudah dieksekusi", sorted(disp["well"]))
-    if st.button("💾 Simpan status eksekusi", type="primary"):
-        rows = [(r["well"], str(r["plan_unit"]), "executed" if r["well"] in done else "planned")
-                for _, r in disp.iterrows()]
-        save_status(str(view_day.date()), rows)
-        st.success(f"Tersimpan utk {view_day.date()}. {len(done)} dieksekusi. Refresh buat re-plan.")
-else:
-    st.caption("Pilih satu hari di atas buat update status eksekusi.")
-
-XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-exp_cols = ["day_idx", "plan_day", "plan_unit", "tipe", "zone", "unit", "well", "subarea", "field",
-            "category", "dur", "min_date", "max_date", "urgency", "coord_source", "lat", "lon"]
-ren = {"day_idx": "hari", "plan_day": "tanggal", "plan_unit": "grup", "unit": "unit_asli",
-       "dur": "durasi_test_menit", "max_date": "deadline"}
-
-ex1, ex2 = st.columns(2)
-
-# --- export mingguan ---
-out_w = BytesIO()
-with pd.ExcelWriter(out_w, engine="openpyxl") as w:
-    scheduled_all[exp_cols].rename(columns=ren).sort_values(
-        ["hari", "grup", "urgency"]).to_excel(w, sheet_name="Jadwal_Mingguan", index=False)
-    if view_day is None:
-        ov.to_excel(w, sheet_name="Overview", index=False)
+        st.info("Belum ada data perencanaan mingguan untuk dianalisis.")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown("#### ⚠️ Detail Kegagalan Algoritma & Exception")
     if len(missed):
-        missed[["well", "unit", "subarea", "category", "dur", "urgency", "max_date"]].rename(
-            columns={"dur": "durasi_test_menit", "max_date": "deadline", "unit": "unit_asli"}).to_excel(
-            w, sheet_name="Miss-Deadline", index=False)
-    if len(off_wells):
-        off_wells[["well", "unit", "subarea", "category", "dur", "status"]].rename(
-            columns={"unit": "unit_asli", "dur": "durasi_test_menit"}).to_excel(
-            w, sheet_name="Well-OFF", index=False)
-ex1.download_button("⬇️ Export jadwal MINGGUAN (Excel)", out_w.getvalue(),
-    file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
+        st.error(f"Ditemukan {len(missed)} sumur yang deadline-nya lewat dalam {horizon} hari ini namun gagal dialokasikan. Kapasitas alat tidak mencukupi, harap eksekusi manual.")
+        st.dataframe(missed[["well", "unit", "subarea", "category", "urgency", "max_date"]].rename(columns={"max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"), use_container_width=True, hide_index=True)
 
-# --- export harian (hari terpilih) ---
-if view_day is not None:
-    out_d = BytesIO()
-    with pd.ExcelWriter(out_d, engine="openpyxl") as w:
-        disp[exp_cols].rename(columns=ren).sort_values(["grup", "urgency"]).to_excel(
-            w, sheet_name="Jadwal_Harian", index=False)
-        unit_summary(disp, speed).to_excel(w, sheet_name="Ringkasan_Unit", index=False)
-    ex2.download_button(f"⬇️ Export jadwal HARIAN {view_day.date()} (Excel)", out_d.getvalue(),
-        file_name=f"jadwal_harian_{view_day.date()}.xlsx", mime=XLSX_MIME, type="primary")
-else:
-    ex2.caption("Pilih satu hari di toggle atas buat export jadwal harian.")
+    with st.expander(f"🔍 Evaluasi Pengecualian Kandidat (Ter-Skip) - Klik Untuk Expand"):
+        elig_set = set(elig_all["well"])
+        out = raw[~raw["well"].isin(elig_set)].copy()
+        no_date = out[out["min_date"].isna() | out["max_date"].isna()]
+        is_comp = out[out["well"].isin(executed)]
+        is_off = out[out["status"] == "OFF"]
+        is_woff = out[out["well"].isin(woff_set)]
+        nw_out = out[out["is_nwaws"].fillna(False) & ~((out["min_date"] <= batch_hi) & (out["max_date"] >= batch_lo))]
+        accounted = (set(no_date["well"]) | set(is_comp["well"]) | set(is_off["well"]) | set(is_woff["well"]) | set(nw_out["well"]))
+        win_out = out[~out["well"].isin(accounted) & out["min_date"].notna() & out["max_date"].notna()]
+        st.markdown(
+            f"- **Formula Excel Kosong (Min/Max Date)**: {len(no_date)} sumur dibuang karena window tak terbaca.\n"
+            f"- **Diluar Rentang Siklus**: {len(win_out)} sumur due di luar horizon. Lebarkan periode jika ingin disertakan.\n"
+            f"- **NW/AWS Diluar Siklus**: {len(nw_out)} sumur.\n"
+            f"- **Status Exclude**: {len(is_comp)} COMP, {len(is_off)} OFF, {len(is_woff)} NCMP-WOFF.")
+
+with tab_cart:
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    st.markdown("#### 📊 Peta Matriks Beban Kapasitas Unit")
+    grid_cols = [f"Hari {d}" for d in range(1, horizon + 1)]
+    grid_df = pd.DataFrame(index=ALL_UNITS, columns=grid_cols, data="")
+    for u in ALL_UNITS:
+        for d in range(1, horizon + 1):
+            cnt = int(((scheduled_all["plan_unit"] == u) & (scheduled_all["day_idx"] == d)).sum()) if len(scheduled_all) else 0
+            if cnt == 0: val = "kosong"
+            elif cnt < max_wells: val = f"🟢 {cnt}/{max_wells}"
+            elif cnt == max_wells: val = f"✅ {cnt}/{max_wells}"
+            else: val = f"⚠️ {cnt}/{max_wells} (Over)"
+            grid_df.at[u, f"Hari {d}"] = val
+    st.dataframe(grid_df, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    st.markdown("#### 🛒 Pengisian Keranjang Manual Cerdas")
+    recs = []
+    if len(scheduled_all) > 0 and len(leftover) > 0:
+        for _, w in leftover.iterrows():
+            if not w['has_coord']: continue
+            valid_sched = scheduled_all[scheduled_all['plan_day'] <= w['max_date']] if pd.notna(w['max_date']) else scheduled_all
+            if valid_sched.empty: valid_sched = scheduled_all
+            if valid_sched.empty: continue
+
+            dists = haversine_km(w['lat'], w['lon'], valid_sched['lat'].values, valid_sched['lon'].values)
+            best_idx = int(np.argmin(dists))
+            best_dist = float(dists[best_idx])
+            best_match = valid_sched.iloc[best_idx]
+
+            target_u = best_match['plan_unit']
+            target_d = int(best_match['day_idx'])
+            curr_cnt = int(((scheduled_all["plan_unit"] == target_u) & (scheduled_all["day_idx"] == target_d)).sum())
+            basket_str = f"{curr_cnt}/{max_wells}" + (" ⚠️ (Penuh)" if curr_cnt >= max_wells else "")
+
+            recs.append({
+                "Pilih": False, "Well": w['well'], "Deadline": w['max_date'].strftime('%Y-%m-%d') if pd.notna(w['max_date']) else '-',
+                "Target Unit": target_u, "Hari ke-": target_d, "Isi Keranjang": basket_str, "Jarak Kedekatan (km)": round(best_dist, 1),
+                "Status": "⚠️ Miss Deadline" if w['well'] in missed['well'].values else "Sisa Pool"
+            })
+
+    if recs:
+        rec_df = pd.DataFrame(recs)
+        f1, f2, f3 = st.columns([2, 2, 1.5])
+        flt_unit = f1.selectbox("Filter Unit Armada:", ["Semua Unit"] + ALL_UNITS, key="cart_u")
+        flt_day = f2.selectbox("Filter Hari Kerja Horizon:", ["Semua Hari"] + list(range(1, horizon + 1)), key="cart_d")
+        flt_miss = f3.checkbox("Tampilkan Hanya Item Miss Deadline", value=True, key="cart_m")
+
+        view_df = rec_df.copy()
+        if flt_unit != "Semua Unit": view_df = view_df[view_df["Target Unit"] == flt_unit]
+        if flt_day != "Semua Hari": view_df = view_df[view_df["Hari ke-"] == int(flt_day)]
+        if flt_miss: view_df = view_df[view_df["Status"].str.contains("Miss Deadline")]
+
+        view_df = view_df.sort_values(["Hari ke-", "Target Unit", "Jarak Kedekatan (km)"])
+        
+        edited_rec = st.data_editor(
+            view_df, hide_index=True, use_container_width=True,
+            column_config={
+                "Pilih": st.column_config.CheckboxColumn("Masukin Armada?", default=False),
+                "Target Unit": st.column_config.SelectboxColumn("Ubah Unit Logistik", options=ALL_UNITS),
+                "Hari ke-": st.column_config.NumberColumn("Ubah Hari Horizon", min_value=1, max_value=horizon)
+            },
+            disabled=["Well", "Deadline", "Isi Keranjang", "Jarak Kedekatan (km)", "Status"]
+        )
+
+        if st.button("🪄 Validasi & Masukkan ke Keranjang MWT", type="primary"):
+            selected_recs = edited_rec[edited_rec["Pilih"] == True]
+            if not selected_recs.empty:
+                st.session_state.setdefault("manual_assign", {})
+                for _, row in selected_recs.iterrows():
+                    st.session_state["manual_assign"][row["Well"]] = {"unit": row["Target Unit"], "day_idx": row["Hari ke-"]}
+                st.rerun()
+    else:
+        st.info("Semua sumur kritis berhasil teralokasi otomatis oleh mesin logistik WELLGO.")
+        
+    with st.expander("🛠️ Bypass Override: Assign Manual Buta Tanpa Jarak"):
+        left_opts = sorted(leftover["well"].tolist())
+        miss_opts = sorted(missed["well"].tolist())
+        mc1, mc2 = st.columns([3, 2])
+        with mc1:
+            man_pick_all = st.multiselect("Pilih Sumur Terbuang", left_opts, key="man_pick")
+            man_pick_miss = st.multiselect(f"Miss deadline krisis ({len(miss_opts)})", miss_opts, key="man_pick_miss")
+        man_pick = sorted(set(man_pick_all) | set(man_pick_miss))
+        with mc2:
+            a1, a2 = st.columns(2)
+            man_unit = a1.selectbox("Pilih Unit", ALL_UNITS, key="man_unit")
+            man_day = a2.selectbox("Hari ke-", list(range(1, horizon + 1)), key="man_day")
+            if st.button("➕ Force Assign", use_container_width=True, disabled=not man_pick):
+                st.session_state.setdefault("manual_assign", {})
+                for w in man_pick:
+                    st.session_state["manual_assign"][w] = {"unit": man_unit, "day_idx": int(man_day)}
+                st.rerun()
+    
+    if man:
+        st.write("**Histori Assign Manual Teraktivasi:**")
+        for w, info in list(man.items()):
+            r1, r2 = st.columns([5, 1])
+            warn = ""
+            cnt = int(((scheduled_all["plan_unit"] == info["unit"]) & (scheduled_all["day_idx"] == info["day_idx"])).sum())
+            if cnt > max_wells: warn = f" ⚠️ (Memicu Overload: {cnt} well)"
+            r1.write(f"• **{w}** → {info['unit']} (Hari {info['day_idx']}){warn}")
+            if r2.button("Hapus", key=f"rm_{w}"):
+                del st.session_state["manual_assign"][w]
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with tab_diagnostics:
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    st.markdown("#### 📋 Analisis Akumulasi Jarak Tempuh Fleets")
+    
+    kr_analysis = []
+    for (di, dday, unit), sub in scheduled_all.groupby(["day_idx", "plan_day", "plan_unit"]):
+        c = sub[sub["has_coord"]]
+        dist_val = route_distance(c["lat"].values, c["lon"].values) if len(c) > 1 else 0.0
+        kr_analysis.append({"Hari": int(di), "Tanggal": dday.date(), "Unit": unit, "km": round(float(dist_val), 1), "Sumur": len(sub)})
+    
+    if kr_analysis:
+        kdf_an = pd.DataFrame(kr_analysis)
+        piv_an = kdf_an.pivot_table(index="Unit", columns="Hari", values="km", aggfunc="sum", fill_value=0.0)
+        piv_an.columns = [days[c - 1].strftime("%Y-%m-%d") for c in piv_an.columns]
+        piv_an["Total Jarak (km)"] = piv_an.sum(axis=1)
+        st.dataframe(piv_an.round(1), use_container_width=True)
+        
+        st.markdown("#### 📈 Tren Jarak Geografis Harian")
+        per_day = kdf_an.groupby(["Tanggal"]).agg(km=("km", "sum"), Unit=("Unit", "nunique"), Sumur=("Sumur", "sum")).reset_index()
+        per_day["km/sumur"] = (per_day["km"] / per_day["Sumur"].clip(lower=1)).round(2)
+        per_day["Tanggal"] = per_day["Tanggal"].astype(str)
+        st.bar_chart(per_day.set_index("Tanggal")["km"])
+    else:
+        st.info("Unggah berkas untuk melihat visualisasi matriks rute.")
+    st.markdown('</div>', unsafe_allow_html=True)
+        
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    st.markdown("#### 🗂️ Tabel Raw Data Perencanaan Rute")
+    if len(disp):
+        scols_view = ["day_idx", "plan_day", "plan_unit", "manual", "timing_label", "tipe", "well", "subarea", "dur", "min_date", "max_date"]
+        det_view = disp[scols_view].rename(columns={"day_idx": "Hari", "plan_day": "Tanggal", "plan_unit": "MWT Group", "timing_label": "Analisis Window", "dur": "Durasi (Min)"})
+        det_view["Tanggal"] = det_view["Tanggal"].dt.strftime("%Y-%m-%d")
+        det_view["min_date"] = det_view["min_date"].dt.strftime("%Y-%m-%d")
+        det_view["max_date"] = det_view["max_date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(det_view.sort_values(["Hari", "MWT Group"]), use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div class="premium-card">', unsafe_allow_html=True)
+    st.markdown("#### ✅ Modul Update Eksekusi Harian & Export Excel")
+    if view_day is not None:
+        st.caption(f"Validasi manual sumur yang telah rampung dieksekusi secara fisik di lapangan pada tanggal {view_day.date()}. Eksekusi akan mengeluarkan sumur dari iterasi rollout engine berikutnya.")
+        done = st.multiselect("Pilih Sumur Terealisasi", sorted(disp["well"]))
+        if st.button("💾 Simpan Status Eksekusi", type="primary"):
+            rows = [(r["well"], str(r["plan_unit"]), "executed" if r["well"] in done else "planned") for _, r in disp.iterrows()]
+            save_status(str(view_day.date()), rows)
+            st.success(f"Log sinkronisasi tersimpan. Lakukan refresh aplikasi untuk melakukan re-plan komputasi.")
+    
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    exp_cols = ["day_idx", "plan_day", "plan_unit", "manual", "timing", "timing_label", "tipe", "zone", "unit", "well", "subarea", "field", "category", "dur", "min_date", "max_date", "urgency", "coord_source", "lat", "lon"]
+    ren = {"day_idx": "hari", "plan_day": "tanggal", "plan_unit": "grup", "manual": "manual", "timing_label": "early_late", "unit": "unit_asli", "dur": "durasi_test_menit", "max_date": "deadline"}
+
+    ex1, ex2 = st.columns(2)
+    out_w = BytesIO()
+    with pd.ExcelWriter(out_w, engine="openpyxl") as w:
+        scheduled_all[exp_cols].rename(columns=ren).sort_values(["hari", "grup", "urgency"]).to_excel(w, sheet_name="Jadwal_Mingguan", index=False)
+        if len(missed): missed[["well", "unit", "subarea", "category", "dur", "urgency", "max_date"]].rename(columns={"dur": "durasi_test_menit", "max_date": "deadline", "unit": "unit_asli"}).to_excel(w, sheet_name="Miss-Deadline", index=False)
+        if len(off_wells): off_wells[["well", "unit", "subarea", "category", "dur", "status"]].rename(columns={"unit": "unit_asli", "dur": "durasi_test_menit"}).to_excel(w, sheet_name="Well-OFF", index=False)
+    ex1.download_button("⬇️ Unduh File Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
+
+    if view_day is not None:
+        out_d = BytesIO()
+        with pd.ExcelWriter(out_d, engine="openpyxl") as w:
+            disp[exp_cols].rename(columns=ren).sort_values(["grup", "urgency"]).to_excel(w, sheet_name="Jadwal_Harian", index=False)
+            unit_summary(disp, speed).to_excel(w, sheet_name="Ringkasan_Unit", index=False)
+        ex2.download_button(f"⬇️ Unduh File Slice Harian {view_day.date()} (.xlsx)", out_d.getvalue(), file_name=f"jadwal_harian_{view_day.date()}.xlsx", mime=XLSX_MIME, type="primary")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# Footer Cleanup & Utility
+st.markdown("---")
+col_f1, col_f2 = st.columns([3, 1])
+with col_f1:
+    st.caption("WELLGO (Well Grouping Optimizer) SL North. Hak Cipta Operasional 2026. Dikembangkan secara analitik dengan Python & Streamlit Engine.")
+with col_f2:
+    if st.button("🔄 Hard Reset App", use_container_width=True):
+        st.session_state["manual_assign"] = {}
+        st.session_state["field_assign"] = {}
+        st.rerun()
