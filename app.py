@@ -20,6 +20,7 @@ import streamlit as st
 from PIL import Image
 
 import wellgo_ui as ui
+import wellgo_guide as guide
 
 st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wide")
 
@@ -734,8 +735,16 @@ with st.sidebar:
 
 if up is None:
     ui.hero_header(date_str=datetime.now().strftime("%d %b %Y"), horizon=7, units=9, compliance=0, mode="pooled")
-    st.info("💡 Silakan unggah berkas Excel data kandidat sumur & master database koordinat spasial pada sidebar untuk memulai kalkulasi rute.")
+
+    t_mulai, t_panduan = st.tabs(["🏠 Mulai", "📘 Panduan"])
+    with t_mulai:
+        st.info("💡 Silakan unggah berkas Excel data kandidat sumur & master database koordinat "
+                "spasial pada sidebar untuk memulai kalkulasi rute.")
+    with t_panduan:
+        guide.render_guide()
+
     st.stop()
+
 
 # ── Data Loading Awal untuk Filter Area ─────────────────────────────────────
 raw = load_candidates(up.getvalue(), sheet_kandidat)
@@ -793,7 +802,6 @@ with st.sidebar:
         n_remote = st.slider("Unit Area Remote (Bangko/Balam)", 1, 5, 5, disabled=ded)
         n_nonremote = st.slider("Unit Area Non-Remote (Bekasap)", 1, 4, 4, disabled=ded)
         
-        # REQ FIX: Nilai Limit default disetel ke angka 5
         elastic_limit = st.slider("Batas Persebaran Rute (Elastic Limit km)", 5, 50, 5, 1, help="Mencegah efek 'chaining' di mana armada merangkai jarak dekat tapi ujung ke ujungnya terlalu jauh.")
         
         time_budget = st.slider("Time Budget / Hari (Menit)", 180, 540, 360, 30, disabled=not use_dur)
@@ -936,6 +944,14 @@ if man_un:
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
+# --- BENTENG PERTAHANAN (SAFEGUARD) ---
+# Memaksa Pandas membuat kolom jika secara gaib hilang dari memori saat kosong
+if "timing" not in scheduled_all.columns:
+    scheduled_all["timing"] = None
+    scheduled_all["timing_label"] = None
+    scheduled_all["out_dir"] = None
+# --------------------------------------
+
 _pd = scheduled_all["plan_day"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
 _mn = scheduled_all["min_date"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
 _mx = scheduled_all["max_date"] if len(scheduled_all) else pd.Series(dtype='datetime64[ns]')
@@ -973,9 +989,9 @@ if len(scheduled_all) > 0:
     scheduled_all["timing_label"] = [c[1] for c in _cats]
     scheduled_all["out_dir"] = [c[2] for c in _cats]
 else:
-    scheduled_all["timing"] = []
-    scheduled_all["timing_label"] = []
-    scheduled_all["out_dir"] = []
+    scheduled_all["timing"] = None
+    scheduled_all["timing_label"] = None
+    scheduled_all["out_dir"] = None
 
 sched_wells = set(scheduled_all["well"]) if len(scheduled_all) else set()
 leftover = week_df[~week_df["scheduled"]].copy()
@@ -1018,7 +1034,8 @@ ui.kpi_row([
 ])
 
 # ── Main Workspace Tabs ────────────────────────────────────────────────────
-tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics = st.tabs([
+tab_guide, tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics = st.tabs([
+    "📘 Panduan",
     "📅 Jadwal Operasional",
     "🗺️ Peta Rute", 
     "📊 Matriks Deviasi", 
@@ -1026,6 +1043,9 @@ tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics = st.tabs([
     "🗃️ SCH Database",
     "🔎 Diagnostik"
 ])
+
+with tab_guide:
+    guide.render_guide()
 
 with tab_sched:
     if len(scheduled_all) == 0:
@@ -1294,6 +1314,7 @@ with tab_map:
 with tab_matrix:
     ui.section("Matriks Deviasi Jadwal", eyebrow="Evaluasi kepatuhan min-max date")
     sa = scheduled_all
+    
     if len(sa) > 0:
         def _wn(mask): return len(sa.loc[mask])
             
