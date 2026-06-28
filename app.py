@@ -1587,7 +1587,7 @@ with tab_diagnostics:
 st.markdown("---")
 col_f1, col_f2 = st.columns([4, 1])
 with col_f1:
-    st.caption("WELLGO (Well Grouping Optimizer). Dikembangkan oleh Tim Well Test SL North")
+    st.caption("WELLGO (Well Grouping Optimizer). Dikembangkan oleh Tim Well Test SL North (2026).")
 with col_f2:
     if st.button("🔄 Hard Reset Konfigurasi", use_container_width=True):
         st.session_state["manual_assign"] = {}
