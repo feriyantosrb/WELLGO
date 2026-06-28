@@ -1,0 +1,21 @@
+# WELLGO — Streamlit native theme
+# Taruh file ini di:  <project>/.streamlit/config.toml
+# Ini ngatur warna dasar yang Streamlit theme secara native (base, primary, bg, text, font).
+# Sisanya (header petroleum, kartu, chip urgensi) di-handle wellgo_ui.py.
+
+[theme]
+base = "light"
+primaryColor = "#15A3A3"            # teal operasional (tombol, slider, fokus)
+backgroundColor = "#EEF2F3"         # surface cool
+secondaryBackgroundColor = "#FFFFFF" # kartu / sidebar
+textColor = "#0B2027"               # ink petroleum
+font = "sans serif"
+
+[server]
+# opsional: kalau di-deploy, biar gak ada watermark menu yang ganggu estetik
+# (boleh dihapus kalau lo butuh menu default)
+headless = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
