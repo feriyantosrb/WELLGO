@@ -64,22 +64,54 @@ def status_in_period(lo, hi):
     con = sqlite3.connect(DB_PATH)
     try:
         q = ("SELECT well_name AS well, status, reason, plan_date FROM execution_log "
-             "WHERE status IN ('executed','ncmp') AND plan_date BETWEEN ? AND ?")
+             "WHERE status IN ('executed','ncmp','pending') AND plan_date BETWEEN ? AND ?")
         df = pd.read_sql(q, con, params=(str(lo), str(hi)))
     except Exception:
         df = pd.DataFrame(columns=["well", "status", "reason", "plan_date"])
     con.close()
+    _empty_pend = pd.DataFrame(columns=["well", "plan_date"])
     if not len(df):
-        return set(), df[["well", "reason", "plan_date"]] if "well" in df else pd.DataFrame(
-            columns=["well", "reason", "plan_date"])
+        return set(), pd.DataFrame(columns=["well", "reason", "plan_date"]), _empty_pend
     df["plan_date"] = df["plan_date"].astype(str)
     latest = df[df["plan_date"] == df.groupby("well")["plan_date"].transform("max")]
-    flag = latest.groupby("well")["status"].apply(lambda s: (s == "executed").any())
-    executed = set(flag[flag].index)
-    ncmp_w = set(flag[~flag].index)
+
+    # status pemenang per well (tanggal terbaru): executed > ncmp > pending
+    def _winner(s):
+        ss = set(s)
+        if "executed" in ss: return "executed"
+        if "ncmp" in ss: return "ncmp"
+        return "pending"
+    wstat = latest.groupby("well")["status"].apply(_winner)
+    executed = set(wstat[wstat == "executed"].index)
+    ncmp_w = set(wstat[wstat == "ncmp"].index)
+    pend_w = set(wstat[wstat == "pending"].index)
+
     ncmp = (latest[latest["well"].isin(ncmp_w)]
             .sort_values("plan_date").groupby("well", as_index=False).last()[["well", "reason", "plan_date"]])
-    return executed, ncmp
+    pending = (latest[latest["well"].isin(pend_w)]
+               .sort_values("plan_date").groupby("well", as_index=False).last()[["well", "plan_date"]])
+    return executed, ncmp, pending
+
+def sch_latest(wells):
+    """xlookup ke execution_log: ambil schedule_date_test TERAKHIR + status per well.
+    Return dict well -> (tanggal_str, label) dengan label COMP/NCMP/PENDING."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT well_name AS well, status, plan_date FROM execution_log "
+                         "WHERE status IN ('executed','ncmp','pending')", con)
+    except Exception:
+        df = pd.DataFrame(columns=["well", "status", "plan_date"])
+    con.close()
+    wset = set(map(str, wells))
+    if not len(df):
+        return {}
+    df = df[df["well"].isin(wset)].copy()
+    if not len(df):
+        return {}
+    df["plan_date"] = df["plan_date"].astype(str)
+    latest = df.loc[df.groupby("well")["plan_date"].idxmax()]
+    lab = {"executed": "COMP", "ncmp": "NCMP", "pending": "PENDING"}
+    return {r.well: (r.plan_date, lab.get(r.status, str(r.status).upper())) for r in latest.itertuples()}
 
 def norm_unit(u):
     u = str(u).strip().upper()
@@ -99,7 +131,7 @@ def classify_status(stat):
     return ""
 
 def import_compncmp(file_list):
-    n_comp = n_ncmp = 0
+    n_comp = n_ncmp = n_pend = 0
     reasons = {}
     status_seen = {}
     skip_date = skip_well = skip_status = 0
@@ -138,9 +170,26 @@ def import_compncmp(file_list):
             status_seen[k] = status_seen.get(k, 0) + int(v)
         w["stat"] = w["raw_stat"].map(classify_status)
         skip_well += int(w["well"].isin(["", "nan"]).sum())
-        skip_status += int((w["stat"] == "").sum())
         skip_date += int(w["date"].isna().sum())
-        w = w[(~w["well"].isin(["", "nan"])) & (w["stat"] != "") & (w["date"].notna())].copy()
+        valid = (~w["well"].isin(["", "nan"])) & (w["date"].notna())
+
+        # PENDING: punya schedule_date_test tapi STATUS kosong/tak dikenal → disisihkan
+        wp = w[valid & (w["stat"] == "")].copy()
+        skip_status += int(((w["stat"] == "") & ~valid).sum())
+        if len(wp):
+            wp["plan_date"] = wp["date"].dt.date.astype(str)
+            prows = list(zip(wp["plan_date"], wp["well"], wp["unit"],
+                             ["pending"] * len(wp), [""] * len(wp), [now] * len(wp)))
+            # WHERE: jangan timpa hasil COMP/NCMP yang sudah ada utk (well, tanggal) yg sama
+            con.executemany("""INSERT INTO execution_log(plan_date,well_name,unit,status,reason,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(plan_date,well_name) DO UPDATE SET
+                unit=excluded.unit, status=excluded.status, reason=excluded.reason,
+                updated_at=excluded.updated_at
+                WHERE execution_log.status NOT IN ('executed','ncmp')""", prows)
+            n_pend += len(wp)
+
+        # COMP / NCMP
+        w = w[valid & (w["stat"] != "")].copy()
         w["plan_date"] = w["date"].dt.date.astype(str)
         w["log_status"] = np.where(w["stat"] == "COMP", "executed", "ncmp")
         rows = list(zip(w["plan_date"], w["well"], w["unit"], w["log_status"], w["reason"],
@@ -156,7 +205,7 @@ def import_compncmp(file_list):
             reasons[rsn] = reasons.get(rsn, 0) + int(cnt)
     con.commit()
     con.close()
-    return {"comp": n_comp, "ncmp": n_ncmp, "reasons": reasons, "status_seen": status_seen,
+    return {"comp": n_comp, "ncmp": n_ncmp, "pending": n_pend, "reasons": reasons, "status_seen": status_seen,
             "skip_date": skip_date, "skip_well": skip_well, "skip_status": skip_status}
 
 def save_coords(pairs):
@@ -724,13 +773,15 @@ CRIT = {
 # ── Sidebar UI / UX ────────────────────────────────────────────────────────
 with st.sidebar:
     ui.section("💾 Manajemen Data")
-    up = st.file_uploader("Upload Excel kandidat & spasial", type=["xlsx", "xlsm"],
+    up = st.file_uploader("Upload Excel kandidat & spasial (1 file)", type=["xlsx", "xlsm"],
                           help="File Excel berisi sheet Kandidat Sumur & Data_Spasial (Master Database Koordinat)")
     
     col_sh1, col_sh2 = st.columns(2)
     with col_sh1: sheet_kandidat = st.text_input("Sheet Kandidat", SHEET_DEFAULT)
     with col_sh2: sheet_spasial = st.text_input("Sheet Spasial", "Data_Spasial")
-        
+    sheet_breakin = st.text_input("Sheet Break-In (NW/AWS/Req sisipan)", "BreakIn",
+                                  help="Sumur sisipan tengah jadwal. Kosongkan jika tidak dipakai.")
+
     mpas_only = st.checkbox("Hanya Unit Tes (MPAS), exclude TS", value=True)
 
 if up is None:
@@ -748,6 +799,22 @@ if up is None:
 
 # ── Data Loading Awal untuk Filter Area ─────────────────────────────────────
 raw = load_candidates(up.getvalue(), sheet_kandidat)
+raw["is_breakin"] = False
+
+# Break-In: sumur sisipan (NW/AWS/Req) dengan schema sama spt kandidat utama
+raw_break = pd.DataFrame()
+if sheet_breakin and sheet_breakin.strip():
+    try:
+        raw_break = load_candidates(up.getvalue(), sheet_breakin.strip())
+    except Exception:
+        raw_break = pd.DataFrame()
+if len(raw_break):
+    raw_break["is_breakin"] = True
+    # gabung; jika well sudah ada di kandidat utama, baris break-in yang dipakai
+    raw = pd.concat([raw[~raw["well"].isin(set(raw_break["well"]))], raw_break],
+                    ignore_index=True)
+n_breakin_total = int(raw["is_breakin"].fillna(False).sum())
+
 spatial_db = load_spatial_data(up.getvalue(), sheet_spasial)
 
 if spatial_db.empty: st.error("⚠️ Struktur berkas Data Spasial tidak valid atau kosong. Pastikan sheet mengandung kolom: WELL, FIELD, LAT, LON.")
@@ -854,13 +921,19 @@ else:
 days = [plan_start_ts + pd.Timedelta(days=i) for i in range(horizon)]
 week_lo, week_hi = days[0], days[-1]
 
-executed_log, ncmp_log = status_in_period(per_lo, per_hi)
+executed_log, ncmp_log, pending_log = status_in_period(per_lo, per_hi)
 comp_col = set(raw.loc[raw["sch_status"] == "COMP", "well"])
-executed = executed_log | comp_col
+manual_comp = set(st.session_state.get("manual_comp", []))  # ditandai COMP manual oleh user (review SCH)
+executed = executed_log | comp_col | manual_comp
 
-ncmp_log = ncmp_log[~ncmp_log["well"].isin(executed)].copy()
-ncmp_col = set(raw.loc[raw["sch_status"] == "NCMP", "well"]) - executed
-ncmp_set = (set(ncmp_log["well"]) | ncmp_col) - executed
+# PENDING: jadwal sudah ada tapi STATUS belum diisi → disisihkan, jangan dijadwalkan ulang
+pending_col = set(raw.loc[raw["sch_status"].isin(["PENDING", "PEND"]), "well"])
+pending_set = (set(pending_log["well"]) | pending_col) - executed
+pending_sched = dict(zip(pending_log["well"], pending_log["plan_date"]))
+
+ncmp_log = ncmp_log[~ncmp_log["well"].isin(executed | pending_set)].copy()
+ncmp_col = set(raw.loc[raw["sch_status"] == "NCMP", "well"]) - executed - pending_set
+ncmp_set = (set(ncmp_log["well"]) | ncmp_col) - executed - pending_set
 
 in_raw = set(raw["well"])
 master_off_wells = set(raw.loc[raw["status"] == "OFF", "well"])
@@ -885,8 +958,9 @@ is_nwaws_c = raw["is_nwaws"].fillna(False)
 req_force = raw["force_week"].fillna(False) & ~is_nwaws_c
 is_ncmp = raw["well"].isin(ncmp_replan)
 comp_wells = raw[raw["well"].isin(executed)].copy()
+pending_wells = raw[raw["well"].isin(pending_set)].copy()
 nwaws_dropped = raw[is_nwaws_c & ~in_range & (~raw["well"].isin(executed))].copy()
-cand = raw[(in_range | is_ncmp | req_force) & (~raw["well"].isin(executed))].copy()
+cand = raw[(in_range | is_ncmp | req_force) & (~raw["well"].isin(executed | pending_set))].copy()
 
 cand["np_in_range"] = np_in_range.loc[cand.index]
 cand["max_in_range"] = ((raw["max_date"] >= batch_lo) & (raw["max_date"] <= batch_hi)).loc[cand.index]
@@ -1034,6 +1108,51 @@ ui.kpi_row([
 ])
 
 # ── Main Workspace Tabs ────────────────────────────────────────────────────
+def _fv(x):
+    """Format nilai field/area: rapikan NaN/kosong jadi '-'."""
+    return "-" if (x is None or (isinstance(x, float) and pd.isna(x)) or str(x).strip() == "" or str(x).lower() == "nan") else str(x)
+
+def _comp_review_panel(df_src, key, only_hits=False):
+    """Tabel review: xlookup SCH (tanggal+status terakhir) vs window min-max, +
+    checklist 'Tandai COMP'. Yang dicentang lalu di-proses -> dikeluarkan dari jadwal."""
+    if not len(df_src):
+        st.caption("Tidak ada sumur untuk direview.")
+        return
+    look = sch_latest(df_src["well"].tolist())
+    rows = []
+    for _, w in df_src.iterrows():
+        hit = look.get(str(w["well"]))
+        rows.append({
+            "Tandai COMP": False, "Well": w["well"], "Field": _fv(w.get("field")),
+            "Min Date": w["min_date"].strftime("%Y-%m-%d") if pd.notna(w.get("min_date")) else "-",
+            "Max Date": w["max_date"].strftime("%Y-%m-%d") if pd.notna(w.get("max_date")) else "-",
+            "SCH Test Terakhir": hit[0] if hit else "-",
+            "Status SCH": hit[1] if hit else "(tidak ada di SCH)",
+        })
+    rev = pd.DataFrame(rows)
+    if only_hits:
+        rev = rev[rev["Status SCH"] != "(tidak ada di SCH)"]
+    if not len(rev):
+        st.caption("Tidak ada sumur yang punya catatan di SCH_Database untuk direview.")
+        return
+    rev = rev.sort_values(["Status SCH", "Well"])
+    st.caption("Bandingkan **SCH Test Terakhir** & **Status SCH** dengan window **Min–Max**. "
+               "Centang sumur yang sudah dianggap **COMP**, lalu klik proses — sumur tsb dikeluarkan dari jadwal & tidak di-replan.")
+    edited = st.data_editor(
+        rev, hide_index=True, use_container_width=True, key=key + "_ed",
+        column_config={"Tandai COMP": st.column_config.CheckboxColumn("✔ COMP?", default=False)},
+        disabled=["Well", "Field", "Min Date", "Max Date", "SCH Test Terakhir", "Status SCH"])
+    if st.button("✅ Proses: Tandai COMP & keluarkan dari jadwal", key=key + "_btn", type="primary"):
+        sel = edited[edited["Tandai COMP"] == True]["Well"].tolist()
+        if sel:
+            st.session_state.setdefault("manual_comp", [])
+            for w in sel:
+                if w not in st.session_state["manual_comp"]:
+                    st.session_state["manual_comp"].append(w)
+            st.rerun()
+        else:
+            st.warning("Belum ada sumur yang dicentang.")
+
 tab_guide, tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics = st.tabs([
     "📘 Panduan",
     "📅 Jadwal Operasional",
@@ -1051,6 +1170,15 @@ with tab_sched:
     if len(scheduled_all) == 0:
         st.info("Belum ada jadwal yang berhasil dialokasikan pada siklus ini.")
     else:
+        # label dgn field/area utk panel "Tambahkan Sumur" (tinjau field saat add manual)
+        def _add_label(r):
+            tags = []
+            if bool(r.get("is_breakin", False)): tags.append("BREAK-IN")
+            if not bool(r.get("has_coord", True)): tags.append("no-coord")
+            t = ("  ·  " + " · ".join(tags)) if tags else ""
+            return f"{r['well']}  —  {_fv(r.get('field'))} / {_fv(r.get('area'))}{t}"
+        _add_map = {_add_label(r): r["well"] for _, r in leftover.iterrows()} if len(leftover) else {}
+
         for day_idx, day_date in enumerate(days, 1):
             day_data = scheduled_all[scheduled_all["day_idx"] == day_idx]
             if len(day_data) == 0: continue
@@ -1072,9 +1200,10 @@ with tab_sched:
                                 st.session_state["manual_unassign"].append(w)
                         st.rerun()
                 with ca2:
-                    ui.section("➕ Tambahkan Sumur", eyebrow="Cari dan masukkan sumur")
-                    avail = leftover["well"].tolist()
-                    to_add = st.multiselect("Cari sumur (ketik nama):", sorted(avail), key=f"add_w_{day_idx}")
+                    ui.section("➕ Tambahkan Sumur", eyebrow="Cari & tinjau field sebelum masukkan")
+                    to_add_lbl = st.multiselect("Cari sumur (nama — field / area):",
+                                                sorted(_add_map.keys()), key=f"add_w_{day_idx}")
+                    to_add = [_add_map[l] for l in to_add_lbl]
                     target_u = st.selectbox("Pilih Unit:", ALL_UNITS, key=f"add_u_{day_idx}")
                     if st.button("Tambahkan ke Unit", key=f"btn_add_{day_idx}", type="primary", use_container_width=True):
                         st.session_state.setdefault("manual_assign", {})
@@ -1155,6 +1284,28 @@ with tab_sched:
                     ui.unit_card(unit, subarea, km=dist, minutes=est_min, pct=pct, wells=wells_list)
             
 with tab_map:
+    # ── Dashboard: Sumur Tanpa Koordinat ───────────────────────────────────
+    if len(nocoord):
+        _nb = int(nocoord["is_breakin"].fillna(False).sum()) if "is_breakin" in nocoord.columns else 0
+        _title = f"📍 Sumur Tanpa Koordinat: {len(nocoord)} sumur" + (f" · {_nb} break-in" if _nb else "")
+        with st.expander(_title, expanded=True):
+            st.caption("Sumur ini tidak punya koordinat sehingga **tidak bisa di-route otomatis**. "
+                       "Cari namanya di kolom pencarian peta untuk verifikasi, atau assign manual di tab "
+                       "**Cart Manual** (panel *Break-In & Tanpa Koordinat*) / kartu unit harian — "
+                       "dengan meninjau field-nya.")
+            _nc_cols = ["well", "field", "area", "subarea", "category", "tipe", "max_date"]
+            nc_show = nocoord[[c for c in _nc_cols if c in nocoord.columns]].copy()
+            if "is_breakin" in nocoord.columns:
+                nc_show.insert(1, "break_in", np.where(nocoord["is_breakin"].fillna(False).values, "✅", ""))
+            if "max_date" in nc_show.columns:
+                nc_show["max_date"] = nc_show["max_date"].dt.strftime("%Y-%m-%d")
+            nc_show = nc_show.rename(columns={
+                "well": "Well", "break_in": "Break-In", "field": "Field", "area": "Area",
+                "subarea": "Sub-area", "category": "Kategori", "tipe": "Tipe", "max_date": "Deadline"})
+            _sort_keys = [c for c in ["Field", "Well"] if c in nc_show.columns]
+            st.dataframe(nc_show.sort_values(_sort_keys) if _sort_keys else nc_show,
+                         use_container_width=True, hide_index=True)
+
     day_labels = [days[i].strftime("%Y-%m-%d") for i in range(horizon)]
     lbl2idx = {lbl: i + 1 for i, lbl in enumerate(day_labels)}
 
@@ -1356,20 +1507,25 @@ with tab_matrix:
         ui.section("Daftar Miss Deadline (Kapasitas Penuh)", eyebrow="Butuh aksi manual/tambah shift")
         st.dataframe(missed[["well", "unit", "subarea", "category", "urgency", "max_date"]].rename(columns={"max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"), use_container_width=True, hide_index=True)
 
+        with st.expander("🔎 Review Miss Deadline vs SCH_Database — tandai COMP manual", expanded=False):
+            _comp_review_panel(missed, key="rev_miss")
+
     with st.expander(f"🔍 Evaluasi Pengecualian Kandidat (Ter-Skip) - Klik Untuk Expand"):
         elig_set = set(elig_all["well"])
         out = raw[~raw["well"].isin(elig_set)].copy()
         no_date = out[out["min_date"].isna() | out["max_date"].isna()]
         is_comp = out[out["well"].isin(executed)]
+        is_pend = out[out["well"].isin(pending_set)]
         is_off = out[out["status"] == "OFF"]
         is_woff = out[out["well"].isin(woff_set)]
         nw_out = out[out["is_nwaws"].fillna(False) & ~((out["min_date"] <= batch_hi) & (out["max_date"] >= batch_lo))]
-        accounted = (set(no_date["well"]) | set(is_comp["well"]) | set(is_off["well"]) | set(is_woff["well"]) | set(nw_out["well"]))
+        accounted = (set(no_date["well"]) | set(is_comp["well"]) | set(is_pend["well"]) | set(is_off["well"]) | set(is_woff["well"]) | set(nw_out["well"]))
         win_out = out[~out["well"].isin(accounted) & out["min_date"].notna() & out["max_date"].notna()]
         st.markdown(
             f"- **Formula Excel Kosong (Min/Max Date)**: {len(no_date)} sumur dibuang karena window tak terbaca.\n"
             f"- **Diluar Rentang Siklus**: {len(win_out)} sumur due di luar horizon. Lebarkan periode jika ingin disertakan.\n"
             f"- **NW/AWS Diluar Siklus**: {len(nw_out)} sumur.\n"
+            f"- **PENDING (jadwal ada, status kosong)**: {len(is_pend)} sumur disisihkan menunggu hasil.\n"
             f"- **Status Exclude**: {len(is_comp)} COMP, {len(is_off)} OFF, {len(is_woff)} NCMP-WOFF.")
 
 with tab_cart:
@@ -1406,7 +1562,8 @@ with tab_cart:
             basket_str = f"{curr_cnt}/{max_wells}" + (" ⚠️ (Penuh)" if curr_cnt >= max_wells else "")
 
             recs.append({
-                "Pilih": False, "Well": w['well'], "Deadline": w['max_date'].strftime('%Y-%m-%d') if pd.notna(w['max_date']) else '-',
+                "Pilih": False, "Well": w['well'], "Kategori": _fv(w.get('category')),
+                "Deadline": w['max_date'].strftime('%Y-%m-%d') if pd.notna(w['max_date']) else '-',
                 "Target Unit": target_u, "Hari ke-": target_d, "Isi Keranjang": basket_str, "Jarak Kedekatan (km)": round(best_dist, 1),
                 "Status": "⚠️ Miss Deadline" if w['well'] in missed['well'].values else "Sisa Pool"
             })
@@ -1432,7 +1589,7 @@ with tab_cart:
                 "Target Unit": st.column_config.SelectboxColumn("Ubah Unit Logistik", options=ALL_UNITS),
                 "Hari ke-": st.column_config.NumberColumn("Ubah Hari Horizon", min_value=1, max_value=horizon)
             },
-            disabled=["Well", "Deadline", "Isi Keranjang", "Jarak Kedekatan (km)", "Status"]
+            disabled=["Well", "Deadline", "Isi Keranjang", "Jarak Kedekatan (km)", "Status", "Kategori"]
         )
 
         if st.button("🪄 Validasi & Masukkan ke Keranjang MWT", type="primary"):
@@ -1444,7 +1601,57 @@ with tab_cart:
                 st.rerun()
     else:
         st.info("Tidak ada sisa sumur yang membutuhkan assign rekomendasi.")
-        
+
+    # ── Break-In & Sumur Tanpa Koordinat — assign manual dgn tinjau field ───
+    ui.section("🧩 Break-In & Sumur Tanpa Koordinat", eyebrow="Assign manual dengan meninjau field")
+    if len(leftover):
+        _bi = leftover["is_breakin"].fillna(False) if "is_breakin" in leftover.columns else pd.Series(False, index=leftover.index)
+        _nc = ~leftover["has_coord"].fillna(False) if "has_coord" in leftover.columns else pd.Series(False, index=leftover.index)
+        attn = leftover[_bi | _nc].copy()
+    else:
+        attn = leftover.iloc[0:0]
+
+    if len(attn):
+        rows_a = []
+        for _, w in attn.iterrows():
+            zone = "remote" if str(w.get("area", "")).upper() in REMOTE_AREAS else "non-remote"
+            suggest_u = REMOTE_UNITS[0] if zone == "remote" else NONREMOTE_UNITS[0]
+            tp = w.get("tipe", "")
+            kat = tp if tp in ("NW", "AWS") else (w.get("req_tag", "") or "RTN")
+            rows_a.append({
+                "Pilih": False, "Well": w["well"],
+                "Field": _fv(w.get("field")), "Area": _fv(w.get("area")),
+                "Kategori": kat,
+                "Break-In": "✅" if bool(w.get("is_breakin", False)) else "",
+                "Koordinat": "ada" if bool(w.get("has_coord", True)) else "❌ kosong",
+                "Deadline": w["max_date"].strftime("%Y-%m-%d") if pd.notna(w["max_date"]) else "-",
+                "Target Unit": suggest_u, "Hari ke-": 1,
+            })
+        attn_df = pd.DataFrame(rows_a).sort_values(["Break-In", "Field", "Well"], ascending=[False, True, True])
+        st.caption("Tinjau **Field/Area** tiap sumur, set Target Unit & Hari, lalu assign. "
+                   "Sumur tanpa koordinat tetap bisa dimasukkan (tidak menambah jarak rute).")
+        edited_attn = st.data_editor(
+            attn_df, hide_index=True, use_container_width=True,
+            column_config={
+                "Pilih": st.column_config.CheckboxColumn("Assign?", default=False),
+                "Target Unit": st.column_config.SelectboxColumn("Unit", options=ALL_UNITS),
+                "Hari ke-": st.column_config.NumberColumn("Hari", min_value=1, max_value=horizon),
+            },
+            disabled=["Well", "Field", "Area", "Kategori", "Break-In", "Koordinat", "Deadline"],
+            key="attn_editor")
+        if st.button("➕ Assign Break-In / Tanpa Koordinat Terpilih", type="primary", key="attn_btn"):
+            sel = edited_attn[edited_attn["Pilih"] == True]
+            if not sel.empty:
+                st.session_state.setdefault("manual_assign", {})
+                st.session_state.setdefault("manual_unassign", [])
+                for _, r in sel.iterrows():
+                    st.session_state["manual_assign"][r["Well"]] = {"unit": r["Target Unit"], "day_idx": int(r["Hari ke-"])}
+                    if r["Well"] in st.session_state["manual_unassign"]:
+                        st.session_state["manual_unassign"].remove(r["Well"])
+                st.rerun()
+    else:
+        st.caption("Tidak ada sumur break-in atau tanpa koordinat pada siklus ini.")
+
     with st.expander("🛠️ Bypass Override: Assign Manual Buta Tanpa Jarak"):
         left_opts = sorted(leftover["well"].tolist())
         miss_opts = sorted(missed["well"].tolist())
@@ -1482,19 +1689,39 @@ with tab_sch:
     tot_ncmp = len(ncmp_df[ncmp_df["well"].isin(ncmp_set)])
     tot_replan = len(replan_df)
     tot_woff = len(woff_wells)
-    
-    c1, c2, c3, c4 = st.columns(4)
+    tot_pend = len(pending_wells)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1: st.markdown(f"<div class='wg-card' style='padding:15px;text-align:center;'><div class='wg-eyb'>Total COMP</div><div class='wg-disp' style='font-size:24px;font-weight:700;color:{ui.TEAL_GREEN};'>{tot_comp}</div></div>", unsafe_allow_html=True)
     with c2: st.markdown(f"<div class='wg-card' style='padding:15px;text-align:center;'><div class='wg-eyb'>Total NCMP</div><div class='wg-disp' style='font-size:24px;font-weight:700;color:#E67E22;'>{tot_ncmp}</div></div>", unsafe_allow_html=True)
     with c3: st.markdown(f"<div class='wg-card' style='padding:15px;text-align:center;'><div class='wg-eyb'>NCMP (Dijadwal Ulang)</div><div class='wg-disp' style='font-size:24px;font-weight:700;color:{ui.TEAL};'>{tot_replan}</div></div>", unsafe_allow_html=True)
     with c4: st.markdown(f"<div class='wg-card' style='padding:15px;text-align:center;'><div class='wg-eyb'>NCMP (Sumur OFF / Skip)</div><div class='wg-disp' style='font-size:24px;font-weight:700;color:{ui.RED};'>{tot_woff}</div></div>", unsafe_allow_html=True)
-    
+    with c5: st.markdown(f"<div class='wg-card' style='padding:15px;text-align:center;'><div class='wg-eyb'>PENDING (Belum ada status)</div><div class='wg-disp' style='font-size:24px;font-weight:700;color:#6B4FD8;'>{tot_pend}</div></div>", unsafe_allow_html=True)
+
     st.markdown("<br>", unsafe_allow_html=True)
-    
-    t1, t2, t3 = st.tabs(["✅ Data COMP", "🔁 NCMP (Dijadwalkan Ulang)", "⏸️ NCMP (Skip / OFF)"])
+
+    # Rekonsiliasi: Total NCMP = replan + OFF/skip + (NCMP tanpa baris kandidat)
+    tot_nodata = len(ncmp_no_data)
+    _bal = tot_ncmp - tot_replan - tot_woff - tot_nodata
+    st.caption(
+        f"**Rekonsiliasi NCMP:** Total {tot_ncmp} = {tot_replan} dijadwal ulang + {tot_woff} OFF/skip + "
+        f"**{tot_nodata} tidak ada baris kandidat** (ke-exclude area mis. LIBO, filter MPAS-only, "
+        f"atau memang tak ada di sheet Kandidat)" + (f" + {_bal} lainnya" if _bal else "") + ".")
+    if tot_nodata:
+        with st.expander(f"🔻 {tot_nodata} NCMP tanpa baris kandidat (tidak bisa di-replan)"):
+            st.dataframe(pd.DataFrame({"well": ncmp_no_data}), use_container_width=True, hide_index=True)
+
+    t1, t2, t3, t4 = st.tabs(["✅ Data COMP", "🔁 NCMP (Dijadwalkan Ulang)", "⏸️ NCMP (Skip / OFF)", "⏳ PENDING (Disisihkan)"])
     with t1:
         if len(comp_wells):
-            st.dataframe(comp_wells[["well", "unit", "subarea", "category", "dur", "sch_status"]].rename(columns={"unit": "unit_asli", "dur": "durasi", "sch_status": "SCH"}), use_container_width=True, hide_index=True)
+            cw = comp_wells[["well", "unit", "subarea", "category", "dur", "sch_status"]].copy()
+            cw.insert(1, "sumber", np.where(cw["well"].isin(manual_comp), "✔ Manual",
+                                    np.where(cw["well"].isin(comp_col), "SCH-kolom", "SCH-file")))
+            st.dataframe(cw.rename(columns={"unit": "unit_asli", "dur": "durasi", "sch_status": "SCH"}), use_container_width=True, hide_index=True)
+            if manual_comp:
+                if st.button(f"↩️ Batalkan semua tanda COMP manual ({len(manual_comp)})", key="clr_manual_comp"):
+                    st.session_state["manual_comp"] = []
+                    st.rerun()
         else:
             st.info("Tidak ada sumur COMP di periode ini.")
     with t2:
@@ -1507,7 +1734,27 @@ with tab_sch:
             st.dataframe(woff_wells[["well", "unit", "subarea", "category", "max_date", "status"]].rename(columns={"unit": "unit_asli", "max_date": "deadline"}), use_container_width=True, hide_index=True)
         else:
             st.info("Tidak ada sumur OFF yang di-skip.")
-            
+    with t4:
+        st.caption("Sumur ini **sudah punya schedule_date_test tapi STATUS-nya masih kosong** (belum COMP/NCMP). "
+                   "Otomatis disisihkan — tidak dijadwalkan ulang sampai hasilnya diisi.")
+        if len(pending_wells):
+            pend_show = pending_wells[["well", "field", "area", "subarea", "category", "max_date"]].copy()
+            pend_show.insert(1, "tgl_jadwal", pend_show["well"].map(pending_sched).fillna("-"))
+            pend_show["max_date"] = pend_show["max_date"].dt.strftime("%Y-%m-%d")
+            pend_show = pend_show.rename(columns={
+                "well": "Well", "tgl_jadwal": "Tgl Jadwal Test", "field": "Field", "area": "Area",
+                "subarea": "Sub-area", "category": "Kategori", "max_date": "Deadline"})
+            st.dataframe(pend_show.sort_values(["Tgl Jadwal Test", "Well"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Tidak ada sumur PENDING (semua jadwal sudah ada status COMP/NCMP).")
+
+    st.divider()
+    ui.section("🔎 Review Eligible vs SCH_Database", eyebrow="xlookup status & tanggal terakhir — tandai COMP manual")
+    st.caption("Sumur **eligible** yang punya catatan di SCH_Database (sudah pernah dijadwalkan/dites). "
+               "Tinjau window Min–Max vs status terakhirnya, lalu centang yang sudah dianggap COMP — "
+               "sumur tsb dikeluarkan dari eligible & tidak dijadwalkan ulang.")
+    _comp_review_panel(elig_all, key="rev_elig", only_hits=True)
+
     st.divider()
     ui.section("Data Mentah SCH Database", eyebrow="Informasi dari file yang diunggah")
     if comp_files:
@@ -1593,4 +1840,5 @@ with col_f2:
         st.session_state["manual_assign"] = {}
         st.session_state["manual_unassign"] = []
         st.session_state["field_assign"] = {}
+        st.session_state["manual_comp"] = []
         st.rerun()
