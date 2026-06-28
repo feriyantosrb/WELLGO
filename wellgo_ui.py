@@ -114,7 +114,7 @@ def hero_header(date_str, horizon, units, compliance, mode="pooled"):
             <span class="wg-disp" style="display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1.5px solid {TEAL};border-radius:9px;color:{TEAL_BRIGHT};">{LOGO_SVG}</span>
             <div>
               <div class="wg-disp" style="font-size:21px;font-weight:600;color:#FFFFFF;letter-spacing:-0.01em;line-height:1.1;">WELLGO</div>
-              <div style="font-size:12px;color:rgba(255,255,255,0.75);font-weight:400;margin-top:2px;">Well Grouping Optimizer · SLN Rokan</div>
+              <div style="font-size:12px;color:rgba(255,255,255,0.75);font-weight:400;margin-top:2px;">Well Grouping Optimizer · SL North · PT Pertamina Hulu Rokan </div>
             </div>
           </div>
           <div style="text-align:right;">
