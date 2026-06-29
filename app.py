@@ -498,7 +498,7 @@ def block_polygon(sub, pad_km=0.6):
     return out
 
 # ------------------------------------------------------------------ engine
-def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=None, elastic_limit=5.0):
+def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=None, elastic_limit=5.0, blocked_units=None):
     df = elig.reset_index(drop=True).copy()
     df["scheduled"] = False
     df["plan_unit"] = None
@@ -530,8 +530,9 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             df.loc[sel, "plan_unit"] = unit
         return df
 
-    avail_remote = list(REMOTE_UNITS)[:n_remote]
-    avail_nonremote = list(NONREMOTE_UNITS)[:n_nonremote]
+    _blk = set(blocked_units) if blocked_units else set()
+    avail_remote = [u for u in list(REMOTE_UNITS)[:n_remote] if u not in _blk]
+    avail_nonremote = [u for u in list(NONREMOTE_UNITS)[:n_nonremote] if u not in _blk]
     unit_clusters = {u: [] for u in avail_remote + avail_nonremote}
     unassigned = set(df.index)
 
@@ -655,7 +656,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
     return df
 
 def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed,
-              use_urg, use_dur, early_days=0, elastic_limit=5.0):
+              use_urg, use_dur, early_days=0, elastic_limit=5.0, unit_blackout=None):
     elig = elig.reset_index(drop=True).copy()
     elig["scheduled"] = False
     elig["plan_unit"] = None
@@ -698,7 +699,15 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         pool.loc[mid, "urgency"] = pool.loc[mid, "urgency"].clip(upper=0)
         pool.loc[nw, "urgency"] = pool.loc[nw, "urgency"].clip(upper=0) - 10000
 
-        pd_ = plan(pool, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=day, elastic_limit=elastic_limit)
+        # Unit MWT tidak tersedia pada hari ini → buang dari pool tersedia
+        day_key = pd.Timestamp(day).strftime("%Y-%m-%d")
+        blocked = unit_blackout.get(day_key, set()) if unit_blackout else set()
+        if blocked and "forced_unit" in pool.columns:
+            # sumur yang dipaksa ke unit terblokir ditunda (tunggu hari unit tersedia)
+            pool = pool[~(pool["forced_unit"].notna() & pool["forced_unit"].isin(blocked))]
+            if len(pool) == 0: continue
+
+        pd_ = plan(pool, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=day, elastic_limit=elastic_limit, blocked_units=blocked)
 
         sd = pd_[pd_["scheduled"]]
         if len(sd) == 0: continue
@@ -985,9 +994,40 @@ elig_all.loc[nwaws, "urgency"] = elig_all.loc[nwaws, "urgency"].clip(upper=0) - 
 elig = elig_all[elig_all["has_coord"]].copy()
 nocoord = elig_all[~elig_all["has_coord"]].copy()
 
+# ── Unit MWT Tidak Tersedia per Tanggal (blackout) ─────────────────────────
+# Hanya bisa diisi setelah rentang tanggal (horizon) terpilih, karena kolom = tanggal horizon.
+with st.sidebar:
+    with st.expander("🚫 Unit MWT Tidak Tersedia (per tanggal)", expanded=False):
+        _day_keys = [d.strftime("%Y-%m-%d") for d in days]
+        st.caption("Centang sel **(unit × tanggal)** saat unit MWT tidak beroperasi / tidak bisa menampung sumur "
+                   "pada tanggal tsb. Sumur akan dialihkan ke unit lain atau hari lain.")
+        _prev_blk = set(tuple(x) for x in st.session_state.get("unit_blackout", []))
+        _grid = pd.DataFrame(False, index=ALL_UNITS, columns=_day_keys)
+        for (_u, _dk) in _prev_blk:
+            if _u in _grid.index and _dk in _grid.columns:
+                _grid.loc[_u, _dk] = True
+        _grid_disp = _grid.reset_index().rename(columns={"index": "Unit MWT"})
+        _ed_blk = st.data_editor(
+            _grid_disp, hide_index=True, use_container_width=True,
+            key=f"blk_editor_{len(_day_keys)}_{(_day_keys[0] if _day_keys else '')}",
+            column_config={"Unit MWT": st.column_config.TextColumn("Unit MWT", disabled=True),
+                           **{dk: st.column_config.CheckboxColumn(dk[5:], default=False, help=dk) for dk in _day_keys}},
+            disabled=["Unit MWT"])
+        _new_blk = [(r["Unit MWT"], dk) for _, r in _ed_blk.iterrows() for dk in _day_keys if bool(r[dk])]
+        st.session_state["unit_blackout"] = _new_blk
+        if _new_blk:
+            st.caption(f"🚫 **{len(_new_blk)}** slot unit-tanggal diblokir.")
+            if st.button("Bersihkan semua blokir", key="clr_blk", use_container_width=True):
+                st.session_state["unit_blackout"] = []
+                st.rerun()
+
+unit_blackout_by_day = {}
+for (_u, _dk) in st.session_state.get("unit_blackout", []):
+    unit_blackout_by_day.setdefault(_dk, set()).add(_u)
+
 # ── Rollout Execution Framework ────────────────────────────────────────────
 if len(elig):
-    week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit)
+    week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day)
 else:
     week_df = elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
 if len(nocoord):
