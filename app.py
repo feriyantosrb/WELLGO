@@ -1091,6 +1091,12 @@ for (di, dday, unit), sub in scheduled_all.groupby(["day_idx", "plan_day", "plan
 computed_total_km = sum(kr_calc)
 avg_utilization = (total_minutes / (max(len(scheduled_all["plan_unit"].unique()), 1) * horizon * time_budget)) * 100 if time_budget > 0 else 0
 
+# Rincian durasi tes terjadwal (60 vs 30 menit)
+_dur_sched = pd.to_numeric(scheduled_all["dur"], errors="coerce") if len(scheduled_all) else pd.Series(dtype=float)
+n_dur60 = int((_dur_sched == 60).sum())
+n_dur30 = int((_dur_sched == 30).sum())
+n_dur_other = int(total_scheduled - n_dur60 - n_dur30)
+
 ui.hero_header(
     date_str=plan_start_ts.strftime("%d %b %Y"), 
     horizon=horizon, 
@@ -1100,12 +1106,16 @@ ui.hero_header(
 )
 
 ui.kpi_row([
-    ("wells scheduled", f"{total_scheduled}", f"/{total_eligible}", ui.TEAL_GREEN),
+    ("wells scheduled", f"{total_scheduled}", f"/{total_eligible} · 60m {n_dur60} · 30m {n_dur30}", ui.TEAL_GREEN),
     ("miss deadline",   f"{total_missed_dl}", " wells", ui.RED),
     ("wells off",       f"{len(off_wells)}", " wells", "#64748B"),
     ("total route",     f"{computed_total_km:.0f}", " km", ui.TEAL),
     ("avg utilization", f"{avg_utilization:.0f}", "%",  ui.AMBER),
 ])
+_dur_caption = (f"🗓️ **{total_scheduled} sumur terjadwal** — "
+                f"🕐 tes 60 menit: **{n_dur60}** · 🕧 tes 30 menit: **{n_dur30}**"
+                + (f" · durasi lain: **{n_dur_other}**" if n_dur_other else ""))
+st.caption(_dur_caption)
 
 # ── Main Workspace Tabs ────────────────────────────────────────────────────
 def _fv(x):
