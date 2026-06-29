@@ -862,6 +862,32 @@ with st.sidebar:
     plan_start_date = st.date_input("Mulai Planning dari Tanggal",
                                     value=per_lo, min_value=per_lo, max_value=per_hi,
                                     help="Titik mulai optimasi rute. Mengikuti rentang siklus di atas.")
+
+    with st.expander("🚫 Unit MWT Tidak Tersedia (per tanggal)", expanded=False):
+        _ps = pd.Timestamp(plan_start_date); _ph = pd.Timestamp(per_hi)
+        _hz = max(1, min(60, (_ph - _ps).days + 1))
+        _blk_days = [(_ps + pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(_hz)]
+        st.caption("Centang sel **(unit × tanggal)** saat unit MWT tidak beroperasi / tidak bisa menampung "
+                   "sumur pada tanggal tsb. Sumur akan dialihkan ke unit lain atau hari lain.")
+        _prev_blk = set(tuple(x) for x in st.session_state.get("unit_blackout", []))
+        _grid = pd.DataFrame(False, index=ALL_UNITS, columns=_blk_days)
+        for (_u, _dk) in _prev_blk:
+            if _u in _grid.index and _dk in _grid.columns:
+                _grid.loc[_u, _dk] = True
+        _grid_disp = _grid.reset_index().rename(columns={"index": "Unit MWT"})
+        _ed_blk = st.data_editor(
+            _grid_disp, hide_index=True, use_container_width=True,
+            key=f"blk_editor_{len(_blk_days)}_{(_blk_days[0] if _blk_days else '')}",
+            column_config={"Unit MWT": st.column_config.TextColumn("Unit MWT", disabled=True),
+                           **{dk: st.column_config.CheckboxColumn(dk[5:], default=False, help=dk) for dk in _blk_days}},
+            disabled=["Unit MWT"])
+        _new_blk = [(r["Unit MWT"], dk) for _, r in _ed_blk.iterrows() for dk in _blk_days if bool(r[dk])]
+        st.session_state["unit_blackout"] = _new_blk
+        if _new_blk:
+            st.caption(f"🚫 **{len(_new_blk)}** slot unit-tanggal diblokir.")
+            if st.button("Bersihkan semua blokir", key="clr_blk", use_container_width=True):
+                st.session_state["unit_blackout"] = []
+                st.rerun()
                                     
     st.divider()
     
@@ -994,33 +1020,7 @@ elig_all.loc[nwaws, "urgency"] = elig_all.loc[nwaws, "urgency"].clip(upper=0) - 
 elig = elig_all[elig_all["has_coord"]].copy()
 nocoord = elig_all[~elig_all["has_coord"]].copy()
 
-# ── Unit MWT Tidak Tersedia per Tanggal (blackout) ─────────────────────────
-# Hanya bisa diisi setelah rentang tanggal (horizon) terpilih, karena kolom = tanggal horizon.
-with st.sidebar:
-    with st.expander("🚫 Unit MWT Tidak Tersedia (per tanggal)", expanded=False):
-        _day_keys = [d.strftime("%Y-%m-%d") for d in days]
-        st.caption("Centang sel **(unit × tanggal)** saat unit MWT tidak beroperasi / tidak bisa menampung sumur "
-                   "pada tanggal tsb. Sumur akan dialihkan ke unit lain atau hari lain.")
-        _prev_blk = set(tuple(x) for x in st.session_state.get("unit_blackout", []))
-        _grid = pd.DataFrame(False, index=ALL_UNITS, columns=_day_keys)
-        for (_u, _dk) in _prev_blk:
-            if _u in _grid.index and _dk in _grid.columns:
-                _grid.loc[_u, _dk] = True
-        _grid_disp = _grid.reset_index().rename(columns={"index": "Unit MWT"})
-        _ed_blk = st.data_editor(
-            _grid_disp, hide_index=True, use_container_width=True,
-            key=f"blk_editor_{len(_day_keys)}_{(_day_keys[0] if _day_keys else '')}",
-            column_config={"Unit MWT": st.column_config.TextColumn("Unit MWT", disabled=True),
-                           **{dk: st.column_config.CheckboxColumn(dk[5:], default=False, help=dk) for dk in _day_keys}},
-            disabled=["Unit MWT"])
-        _new_blk = [(r["Unit MWT"], dk) for _, r in _ed_blk.iterrows() for dk in _day_keys if bool(r[dk])]
-        st.session_state["unit_blackout"] = _new_blk
-        if _new_blk:
-            st.caption(f"🚫 **{len(_new_blk)}** slot unit-tanggal diblokir.")
-            if st.button("Bersihkan semua blokir", key="clr_blk", use_container_width=True):
-                st.session_state["unit_blackout"] = []
-                st.rerun()
-
+# ── Unit MWT Tidak Tersedia per Tanggal (blackout) — input ada di sidebar ───
 unit_blackout_by_day = {}
 for (_u, _dk) in st.session_state.get("unit_blackout", []):
     unit_blackout_by_day.setdefault(_dk, set()).add(_u)
