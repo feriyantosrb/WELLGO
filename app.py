@@ -905,6 +905,9 @@ if mpas_only:
     plannable = (((raw["is_mpas"] | raw["unit_unknown"]) & ~raw["area"].isin(mwt_unavail))
                  | (raw["is_ts"] & raw["area"].isin(ts_unavail)))
     raw = raw[plannable].copy()
+    # Sumur TS yang dialihkan ke MWT → durasi pengetesan dipaksa 60 menit
+    ts2mwt = raw["is_ts"] & raw["area"].isin(ts_unavail)
+    raw.loc[ts2mwt, "dur"] = 60
 
 field_assign = st.session_state.get("field_assign", {})
 raw = resolve_coords(raw, spatial_db, load_coord_cache(), field_assign=field_assign)
@@ -1106,7 +1109,7 @@ ui.hero_header(
 )
 
 ui.kpi_row([
-    ("wells scheduled", f"{total_scheduled}", f"/{total_eligible} · 60m {n_dur60} · 30m {n_dur30}", ui.TEAL_GREEN),
+    ("wells scheduled", f"{total_scheduled}", f"/{total_eligible}", ui.TEAL_GREEN),
     ("miss deadline",   f"{total_missed_dl}", " wells", ui.RED),
     ("wells off",       f"{len(off_wells)}", " wells", "#64748B"),
     ("total route",     f"{computed_total_km:.0f}", " km", ui.TEAL),
