@@ -773,7 +773,7 @@ CRIT = {
 # ── Sidebar UI / UX ────────────────────────────────────────────────────────
 with st.sidebar:
     ui.section("💾 Manajemen Data")
-    up = st.file_uploader("Upload Excel kandidat & spasial (1 file)", type=["xlsx", "xlsm"],
+    up = st.file_uploader("Upload Excel kandidat & spasial", type=["xlsx", "xlsm"],
                           help="File Excel berisi sheet Kandidat Sumur & Data_Spasial (Master Database Koordinat)")
     
     col_sh1, col_sh2 = st.columns(2)
@@ -1138,11 +1138,54 @@ def _comp_review_panel(df_src, key, only_hits=False):
     rev = rev.sort_values(["Status SCH", "Well"])
     st.caption("Bandingkan **SCH Test Terakhir** & **Status SCH** dengan window **Min–Max**. "
                "Centang sumur yang sudah dianggap **COMP**, lalu klik proses — sumur tsb dikeluarkan dari jadwal & tidak di-replan.")
+
+    # ── Filter: Status SCH + Tanggal (single / rentang) ────────────────────
+    fcol1, fcol2, fcol3 = st.columns([1.4, 1, 1.6])
+    with fcol1:
+        stat_opts = sorted(rev["Status SCH"].unique().tolist())
+        stat_pick = st.multiselect("Filter Status SCH", stat_opts, default=stat_opts, key=key + "_fs")
+    parsed_all = pd.to_datetime(rev["SCH Test Terakhir"], format="%Y-%m-%d", errors="coerce")
+    has_dates = bool(parsed_all.notna().any())
+    with fcol2:
+        dmode = st.selectbox("Filter Tgl SCH", ["Semua", "Single", "Rentang"],
+                             key=key + "_dm", disabled=not has_dates)
+    sel_date = None
+    with fcol3:
+        if has_dates and dmode != "Semua":
+            dmin = parsed_all.min().date(); dmax = parsed_all.max().date()
+            if dmode == "Single":
+                sel_date = st.date_input("Tanggal SCH", value=dmax, min_value=dmin, max_value=dmax, key=key + "_d1")
+            else:
+                sel_date = st.date_input("Rentang Tgl SCH", value=(dmin, dmax), min_value=dmin, max_value=dmax, key=key + "_d2")
+
+    view = rev[rev["Status SCH"].isin(stat_pick)].copy()
+    if has_dates and dmode != "Semua" and sel_date is not None:
+        pv = pd.to_datetime(view["SCH Test Terakhir"], format="%Y-%m-%d", errors="coerce").dt.date
+        if dmode == "Single":
+            lo = hi = sel_date
+        elif isinstance(sel_date, (list, tuple)):
+            lo, hi = (sel_date[0], sel_date[-1]) if len(sel_date) >= 2 else (sel_date[0], sel_date[0])
+        else:
+            lo = hi = sel_date
+        view = view[pv.notna() & (pv >= lo) & (pv <= hi)]
+
+    st.caption(f"Menampilkan **{len(view)}** dari {len(rev)} sumur sesuai filter.")
+    if not len(view):
+        st.info("Tidak ada sumur yang cocok dengan filter.")
+        return
+
+    sel_all = st.checkbox(f"✔ Centang semua hasil filter ({len(view)} sumur)", key=key + "_all",
+                          help="Mencentang semua sumur yang sedang tampil. Masih bisa di-uncheck satu per satu.")
+    view = view.copy()
+    if sel_all:
+        view["Tandai COMP"] = True
+
     edited = st.data_editor(
-        rev, hide_index=True, use_container_width=True, key=key + "_ed",
+        view, hide_index=True, use_container_width=True, key=f"{key}_ed_{int(sel_all)}",
         column_config={"Tandai COMP": st.column_config.CheckboxColumn("✔ COMP?", default=False)},
         disabled=["Well", "Field", "Min Date", "Max Date", "SCH Test Terakhir", "Status SCH"])
-    if st.button("✅ Proses: Tandai COMP & keluarkan dari jadwal", key=key + "_btn", type="primary"):
+    n_sel = int((edited["Tandai COMP"] == True).sum())
+    if st.button(f"✅ Proses: Tandai COMP & keluarkan dari jadwal ({n_sel} dipilih)", key=key + "_btn", type="primary"):
         sel = edited[edited["Tandai COMP"] == True]["Well"].tolist()
         if sel:
             st.session_state.setdefault("manual_comp", [])
@@ -1329,7 +1372,13 @@ with tab_map:
     search_q = mco3.text_input("🔎 Pencarian Cepat Nama Sumur", placeholder="Contoh: BO083").strip().upper()
     timing_pick = st.multiselect("🕐 Filter Deviasi Window", ["EARLY", "on-time", "LATE", "PRQ", "ORQ"], default=[])
     field_block = st.multiselect("📦 Tampilkan Batas Field Area", field_list, default=[])
-    
+
+    n_miss_coord = int(missed["has_coord"].fillna(False).sum()) if len(missed) else 0
+    show_miss = st.checkbox(f"📌 Tampilkan Miss Deadline di peta ({n_miss_coord} sumur berkoordinat)",
+                            value=False,
+                            help="Zoom & tandai sumur miss deadline: nama, tipe (NW/AWS/PRQ/ORQ/RTN), dan window min–max.")
+    miss_map = missed[missed["has_coord"].fillna(False)].copy() if len(missed) else leftover.iloc[0:0]
+
     fb_wells = field_wells_coord[field_wells_coord["field"].isin(field_block)] if field_block else field_wells_coord.iloc[0:0]
 
     pmap = disp[disp["has_coord"]].copy() if len(disp) else disp.copy()
@@ -1354,7 +1403,7 @@ with tab_map:
             info = "; ".join(f"**{r.well}** → {r.grup} ({r.tgl})" for r in sh.itertuples())
             st.info(f"🔎 Hasil Pencarian Spasial: {info}")
 
-    if len(pmap) or len(prev) or len(search_hits) or field_block:
+    if len(pmap) or len(prev) or len(search_hits) or field_block or (show_miss and len(miss_map)):
         TIPE_RING = {"NW": [220, 30, 30], "AWS": [245, 150, 20], "REG": [120, 120, 120]}
         TIMING_COL = {"EARLY": [30, 120, 220], "on-time": [150, 150, 150], "LATE": [220, 30, 30], "PRQ": [150, 80, 200], "ORQ": [0, 160, 140]}
         legend = ""
@@ -1426,7 +1475,34 @@ with tab_map:
         
         if len(pmap):
             layers.append(pdk.Layer("ScatterplotLayer", data=pmap, get_position=["lon", "lat"], get_fill_color="color", get_radius="radius", get_line_color="ring", get_line_width="ringw", line_width_min_pixels=1, stroked=True, filled=True, pickable=True, opacity=0.9))
-        
+
+        # ── Overlay Miss Deadline: pin warna kategori + nama + tipe & window ──
+        if show_miss and len(miss_map):
+            mm = _tipcols(miss_map.copy())
+            _rt = mm["req_tag"].fillna("") if "req_tag" in mm.columns else pd.Series("", index=mm.index)
+            def _catv(tp, rt):
+                if tp == "NW": return "NW"
+                if tp == "AWS": return "AWS"
+                if rt == "PRQ": return "PRQ"
+                if rt == "ORQ": return "ORQ"
+                return "RTN"
+            mm["cat"] = [_catv(tp, rt) for tp, rt in zip(mm["tipe"], _rt)]
+            CAT_COL = {"NW": [107, 79, 216], "AWS": [230, 178, 58], "RTN": [31, 157, 114], "PRQ": [59, 130, 246], "ORQ": [214, 71, 58]}
+            mm["mcol"] = mm["cat"].map(lambda c: CAT_COL.get(c, [120, 120, 120]))
+            mm["tipe"] = mm["cat"]                       # tooltip {tipe} -> kategori
+            mm["ket"] = "MISS DEADLINE"
+            mm["plan_unit"] = mm["unit"].fillna("—") if "unit" in mm.columns else "—"
+            mm["sub"] = "[" + mm["cat"].astype(str) + "] " + mm["min_str"].astype(str) + " → " + mm["max_str"].astype(str)
+            layers.append(pdk.Layer("ScatterplotLayer", data=mm, get_position=["lon", "lat"],
+                get_fill_color="mcol", get_radius=160, get_line_color=[210, 30, 30], get_line_width=4,
+                line_width_min_pixels=2, stroked=True, filled=True, pickable=True, opacity=0.95))
+            layers.append(pdk.Layer("TextLayer", data=mm, get_position=["lon", "lat"], get_text="well",
+                get_size=58, get_color=[190, 20, 20], get_pixel_offset=[0, -42],
+                font_family="Inter", font_weight="bold", pickable=False))
+            layers.append(pdk.Layer("TextLayer", data=mm, get_position=["lon", "lat"], get_text="sub",
+                get_size=32, get_color=[40, 40, 40], get_pixel_offset=[0, 30],
+                font_family="Inter", font_weight="bold", pickable=False))
+
         if len(search_hits):
             foc = search_hits
             zoom_lvl = 13.5 if len(search_hits) == 1 else 11.0
@@ -1444,6 +1520,9 @@ with tab_map:
                 pickable=False
             ))
             
+        elif show_miss and len(miss_map):
+            foc = miss_map
+            zoom_lvl = 13.0 if len(miss_map) == 1 else 11.5
         elif len(pmap):
             foc = pmap
             zoom_lvl = 8.5
@@ -1460,7 +1539,8 @@ with tab_map:
         view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=zoom_lvl)
         tip = "{well} [{tipe}] · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
         st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
-        st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. Garis biru menghubungkan sequence rute TSP antar sumur.")
+        miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
+        st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
 
 with tab_matrix:
     ui.section("Matriks Deviasi Jadwal", eyebrow="Evaluasi kepatuhan min-max date")
@@ -1783,12 +1863,40 @@ with tab_diagnostics:
         piv_an.columns = [days[c - 1].strftime("%Y-%m-%d") for c in piv_an.columns]
         piv_an["Total Jarak (km)"] = piv_an.sum(axis=1)
         st.dataframe(piv_an.round(1), use_container_width=True)
-        
-        ui.section("Tren Jarak Geografis Harian", eyebrow="Fluktuasi KM route")
+
+        # ── Dashboard KM / WELL (efisiensi jarak per sumur) ────────────────
+        ui.section("Efisiensi Jarak per Sumur (KM/WELL)", eyebrow="Rasio jarak tempuh terhadap jumlah sumur")
+        tot_km = float(kdf_an["km"].sum())
+        tot_wells = int(kdf_an["Sumur"].sum())
+        kmw = (tot_km / tot_wells) if tot_wells else 0.0
+        m1, m2, m3 = st.columns(3)
+        m1.markdown(f"<div class='wg-card' style='padding:14px;text-align:center;'><div class='wg-eyb'>Total Jarak</div><div style='font-size:24px;font-weight:700;color:{ui.TEAL};'>{tot_km:.1f} <span style='font-size:13px;'>km</span></div></div>", unsafe_allow_html=True)
+        m2.markdown(f"<div class='wg-card' style='padding:14px;text-align:center;'><div class='wg-eyb'>Total Sumur Terjadwal</div><div style='font-size:24px;font-weight:700;color:{ui.HEADER_BG};'>{tot_wells}</div></div>", unsafe_allow_html=True)
+        m3.markdown(f"<div class='wg-card' style='padding:14px;text-align:center;'><div class='wg-eyb'>Rata-rata KM / WELL</div><div style='font-size:24px;font-weight:700;color:{ui.AMBER};'>{kmw:.2f} <span style='font-size:13px;'>km/well</span></div></div>", unsafe_allow_html=True)
+
+        per_unit = kdf_an.groupby("Unit").agg(**{"Jarak (km)": ("km", "sum"), "Sumur": ("Sumur", "sum")}).reset_index()
+        per_unit["KM / WELL"] = (per_unit["Jarak (km)"] / per_unit["Sumur"].clip(lower=1)).round(2)
+        per_unit["Jarak (km)"] = per_unit["Jarak (km)"].round(1)
+        per_unit = per_unit.sort_values("KM / WELL", ascending=False)
+        cda, cdb = st.columns([1.3, 1])
+        with cda:
+            st.dataframe(per_unit, use_container_width=True, hide_index=True)
+        with cdb:
+            st.bar_chart(per_unit.set_index("Unit")["KM / WELL"])
+        st.caption("KM/WELL tinggi = unit menempuh jarak besar untuk sedikit sumur (rute kurang efisien / sumur tersebar). "
+                   "Pakai untuk spot unit yang rutenya boros.")
+
+        ui.section("Tren Jarak Geografis Harian", eyebrow="Total KM & KM/WELL per hari")
         per_day = kdf_an.groupby(["Tanggal"]).agg(km=("km", "sum"), Unit=("Unit", "nunique"), Sumur=("Sumur", "sum")).reset_index()
         per_day["km/sumur"] = (per_day["km"] / per_day["Sumur"].clip(lower=1)).round(2)
         per_day["Tanggal"] = per_day["Tanggal"].astype(str)
-        st.bar_chart(per_day.set_index("Tanggal")["km"])
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            st.caption("Total Jarak (km) / hari")
+            st.bar_chart(per_day.set_index("Tanggal")["km"])
+        with tcol2:
+            st.caption("KM / WELL per hari")
+            st.bar_chart(per_day.set_index("Tanggal")["km/sumur"])
     else:
         st.info("Unggah berkas untuk melihat visualisasi matriks rute.")
         
@@ -1834,7 +1942,7 @@ with tab_diagnostics:
 st.markdown("---")
 col_f1, col_f2 = st.columns([4, 1])
 with col_f1:
-    st.caption("WELLGO (Well Grouping Optimizer). Dikembangkan oleh Tim Well Test SL North (2026).")
+    st.caption("WELLGO (Well Grouping Optimizer). Dikembangkan oleh Tim Well Test SL North")
 with col_f2:
     if st.button("🔄 Hard Reset Konfigurasi", use_container_width=True):
         st.session_state["manual_assign"] = {}
