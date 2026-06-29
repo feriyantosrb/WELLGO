@@ -1039,6 +1039,25 @@ week_df["manual"] = False
 
 man = st.session_state.get("manual_assign", {})
 if man:
+    # pool master semua kandidat (utk inject sumur yg belum ada di week_df: luar window/COMP/dll)
+    _master = raw.drop_duplicates("well").set_index("well")
+    _dtcols = [c for c in week_df.columns if pd.api.types.is_datetime64_any_dtype(week_df[c])]
+    _present = set(week_df["well"])
+    _inject = []
+    for w in man:
+        if w not in _present and w in _master.index:
+            base = _master.loc[w]
+            newrow = {c: (base[c] if c in _master.columns else np.nan) for c in week_df.columns}
+            newrow["well"] = w
+            newrow["zone"] = "remote" if str(base.get("area")) in REMOTE_AREAS else "non-remote"
+            newrow["manual"] = False
+            newrow["scheduled"] = False
+            if "urgency" in week_df.columns: newrow["urgency"] = 0
+            _inject.append(newrow)
+    if _inject:
+        week_df = pd.concat([week_df, pd.DataFrame(_inject)], ignore_index=True)
+        for c in _dtcols:  # concat dgn NaN bisa merusak dtype datetime → paksa balik
+            week_df[c] = pd.to_datetime(week_df[c], errors="coerce")
     for w, info in list(man.items()):
         m = week_df["well"] == w
         if not m.any(): continue
@@ -1266,14 +1285,25 @@ with tab_sched:
     if len(scheduled_all) == 0:
         st.info("Belum ada jadwal yang berhasil dialokasikan pada siklus ini.")
     else:
-        # label dgn field/area utk panel "Tambahkan Sumur" (tinjau field saat add manual)
+        # label dgn field/area + status utk panel "Tambahkan Sumur"
         def _add_label(r):
             tags = []
             if bool(r.get("is_breakin", False)): tags.append("BREAK-IN")
             if not bool(r.get("has_coord", True)): tags.append("no-coord")
+            _w = r["well"]
+            if _w in executed: tags.append("COMP")
+            elif _w in pending_set: tags.append("PENDING")
+            else:
+                _mn, _mx = r.get("min_date"), r.get("max_date")
+                if pd.notna(_mx) and _mx < batch_lo: tags.append("lewat window")
+                elif pd.notna(_mn) and _mn > batch_hi: tags.append("blm masuk window")
             t = ("  ·  " + " · ".join(tags)) if tags else ""
             return f"{r['well']}  —  {_fv(r.get('field'))} / {_fv(r.get('area'))}{t}"
-        _add_map = {_add_label(r): r["well"] for _, r in leftover.iterrows()} if len(leftover) else {}
+        # sumber: SEMUA kandidat yg lolos filter area/MPAS (bukan hanya leftover), minus yg sudah terjadwal
+        _sched_now = set(scheduled_all["well"]) if len(scheduled_all) else set()
+        _add_src = raw.drop_duplicates("well")
+        _add_src = _add_src[~_add_src["well"].isin(_sched_now)]
+        _add_map = {_add_label(r): r["well"] for _, r in _add_src.iterrows()} if len(_add_src) else {}
 
         for day_idx, day_date in enumerate(days, 1):
             day_data = scheduled_all[scheduled_all["day_idx"] == day_idx]
@@ -1285,8 +1315,16 @@ with tab_sched:
             with st.expander(f"⚙️ Atur Manual Sumur Hari Ke-{day_idx}"):
                 ca1, ca2 = st.columns(2)
                 with ca1:
-                    ui.section("➖ Keluarkan Sumur", eyebrow="Batal jadwalkan dari hari ini")
-                    to_rm = st.multiselect("Pilih sumur:", day_data["well"].tolist(), key=f"rm_w_{day_idx}")
+                    ui.section("➖ Keluarkan Sumur", eyebrow="Batal jadwalkan dari hari ini (per unit)")
+                    day_units = sorted(day_data["plan_unit"].dropna().unique().tolist())
+                    rm_unit = st.selectbox("Pilih Unit:", ["(Semua Unit)"] + day_units, key=f"rm_u_{day_idx}")
+                    if rm_unit == "(Semua Unit)":
+                        _rm_map = {f"{r['well']}  —  {r['plan_unit']}": r["well"] for _, r in day_data.iterrows()}
+                    else:
+                        _rm_map = {r["well"]: r["well"] for _, r in day_data[day_data["plan_unit"] == rm_unit].iterrows()}
+                    st.caption(f"{len(_rm_map)} sumur terjadwal di {rm_unit}.")
+                    to_rm_lbl = st.multiselect("Pilih sumur:", sorted(_rm_map.keys()), key=f"rm_w_{day_idx}_{rm_unit}")
+                    to_rm = [_rm_map[l] for l in to_rm_lbl]
                     if st.button("Keluarkan", key=f"btn_rm_{day_idx}", use_container_width=True):
                         st.session_state.setdefault("manual_unassign", [])
                         for w in to_rm:
