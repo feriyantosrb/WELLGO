@@ -18,7 +18,7 @@ pip install streamlit pandas
 python -m streamlit run wellgo_demo.py
 ```
 
-## Pasang ke app.py asli lo
+## Pasang ke app.py asli
 
 ```python
 import streamlit as st
@@ -53,12 +53,12 @@ for day_idx, day in enumerate(days, 1):
 
 ## Catatan
 
-- **Urgency spectrum** dipetakan langsung dari model lo (`ui.urgency_color(days, flag)`):
+- **Urgency spectrum** dipetakan langsung dari model (`ui.urgency_color(days, flag)`):
   on-time → watch → critical → overdue, + violet buat NW/AWS. Konsisten dipakai
   di chip deadline, load-gauge, dan legend.
 - Font (Space Grotesk / Inter / JetBrains Mono) di-load dari Google Fonts via CSS.
   Kalau deploy di env tanpa internet, host font sendiri & ganti `@import`-nya.
-- Selektor CSS nge-target `data-testid` Streamlit yang relatif stabil. Kalau lo
+- Selektor CSS nge-target `data-testid` Streamlit yang relatif stabil. Kalau
   upgrade Streamlit dan ada yang geser (tabs/metric/sidebar), tinggal sesuaikan di
   `inject_theme()`. Diuji di Streamlit ≥ 1.30.
-- `config.toml` set `toolbarMode="minimal"` — hapus kalau lo butuh menu deploy default.
+- `config.toml` set `toolbarMode="minimal"` — hapus kalau butuh menu deploy default.
