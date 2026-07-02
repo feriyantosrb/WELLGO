@@ -889,6 +889,10 @@ with st.sidebar:
     ui.section("⏱️ Status Realisasi Harian")
     comp_files = st.file_uploader("Upload file COMP/NCMP harian", type=["xlsx", "xlsm"], accept_multiple_files=True)
     skip_woff = st.checkbox("Skip sumur NCMP yang berstatus OFF", value=True)
+    aws_split = st.checkbox("Pecah AWS jadi 2 kunjungan (AWS1 + AWS2) dalam periode", value=False,
+        help="Untuk capacity planning: bila POP_Date bikin window AWS1 (POP+1..+3) DAN AWS2 (POP+5..+10) sama-sama "
+             "masuk periode terpilih & AWS1 belum ada bukti selesai, sumur dibuat jadi 2 tugas terpisah sekaligus. "
+             "Begitu AWS1 di-COMP, otomatis balik ke alur normal (satu baris AWS2).")
 
     with st.expander("🗑️ Kelola / Hapus SCH_Database"):
         st.caption("SCH_Database (COMP/NCMP + tanda COMP manual) tersimpan permanen di server sampai dihapus — "
@@ -1033,6 +1037,7 @@ manual_comp = set(st.session_state.get("manual_comp", []))  # ditandai COMP manu
 # Sumur baru dianggap "selesai" (executed) bila AWS2 sudah COMP.
 aws_done = set()        # AWS2 selesai → final (executed)
 aws_active = {}         # well → (fase, min_date|None, max_date|None); None = pertahankan window Excel
+aws_extra_rows = []     # duplikat tugas AWS2 (mode "Pecah AWS jadi 2 kunjungan")
 _aws = raw[raw["tipe"] == "AWS"].drop_duplicates("well")
 if len(_aws):
     _recs = comp_records(set(_aws["well"]))
@@ -1057,6 +1062,20 @@ if len(_aws):
             a1_win = any(popn + pd.Timedelta(days=1) <= d <= popn + pd.Timedelta(days=3) for d in ds)
             a2_win = any(popn + pd.Timedelta(days=5) <= d <= popn + pd.Timedelta(days=10) for d in ds)
         n_comp = len(ds)
+        # MODE PECAH 2 KUNJUNGAN: AWS1 belum ada bukti selesai & kedua window masuk periode terpilih
+        # → base jadi tugas AWS1 (POP+1..+3), plus dibuat duplikat tugas AWS2 (POP+5..+10) sekaligus.
+        if aws_split and has_pop and not excel_aws2 and not (as1 or as2) and n_comp == 0:
+            a1_lo, a1_hi = popn + pd.Timedelta(days=1), popn + pd.Timedelta(days=3)
+            a2_lo, a2_hi = popn + pd.Timedelta(days=5), popn + pd.Timedelta(days=10)
+            a1_in = (a1_lo <= per_hi_ts) and (a1_hi >= per_lo_ts)
+            a2_in = (a2_lo <= per_hi_ts) and (a2_hi >= per_lo_ts)
+            if a1_in and a2_in:
+                aws_active[_wn] = ("AWS1", a1_lo, a1_hi)     # base = AWS1
+                _r2 = _w.to_dict()
+                _r2["well"] = f"{_wn} #AWS2"
+                _r2["category"] = "AWS2"; _r2["min_date"] = a2_lo; _r2["max_date"] = a2_hi
+                aws_extra_rows.append(_r2)
+                continue
         if as2:
             aws_done.add(_wn)                              # Reason AS2 → selesai
         elif as1:
@@ -1076,6 +1095,12 @@ if len(_aws):
         if _lo is not None: raw.loc[_m, "min_date"] = _lo
         if _hi is not None: raw.loc[_m, "max_date"] = _hi
         raw.loc[_m, "category"] = _ph
+
+    if aws_extra_rows:
+        _dtc = [c for c in raw.columns if pd.api.types.is_datetime64_any_dtype(raw[c])]
+        raw = pd.concat([raw, pd.DataFrame(aws_extra_rows)], ignore_index=True)
+        for _c in _dtc:  # concat bisa merusak dtype datetime → paksa balik
+            raw[_c] = pd.to_datetime(raw[_c], errors="coerce")
 
 executed = (executed_log | comp_col | manual_comp | aws_done) - set(aws_active.keys())
 # COMP utk DASHBOARD = period-scoped (executed_log sudah difilter periode) + kolom SCH + manual.
@@ -1834,6 +1859,65 @@ with tab_map:
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
 
 with tab_matrix:
+    ui.section("🗓️ Matriks Deadline per Tanggal", eyebrow="Sumur jatuh tempo (deadline) dikelompokkan per tanggal")
+    _dl = cand[cand["max_date"].notna()].copy()
+    if len(_dl):
+        _dl["is_nwaws"] = _dl["is_nwaws"].fillna(False)
+        _tu = _dl["tipe"].astype(str).str.upper()
+        _rt = _dl["req_tag"].astype(str).str.upper()
+        _dl["Tipe"] = np.select(
+            [_dl["is_nwaws"] & (_tu == "NW"), _dl["is_nwaws"] & (_tu == "AWS"),
+             _rt == "PRQ", _rt == "ORQ"],
+            ["NW", "AWS", "PRQ", "ORQ"], default="Regular")
+        _dl["Deadline"] = _dl["max_date"].dt.strftime("%Y-%m-%d")
+        _dl["Area"] = _dl["area"].fillna("-")
+
+        c1, c2, c3 = st.columns([2.4, 2.4, 1.8])
+        _types = ["NW", "AWS", "PRQ", "ORQ", "Regular"]
+        sel_t = c1.multiselect("Filter Tipe", _types, default=_types, key="dlmx_t")
+        _areas = sorted(_dl["Area"].unique())
+        sel_a = c2.multiselect("Filter Area", _areas, default=_areas, key="dlmx_a")
+        by = c3.radio("Kolom matriks", ["Tipe", "Area", "Field"], key="dlmx_by", horizontal=True)
+        cc1, cc2 = st.columns([2, 2])
+        in_period = cc1.checkbox(f"Hanya deadline dalam periode terpilih ({per_lo_ts.date()} s/d {per_hi_ts.date()})",
+                                 value=True, key="dlmx_period")
+        show_names = cc2.toggle("Tampilkan nama sumur di dalam sel (bukan jumlah)", value=False, key="dlmx_names")
+
+        v = _dl[_dl["Tipe"].isin(sel_t) & _dl["Area"].isin(sel_a)]
+        if in_period:
+            v = v[(v["max_date"] >= per_lo_ts) & (v["max_date"] <= per_hi_ts)]
+        if len(v):
+            col_field = {"Tipe": "Tipe", "Area": "Area", "Field": "field"}[by]
+            if show_names:
+                piv = (v.groupby(["Deadline", col_field])["well"]
+                         .apply(lambda s: ", ".join(sorted(s))).unstack(fill_value=""))
+                piv = piv.reindex(sorted(piv.index))
+                st.dataframe(piv, use_container_width=True)
+            else:
+                piv = v.pivot_table(index="Deadline", columns=col_field, values="well",
+                                    aggfunc="count", fill_value=0)
+                piv = piv.reindex(sorted(piv.index))
+                piv["TOTAL"] = piv.sum(axis=1)
+                piv.loc["TOTAL"] = piv.sum(axis=0)
+                st.dataframe(piv, use_container_width=True)
+            st.caption(f"**{len(v)}** sumur punya deadline"
+                       + (f" dalam periode {per_lo_ts.date()}–{per_hi_ts.date()}" if in_period else " (semua tanggal)")
+                       + f". Baris = tanggal deadline (Latest Date), kolom = {by}. "
+                       f"Sumber: pool kandidat aktif (COMP/PENDING/OFF sudah dikecualikan).")
+
+            with st.expander("📋 Rincian sumur per deadline"):
+                det = v[["Deadline", "well", "Tipe", "field", "Area", "min_date", "max_date", "unit", "status"]].copy()
+                det["min_date"] = det["min_date"].dt.strftime("%Y-%m-%d").fillna("-")
+                det["max_date"] = det["max_date"].dt.strftime("%Y-%m-%d").fillna("-")
+                det = det.rename(columns={"well": "Well", "field": "Field", "min_date": "Earliest",
+                                          "max_date": "Latest (Deadline)", "unit": "Unit Terakhir", "status": "Status"})
+                st.dataframe(det.sort_values(["Deadline", "Tipe", "Well"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Tidak ada sumur yang cocok dengan filter.")
+    else:
+        st.info("Belum ada sumur berdeadline di pool kandidat.")
+
+    st.divider()
     ui.section("Matriks Deviasi Jadwal", eyebrow="Evaluasi kepatuhan min-max date")
     sa = scheduled_all
     
