@@ -60,6 +60,13 @@ def save_status(plan_date, rows):
     con.commit()
     con.close()
 
+def reset_execution_log():
+    """Kosongkan seluruh SCH_Database (execution_log): COMP/NCMP hasil upload + tanda COMP manual."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM execution_log")
+    con.commit()
+    con.close()
+
 def status_in_period(lo, hi):
     con = sqlite3.connect(DB_PATH)
     try:
@@ -882,6 +889,19 @@ with st.sidebar:
     ui.section("⏱️ Status Realisasi Harian")
     comp_files = st.file_uploader("Upload file COMP/NCMP harian", type=["xlsx", "xlsm"], accept_multiple_files=True)
     skip_woff = st.checkbox("Skip sumur NCMP yang berstatus OFF", value=True)
+
+    with st.expander("🗑️ Kelola / Hapus SCH_Database"):
+        st.caption("SCH_Database (COMP/NCMP + tanda COMP manual) tersimpan permanen di server sampai dihapus — "
+                   "bukan sekadar cache. Menghapus akan mengosongkan seluruh riwayat, lalu app membangun ulang "
+                   "hanya dari file yang sedang ada di uploader (kosongkan uploader dulu bila ingin benar-benar bersih).")
+        _ok = st.checkbox("Saya paham ini menghapus SEMUA log eksekusi (termasuk tanda COMP manual)", key="_confirm_wipe_sch")
+        if st.button("Hapus SCH_Database sekarang", disabled=not _ok, use_container_width=True):
+            reset_execution_log()
+            for _k in ("_compncmp_sig", "_compncmp_summary"):
+                st.session_state.pop(_k, None)
+            st.cache_data.clear()
+            st.success("SCH_Database dihapus. Data akan dibangun ulang dari file yang sedang di-upload (jika ada).")
+            st.rerun()
 
     st.divider()
     ui.section("⚖️ Data Komparasi Manual")
