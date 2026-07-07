@@ -1044,12 +1044,18 @@ if len(_aws):
     _has_pop_col = "pop_date" in raw.columns
     for _, _w in _aws.iterrows():
         _wn = _w["well"]
+        pop = _w["pop_date"] if _has_pop_col else pd.NaT
+        has_pop = pd.notna(pop)
         recs = _recs.get(_wn, [])
+        # Fase AWS hanya boleh disimpulkan dari COMP siklus POP SEKARANG (≥ POP_Date).
+        # Riwayat kampanye lama (RTN/AS1/AS2 dari POP sebelumnya) TIDAK dihitung — kalau tidak,
+        # sumur yang sudah lama rutin dites salah dianggap "AWS selesai".
+        if has_pop:
+            _popn = pd.Timestamp(pop).normalize()
+            recs = [(d, r) for d, r in recs if pd.notna(d) and pd.Timestamp(d).normalize() >= _popn]
         reasons = [r for _, r in recs]
         as1 = any(("AS1" in r) or ("AWS1" in r) for r in reasons)
         as2 = any(("AS2" in r) or ("AWS2" in r) for r in reasons)
-        pop = _w["pop_date"] if _has_pop_col else pd.NaT
-        has_pop = pd.notna(pop)
         orig_cat = str(_w.get("category", "")).upper()
         excel_aws2 = "AWS2" in orig_cat                 # user sudah melabel AWS2 di Excel
         # window utk fase AWS2: kalau Excel SUDAH AWS2 → pertahankan window Excel (sumber kebenaran user);
