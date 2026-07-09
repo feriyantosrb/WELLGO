@@ -834,34 +834,35 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
     min_day = ((sub["min_date"] - base).dt.days + 1).fillna(1).to_numpy()
     max_day = ((sub["max_date"] - base).dt.days + 1).fillna(horizon).to_numpy()
 
-    D = haversine_km(lat[:, None], lon[:, None], lat[None, :], lon[None, :])
-    np.fill_diagonal(D, 0.0)
+    min_day = min_day.astype(int); max_day = max_day.astype(int)
+    is_addman = np.array([c.startswith("Add Manual") for c in catg])
+    is_flex = isprq | is_addman
+    prio = isnw | np.isin(catg, ["Regular A", "Regular B"])   # NW/AWS + Reg A/B wajib on-time
+
+    D = haversine_km(lat[:, None], lon[:, None], lat[None, :], lon[None, :]); np.fill_diagonal(D, 0.0)
     nn = np.argsort(D, axis=1)
     nbr = [[j for j in nn[w] if j != w and zone[j] == zone[w]][:12] for w in range(n)]
     units = {"remote": list(REMOTE_UNITS)[:n_remote], "nonremote": list(NONREMOTE_UNITS)[:n_nonremote]}
     zof = lambda u: "remote" if u in REMOTE_UNITS else "nonremote"
-
-    # jendela hari yang diizinkan per kategori: mandatory=on-time, C/D=boleh late, AddMan/PRQ=fleksibel
-    is_addman = np.array([c.startswith("Add Manual") for c in catg])
-    is_cd = np.isin(catg, ["Regular C", "Regular D"]) & ~isprq
-    is_flex = isprq | is_addman
-    alo = np.maximum(1, min_day).astype(int)
-    ahi = np.minimum(horizon, np.maximum(max_day, 1)).astype(int)   # default: on-time
-    ahi[is_cd] = horizon                                            # C/D boleh late
-    alo[is_flex] = 1; ahi[is_flex] = horizon                        # AddMan/PRQ fleksibel
-
-    routes, where = {}, {}
-    widx = {w: i for i, w in enumerate(sub["well"])}
-    for _, r in sub.iterrows():
-        if r["scheduled"] and r["plan_unit"] is not None and 1 <= int(r["day_idx"] or 0) <= horizon:
-            key = (r["plan_unit"], int(r["day_idx"])); i = widx[r["well"]]
-            routes.setdefault(key, []).append(i); where[i] = key
+    P_ROUTE, P_PRIO, P_REG = 15.0, 8000.0, 400.0
 
     def path_len(o):
         if len(o) <= 1: return 0.0
         a = np.array(o); return float(D[a[:-1], a[1:]].sum())
 
-    def cheapest(o, w):
+    def two_opt(o):
+        if len(o) < 4: return o
+        best = path_len(o); imp = True
+        while imp:
+            imp = False
+            for i in range(len(o) - 1):
+                for k in range(i + 1, len(o)):
+                    no = o[:i] + o[i:k + 1][::-1] + o[k + 1:]
+                    nl = path_len(no)
+                    if nl + 1e-9 < best: o, best, imp = no, nl, True
+        return o
+
+    def cheapest_insert(o, w):
         if not o: return 0.0, 0
         bd, bp = D[w, o[0]], 0
         if D[o[-1], w] < bd: bd, bp = D[o[-1], w], len(o)
@@ -870,66 +871,107 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
             if d < bd: bd, bp = d, i + 1
         return bd, bp
 
-    def cands_for(w, cap):
-        out = set()
-        for nb_ in nbr[w]:
-            k = where.get(nb_)
-            if k and alo[w] <= k[1] <= ahi[w] and zof(k[0]) == zone[w] and len(routes.get(k, [])) < cap:
-                out.add(k)
-        for d in range(int(alo[w]), int(ahi[w]) + 1):
+    routes, where = {}, {}
+    widx = {w: i for i, w in enumerate(sub["well"])}
+    for _, r in sub.iterrows():
+        if r["scheduled"] and r["plan_unit"] is not None and 1 <= int(r["day_idx"] or 0) <= horizon:
+            key = (r["plan_unit"], int(r["day_idx"])); i = widx[r["well"]]
+            routes.setdefault(key, []).append(i); where[i] = key
+    for k in list(routes): routes[k] = two_opt(routes[k])
+
+    def day_ok(w, d):
+        if d < max(1, min_day[w]): return False
+        if prio[w] and max_day[w] >= 1 and d > max_day[w]: return False
+        return True
+
+    def feasible(w, key):
+        u, d = key
+        if zof(u) != zone[w]: return False
+        if len(routes.get(key, [])) >= max_wells: return False
+        return day_ok(w, d)
+
+    def candidate_keys(w):
+        keys = set()
+        for nb in nbr[w]:
+            k = where.get(nb)
+            if k is not None and feasible(w, k): keys.add(k)
+        for d in range(max(1, int(min_day[w])), horizon + 1):
+            if prio[w] and max_day[w] >= 1 and d > max_day[w]: break
             for u in units[zone[w]]:
-                if len(routes.get((u, d), [])) < cap:
-                    out.add((u, d)); break
-        return out
+                if feasible(w, (u, d)): keys.add((u, d)); break
+        return keys
 
-    def insert(w, cap=None):
-        cap = cap or max_wells
-        best = None
-        for k in cands_for(w, cap):
-            d = k[1]
-            state = 0 if (min_day[w] <= d <= max(max_day[w], 1)) else (1 if d < min_day[w] else 2)
-            dd, pos = cheapest(routes.get(k, []), w)
-            if not routes.get(k): dd += 20.0
-            if best is None or (state, dd) < best[0]: best = ((state, dd), k, pos)
-        if best is None: return False
-        routes.setdefault(best[1], []).insert(best[2], w); where[w] = best[1]; return True
+    def ins_cost(w, key):
+        r = routes.get(key, [])
+        delta, pos = cheapest_insert(r, w)
+        if not r: delta += P_ROUTE
+        return delta, pos
 
-    # cabut hanya AddMan + PRQ (fleksibel); C/D dari pass-1 dibiarkan (sudah on-time, jaga km)
+    def do_insert(w, key, pos):
+        routes.setdefault(key, []).insert(pos, w); where[w] = key
+
+    def do_remove(w):
+        key = where.pop(w); routes[key].remove(w)
+        if not routes[key]: del routes[key]
+
+    def repair(pool):
+        pool = list(pool)
+        while pool:
+            bw = None; breg = -1e18; bkey = bpos = None
+            for w in pool:
+                cands = candidate_keys(w)
+                costs = sorted((ins_cost(w, k) + (k,) for k in cands), key=lambda x: x[0]) if cands else []
+                if not costs:
+                    reg = P_PRIO if prio[w] else P_REG
+                    if reg > breg: breg, bw, bkey, bpos = reg, w, None, None
+                    continue
+                d0, p0, k0 = costs[0]
+                d1 = costs[1][0] if len(costs) > 1 else d0 + 1000
+                reg = (d1 - d0) + (6000 if prio[w] else 0)
+                if reg > breg: breg, bw, bkey, bpos = reg, w, k0, p0
+            pool.remove(bw)
+            if bkey is not None: do_insert(bw, bkey, bpos)
+
+    def relocate_pass():
+        improved = False
+        for w in list(where):
+            cur = where[w]
+            gain0 = path_len(routes[cur]) - path_len([x for x in routes[cur] if x != w])
+            if len(routes[cur]) == 1: gain0 += P_ROUTE
+            best = None
+            for key in candidate_keys(w):
+                if key == cur: continue
+                delta, pos = ins_cost(w, key)
+                g = gain0 - delta
+                if g > 1e-6 and (best is None or g > best[0]): best = (g, key, pos)
+            if best:
+                do_remove(w); do_insert(w, best[1], best[2]); improved = True
+        return improved
+
+    # cabut AddMan+PRQ, isi berjenjang (regret A/B → C → D → AddMan → PRQ), lalu polish
     for w in [w for w in list(where) if is_flex[w]]:
-        routes[where[w]].remove(w)
-        if not routes[where[w]]: del routes[where[w]]
-        del where[w]
+        do_remove(w)
+    unpl = lambda pred: [w for w in range(n) if pred(w) and w not in where]
+    repair(unpl(lambda w: prio[w] and not isprq[w]))
+    repair(unpl(lambda w: catg[w] == "Regular C" and not isprq[w]))
+    repair(unpl(lambda w: catg[w] == "Regular D" and not isprq[w]))
+    repair(unpl(lambda w: is_addman[w] and not isprq[w]))
+    repair(unpl(lambda w: isprq[w]))
+    for _ in range(3):
+        if not relocate_pass(): break
+    for k in list(routes): routes[k] = two_opt(routes[k])
 
-    def pool(pred): return sorted([w for w in range(n) if pred(w) and w not in where], key=lambda x: max_day[x])
-    for w in pool(lambda w: (isnw[w] or catg[w] in ("Regular A", "Regular B")) and not isprq[w]): insert(w)
-    for w in pool(lambda w: catg[w] == "Regular C" and not isprq[w]): insert(w)
-    for w in pool(lambda w: catg[w] == "Regular D" and not isprq[w]): insert(w)
-    for w in pool(lambda w: is_addman[w] and not isprq[w]): insert(w)
-    for w in pool(lambda w: isprq[w]): insert(w)
+    # PRQ overflow: sisa PRQ nempel ke rute TERDEKAT sezona (boleh > max sampai soft cap)
     overflow_wells = []
     for w in [w for w in range(n) if isprq[w] and w not in where]:
-        if insert(w, cap=prq_soft_cap):
-            overflow_wells.append(sub["well"].iloc[w])
-
-    # relocate: rapiin km (pindah well ke rute lebih murah, hormati jendela alo/ahi)
-    for _ in range(5):
-        moved = False
-        for w in list(where):
-            cur = where[w]; o = routes[cur]
-            gain0 = path_len(o) - path_len([x for x in o if x != w])
-            if len(o) == 1: gain0 += 20.0
-            best = None
-            for k in cands_for(w, max_wells):
-                if k == cur: continue
-                dd, pos = cheapest(routes.get(k, []), w)
-                if not routes.get(k): dd += 20.0
-                g = gain0 - dd
-                if g > 1e-6 and (best is None or g > best[0]): best = (g, k, pos)
-            if best:
-                routes[cur].remove(w)
-                if not routes[cur]: del routes[cur]
-                routes[best[1]].insert(best[2], w); where[w] = best[1]; moved = True
-        if not moved: break
+        best = None
+        for key, r in routes.items():
+            if zof(key[0]) != zone[w] or not r or len(r) >= prq_soft_cap: continue
+            dmin = min(D[w, x] for x in r)
+            if best is None or dmin < best[0]: best = (dmin, key)
+        if best:
+            _, pos = cheapest_insert(routes[best[1]], w)
+            do_insert(w, best[1], pos); overflow_wells.append(sub["well"].iloc[w])
 
     # miss sebelum (dari week_df asli, dalam scope) & sesudah
     miss_before = int((~sub["scheduled"].fillna(False) & (sub["max_date"] <= per_hi_ts)).sum())
