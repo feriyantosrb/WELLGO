@@ -813,6 +813,186 @@ def cmap(label, labels):
     except ValueError: return [130, 130, 130]
 
 
+def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, prq_soft_cap=8):
+    """Optimasi kedua penekan miss-deadline (boleh mengubah hasil pass-1).
+    Kebijakan: NW/AWS + Reg A/B WAJIB on-time; Reg C/D boleh late; AddMan+PRQ fleksibel isi sisa;
+    PRQ sisa boleh overflow ke rute terdekat sampai soft cap. Return (week_df_baru, ringkasan)."""
+    horizon = len(days); base = pd.Timestamp(days[0])
+    wd = week_df.copy()
+    has_xy = wd["lat"].notna() & wd["lon"].notna()
+    in_scope = has_xy & (wd["scheduled"].fillna(False) | (wd["max_date"] <= per_hi_ts))
+    sub = wd.loc[in_scope].drop_duplicates("well").reset_index(drop=True)
+    n = len(sub)
+    if n == 0:
+        return week_df, {"miss_before": 0, "miss_after": 0, "overflow": []}
+
+    lat = sub["lat"].to_numpy(float); lon = sub["lon"].to_numpy(float)
+    zone = np.where(sub["area"].isin(REMOTE_AREAS), "remote", "nonremote")
+    isnw = sub["is_nwaws"].fillna(False).to_numpy(bool)
+    catg = sub["category"].astype(str).to_numpy()
+    isprq = (sub["req_tag"].astype(str) == "PRQ").to_numpy()
+    min_day = ((sub["min_date"] - base).dt.days + 1).fillna(1).to_numpy()
+    max_day = ((sub["max_date"] - base).dt.days + 1).fillna(horizon).to_numpy()
+
+    D = haversine_km(lat[:, None], lon[:, None], lat[None, :], lon[None, :])
+    np.fill_diagonal(D, 0.0)
+    nn = np.argsort(D, axis=1)
+    nbr = [[j for j in nn[w] if j != w and zone[j] == zone[w]][:12] for w in range(n)]
+    units = {"remote": list(REMOTE_UNITS)[:n_remote], "nonremote": list(NONREMOTE_UNITS)[:n_nonremote]}
+    zof = lambda u: "remote" if u in REMOTE_UNITS else "nonremote"
+
+    # jendela hari yang diizinkan per kategori: mandatory=on-time, C/D=boleh late, AddMan/PRQ=fleksibel
+    is_addman = np.array([c.startswith("Add Manual") for c in catg])
+    is_cd = np.isin(catg, ["Regular C", "Regular D"]) & ~isprq
+    is_flex = isprq | is_addman
+    alo = np.maximum(1, min_day).astype(int)
+    ahi = np.minimum(horizon, np.maximum(max_day, 1)).astype(int)   # default: on-time
+    ahi[is_cd] = horizon                                            # C/D boleh late
+    alo[is_flex] = 1; ahi[is_flex] = horizon                        # AddMan/PRQ fleksibel
+
+    routes, where = {}, {}
+    widx = {w: i for i, w in enumerate(sub["well"])}
+    for _, r in sub.iterrows():
+        if r["scheduled"] and r["plan_unit"] is not None and 1 <= int(r["day_idx"] or 0) <= horizon:
+            key = (r["plan_unit"], int(r["day_idx"])); i = widx[r["well"]]
+            routes.setdefault(key, []).append(i); where[i] = key
+
+    def path_len(o):
+        if len(o) <= 1: return 0.0
+        a = np.array(o); return float(D[a[:-1], a[1:]].sum())
+
+    def cheapest(o, w):
+        if not o: return 0.0, 0
+        bd, bp = D[w, o[0]], 0
+        if D[o[-1], w] < bd: bd, bp = D[o[-1], w], len(o)
+        for i in range(len(o) - 1):
+            d = D[o[i], w] + D[w, o[i + 1]] - D[o[i], o[i + 1]]
+            if d < bd: bd, bp = d, i + 1
+        return bd, bp
+
+    def cands_for(w, cap):
+        out = set()
+        for nb_ in nbr[w]:
+            k = where.get(nb_)
+            if k and alo[w] <= k[1] <= ahi[w] and zof(k[0]) == zone[w] and len(routes.get(k, [])) < cap:
+                out.add(k)
+        for d in range(int(alo[w]), int(ahi[w]) + 1):
+            for u in units[zone[w]]:
+                if len(routes.get((u, d), [])) < cap:
+                    out.add((u, d)); break
+        return out
+
+    def insert(w, cap=None):
+        cap = cap or max_wells
+        best = None
+        for k in cands_for(w, cap):
+            d = k[1]
+            state = 0 if (min_day[w] <= d <= max(max_day[w], 1)) else (1 if d < min_day[w] else 2)
+            dd, pos = cheapest(routes.get(k, []), w)
+            if not routes.get(k): dd += 20.0
+            if best is None or (state, dd) < best[0]: best = ((state, dd), k, pos)
+        if best is None: return False
+        routes.setdefault(best[1], []).insert(best[2], w); where[w] = best[1]; return True
+
+    # cabut hanya AddMan + PRQ (fleksibel); C/D dari pass-1 dibiarkan (sudah on-time, jaga km)
+    for w in [w for w in list(where) if is_flex[w]]:
+        routes[where[w]].remove(w)
+        if not routes[where[w]]: del routes[where[w]]
+        del where[w]
+
+    def pool(pred): return sorted([w for w in range(n) if pred(w) and w not in where], key=lambda x: max_day[x])
+    for w in pool(lambda w: (isnw[w] or catg[w] in ("Regular A", "Regular B")) and not isprq[w]): insert(w)
+    for w in pool(lambda w: catg[w] == "Regular C" and not isprq[w]): insert(w)
+    for w in pool(lambda w: catg[w] == "Regular D" and not isprq[w]): insert(w)
+    for w in pool(lambda w: is_addman[w] and not isprq[w]): insert(w)
+    for w in pool(lambda w: isprq[w]): insert(w)
+    overflow_wells = []
+    for w in [w for w in range(n) if isprq[w] and w not in where]:
+        if insert(w, cap=prq_soft_cap):
+            overflow_wells.append(sub["well"].iloc[w])
+
+    # relocate: rapiin km (pindah well ke rute lebih murah, hormati jendela alo/ahi)
+    for _ in range(5):
+        moved = False
+        for w in list(where):
+            cur = where[w]; o = routes[cur]
+            gain0 = path_len(o) - path_len([x for x in o if x != w])
+            if len(o) == 1: gain0 += 20.0
+            best = None
+            for k in cands_for(w, max_wells):
+                if k == cur: continue
+                dd, pos = cheapest(routes.get(k, []), w)
+                if not routes.get(k): dd += 20.0
+                g = gain0 - dd
+                if g > 1e-6 and (best is None or g > best[0]): best = (g, k, pos)
+            if best:
+                routes[cur].remove(w)
+                if not routes[cur]: del routes[cur]
+                routes[best[1]].insert(best[2], w); where[w] = best[1]; moved = True
+        if not moved: break
+
+    # miss sebelum (dari week_df asli, dalam scope) & sesudah
+    miss_before = int((~sub["scheduled"].fillna(False) & (sub["max_date"] <= per_hi_ts)).sum())
+    scheduled_now = set(where.keys())
+    miss_after = sum(1 for w in range(n) if w not in scheduled_now and max_day[w] <= horizon)
+    overflow_routes = [(k, len(v)) for k, v in routes.items() if len(v) > max_wells]
+
+    # tulis balik ke week_df
+    out = week_df.copy()
+    dtc = [c for c in out.columns if pd.api.types.is_datetime64_any_dtype(out[c])]
+    inv = {i: w for w, i in widx.items()}
+    day_of = {}; unit_of = {}
+    for w_i, key in where.items():
+        wn = inv[w_i]; unit_of[wn] = key[0]; day_of[wn] = key[1]
+    scope_wells = set(sub["well"])
+    for i in out.index:
+        wn = out.at[i, "well"]
+        if wn not in scope_wells: continue
+        if wn in day_of:
+            out.at[i, "scheduled"] = True
+            out.at[i, "plan_unit"] = unit_of[wn]
+            out.at[i, "day_idx"] = day_of[wn]
+            out.at[i, "plan_day"] = days[day_of[wn] - 1]
+            out.at[i, "manual"] = False
+        else:
+            out.at[i, "scheduled"] = False
+            out.at[i, "plan_unit"] = None
+            out.at[i, "day_idx"] = 0
+    for c in dtc:
+        out[c] = pd.to_datetime(out[c], errors="coerce")
+    return out, {"miss_before": miss_before, "miss_after": miss_after,
+                 "overflow": overflow_routes, "overflow_wells": overflow_wells}
+
+
+def pass2_kpis(week_df, per_hi_ts, days):
+    """Metrik ringkas satu jadwal (AddMan+PRQ fleksibel, tak dihitung late)."""
+    base = pd.Timestamp(days[0]); horizon = len(days)
+    wd = week_df.copy()
+    cat = wd["category"].astype(str); prq = wd["req_tag"].astype(str) == "PRQ"
+    isflex = prq | cat.str.startswith("Add Manual")
+    sch = wd["scheduled"].fillna(False)
+    maxd = ((wd["max_date"] - base).dt.days + 1)
+    dayi = wd["day_idx"].fillna(0).astype(int)
+    ontime = late = miss = 0
+    for i in wd.index:
+        if isflex.iloc[wd.index.get_loc(i)]: continue
+        if not sch.loc[i]:
+            if pd.notna(wd.at[i, "max_date"]) and wd.at[i, "max_date"] <= per_hi_ts: miss += 1
+            continue
+        d = dayi.loc[i]; md = maxd.loc[i]
+        if pd.isna(md) or d <= max(md, 1): ontime += 1     # on-time atau early → deadline kepenuhi
+        else: late += 1
+    s = wd[sch]
+    km = sum(route_distance(gp["lat"].to_numpy(), gp["lon"].to_numpy())
+             for _, gp in s.groupby(["plan_unit", "day_idx"]) if len(gp) > 1)
+    nsch = len(s); crew = s.groupby(["plan_unit", "day_idx"]).ngroups if nsch else 0
+    nk = ontime + late + miss
+    return dict(miss=miss, ontime=ontime, late=late,
+                ontime_pct=(ontime / nk * 100 if nk else 100.0),
+                km_well=(km / nsch if nsch else 0.0), crew=crew, sched=nsch,
+                prq=int((sch & prq).sum()), addman=int((sch & cat.str.startswith("Add Manual")).sum()))
+
+
 # ================================================================== UI Configuration
 init_db()
 
@@ -974,6 +1154,11 @@ with st.sidebar:
 
         two_layer = st.checkbox("Optimasi 2-lapis (prioritas → reguler)", value=False,
             help="Lapis 1: optimasi sumur prioritas (NW/AWS/PRQ/ORQ + carry NCMP) lebih dulu. Lapis 2: sumur reguler mengisi sisa kapasitas unit/hari & menumpang rute prioritas. Algoritma sama; hasil lebih mudah diaudit.")
+
+        pass2_on = st.checkbox("🚑 Pass-2: Tekan Miss-Deadline", value=False,
+            help="Optimasi kedua setelah jadwal utama: boleh menggeser hasil pass-1 untuk menghapus miss-deadline. "
+                 "NW/AWS + Reg A/B wajib on-time; Reg C/D boleh late; AddMan+PRQ fleksibel isi sisa; "
+                 "PRQ sisa boleh menempel rute terdekat >6 (overflow, ditandai). Menggantikan rescue manual + lompat tab.")
         
         time_budget = st.slider("Time Budget / Hari (Menit)", 180, 540, 360, 30, disabled=not use_dur)
         speed = st.slider("Kecepatan Rata-rata Fleet (km/jam)", 10, 60, 25, 5)
@@ -1276,6 +1461,14 @@ if man_un:
     week_df.loc[m_un, "day_idx"] = 0
     week_df.loc[m_un, "plan_day"] = pd.NaT
     week_df.loc[m_un, "manual"] = False
+
+pass2_summary = None
+pass2_compare = None
+if pass2_on and len(week_df):
+    _wd_before = week_df.copy()
+    week_df, pass2_summary = pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote)
+    pass2_compare = {"before": pass2_kpis(_wd_before, per_hi_ts, days),
+                     "after": pass2_kpis(week_df, per_hi_ts, days)}
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
@@ -1990,6 +2183,19 @@ with tab_matrix:
             f"- **Status Exclude**: {len(is_comp)} COMP, {len(is_off)} OFF, {len(is_woff)} NCMP-WOFF.")
 
 with tab_cart:
+    if pass2_summary is not None:
+        _mb, _ma = pass2_summary["miss_before"], pass2_summary["miss_after"]
+        _ov = pass2_summary.get("overflow", [])
+        if _ma == 0:
+            st.success(f"🚑 **Pass-2 aktif** — miss-deadline **{_mb} → {_ma}**. "
+                       f"NW/AWS + Reg A/B on-time, Reg C/D boleh late, AddMan+PRQ isi sisa."
+                       + (f" PRQ overflow di {len(_ov)} rute (>6): {sorted(c for _,c in _ov)}." if _ov else ""))
+        else:
+            st.warning(f"🚑 **Pass-2 aktif** — miss-deadline **{_mb} → {_ma}** (sisa {_ma} tak bisa dimuat "
+                       f"walau geser + overflow; kemungkinan kapasitas/zona benar-benar penuh)."
+                       + (f" PRQ overflow di {len(_ov)} rute." if _ov else ""))
+        st.divider()
+
     # ── 🚑 Rescue Miss-Deadline (Tahap 2) ─────────────────────────────────
     ui.section("🚑 Rescue Miss-Deadline (Tahap 2)", eyebrow="Gabungkan sumur miss ke rute existing TERDEKAT (distance-first, overflow ≤8)")
     SOFT_CAP = 8
@@ -2448,6 +2654,25 @@ with tab_export:
         ex2.caption("Pilih **1 tanggal tunggal** di tab Peta Rute untuk mengaktifkan unduhan rute harian.")
 
 with tab_compare:
+    if pass2_compare is not None:
+        ui.section("Pass-1 vs Pass-2 (Tekan Miss-Deadline)", eyebrow="Perbandingan berdampingan — sebelum vs sesudah optimasi kedua")
+        b, a = pass2_compare["before"], pass2_compare["after"]
+        cmp_df = pd.DataFrame({
+            "Metrik": ["Miss-deadline", "On-time KPI (%)", "Late KPI (Reg C/D)", "km/well",
+                       "Crew-day", "Sumur terjadwal", "PRQ terjadwal", "AddMan terjadwal"],
+            "Pass-1 (utama)": [b["miss"], f"{b['ontime_pct']:.1f}%", b["late"], f"{b['km_well']:.3f}",
+                               b["crew"], b["sched"], b["prq"], b["addman"]],
+            "Pass-2 (tekan miss)": [a["miss"], f"{a['ontime_pct']:.1f}%", a["late"], f"{a['km_well']:.3f}",
+                                    a["crew"], a["sched"], a["prq"], a["addman"]],
+        })
+        st.dataframe(cmp_df, hide_index=True, use_container_width=True)
+        _dmiss = b["miss"] - a["miss"]; _dkm = a["km_well"] - b["km_well"]
+        st.caption(f"Miss-deadline **{b['miss']} → {a['miss']}** (−{_dmiss}). "
+                   f"Ongkos: km/well {b['km_well']:.2f} → {a['km_well']:.2f} ({_dkm:+.2f}), "
+                   f"crew-day {b['crew']} → {a['crew']}. "
+                   f"AddMan+PRQ fleksibel (kapan saja dalam rentang, tak dihitung late). "
+                   f"KPI = RTN A/B/C/D + AWS/NW.")
+        st.divider()
     ui.section("Komparasi Rute: Manual vs WELLGO", eyebrow="Evaluasi Efisiensi Jarak & Distribusi Harian")
     
     if manual_file is None:
