@@ -813,7 +813,7 @@ def cmap(label, labels):
     except ValueError: return [130, 130, 130]
 
 
-def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, prq_soft_cap=8):
+def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, prq_soft_cap=8, addman_skip_km=0.0, due_first=False, notdue_fill_km=5.0):
     """Optimasi kedua penekan miss-deadline (boleh mengubah hasil pass-1).
     Kebijakan: NW/AWS + Reg A/B WAJIB on-time; Reg C/D boleh late; AddMan+PRQ fleksibel isi sisa;
     PRQ sisa boleh overflow ke rute terdekat sampai soft cap. Return (week_df_baru, ringkasan)."""
@@ -824,7 +824,7 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
     sub = wd.loc[in_scope].drop_duplicates("well").reset_index(drop=True)
     n = len(sub)
     if n == 0:
-        return week_df, {"miss_before": 0, "miss_after": 0, "overflow": []}
+        return week_df, {"miss_before": 0, "miss_after": 0, "addman_deferred": 0, "notdue_deferred": 0, "overflow": [], "overflow_wells": []}
 
     lat = sub["lat"].to_numpy(float); lon = sub["lon"].to_numpy(float)
     zone = np.where(sub["area"].isin(REMOTE_AREAS), "remote", "nonremote")
@@ -914,23 +914,24 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
         key = where.pop(w); routes[key].remove(w)
         if not routes[key]: del routes[key]
 
-    def repair(pool):
+    def repair(pool, defer_above=None):
         pool = list(pool)
         while pool:
-            bw = None; breg = -1e18; bkey = bpos = None
+            bw = None; breg = -1e18; bkey = bpos = None; bd0 = 0.0
             for w in pool:
                 cands = candidate_keys(w)
                 costs = sorted((ins_cost(w, k) + (k,) for k in cands), key=lambda x: x[0]) if cands else []
                 if not costs:
                     reg = P_PRIO if prio[w] else P_REG
-                    if reg > breg: breg, bw, bkey, bpos = reg, w, None, None
+                    if reg > breg: breg, bw, bkey, bpos, bd0 = reg, w, None, None, 0.0
                     continue
                 d0, p0, k0 = costs[0]
                 d1 = costs[1][0] if len(costs) > 1 else d0 + 1000
                 reg = (d1 - d0) + (6000 if prio[w] else 0)
-                if reg > breg: breg, bw, bkey, bpos = reg, w, k0, p0
+                if reg > breg: breg, bw, bkey, bpos, bd0 = reg, w, k0, p0, d0
             pool.remove(bw)
-            if bkey is not None: do_insert(bw, bkey, bpos)
+            if bkey is not None and (defer_above is None or bd0 <= defer_above):
+                do_insert(bw, bkey, bpos)
 
     def relocate_pass():
         improved = False
@@ -948,18 +949,44 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
                 do_remove(w); do_insert(w, best[1], best[2]); improved = True
         return improved
 
-    # cabut AddMan+PRQ, isi berjenjang (regret A/B → C → D → AddMan → PRQ), lalu polish
-    for w in [w for w in list(where) if is_flex[w]]:
-        do_remove(w)
+    is_due = (max_day <= horizon)   # deadline di dalam periode ini
     unpl = lambda pred: [w for w in range(n) if pred(w) and w not in where]
-    repair(unpl(lambda w: prio[w] and not isprq[w]))
-    repair(unpl(lambda w: catg[w] == "Regular C" and not isprq[w]))
-    repair(unpl(lambda w: catg[w] == "Regular D" and not isprq[w]))
-    repair(unpl(lambda w: is_addman[w] and not isprq[w]))
-    repair(unpl(lambda w: isprq[w]))
-    for _ in range(3):
-        if not relocate_pass(): break
-    for k in list(routes): routes[k] = two_opt(routes[k])
+
+    if due_first:
+        # Fill-last untuk not-yet-due: cabut AddMan+PRQ + semua not-yet-due dari slot,
+        # jadwalkan DUE dulu (buka crew-day seperlunya), lalu not-yet-due cuma numpang slot kosong.
+        for w in [w for w in list(where) if is_flex[w] or not is_due[w]]:
+            do_remove(w)
+        repair(unpl(lambda w: is_due[w] and prio[w] and not isprq[w]))
+        repair(unpl(lambda w: is_due[w] and catg[w] == "Regular C" and not isprq[w]))
+        repair(unpl(lambda w: is_due[w] and catg[w] == "Regular D" and not isprq[w]))
+        repair(unpl(lambda w: is_due[w] and is_addman[w] and not isprq[w]), defer_above=(addman_skip_km if addman_skip_km and addman_skip_km > 0 else None))
+        repair(unpl(lambda w: is_due[w] and isprq[w]))
+        for _ in range(3):
+            if not relocate_pass(): break
+        for k in list(routes): routes[k] = two_opt(routes[k])
+        # NOT-YET-DUE isi sisa: HANYA rute existing (tanpa crew-day baru), yang dekat (≤ ambang)
+        _fill_km = notdue_fill_km if notdue_fill_km and notdue_fill_km > 0 else 5.0
+        for w in sorted([w for w in range(n) if not is_due[w] and w not in where], key=lambda x: max_day[x]):
+            best = None
+            for nb in nbr[w]:
+                k = where.get(nb)
+                if k is not None and feasible(w, k):
+                    dd, pos = cheapest_insert(routes[k], w)
+                    if dd <= _fill_km and (best is None or dd < best[0]): best = (dd, k, pos)
+            if best: do_insert(w, best[1], best[2])
+    else:
+        # mode normal: cabut AddMan+PRQ, isi berjenjang (regret A/B → C → D → AddMan → PRQ)
+        for w in [w for w in list(where) if is_flex[w]]:
+            do_remove(w)
+        repair(unpl(lambda w: prio[w] and not isprq[w]))
+        repair(unpl(lambda w: catg[w] == "Regular C" and not isprq[w]))
+        repair(unpl(lambda w: catg[w] == "Regular D" and not isprq[w]))
+        repair(unpl(lambda w: is_addman[w] and not isprq[w]), defer_above=(addman_skip_km if addman_skip_km and addman_skip_km > 0 else None))
+        repair(unpl(lambda w: isprq[w]))
+        for _ in range(3):
+            if not relocate_pass(): break
+        for k in list(routes): routes[k] = two_opt(routes[k])
 
     # PRQ overflow: sisa PRQ nempel ke rute TERDEKAT sezona (boleh > max sampai soft cap)
     overflow_wells = []
@@ -973,10 +1000,11 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
             _, pos = cheapest_insert(routes[best[1]], w)
             do_insert(w, best[1], pos); overflow_wells.append(sub["well"].iloc[w])
 
-    # miss sebelum (dari week_df asli, dalam scope) & sesudah
-    miss_before = int((~sub["scheduled"].fillna(False) & (sub["max_date"] <= per_hi_ts)).sum())
-    scheduled_now = set(where.keys())
-    miss_after = sum(1 for w in range(n) if w not in scheduled_now and max_day[w] <= horizon)
+    # miss = HANYA KPI wells (NW/AWS + Reg A/B/C/D); AddMan/PRQ fleksibel → tak dihitung miss
+    miss_before = int((~sub["scheduled"].fillna(False) & (sub["max_date"] <= per_hi_ts) & ~is_flex).sum())
+    miss_after = sum(1 for w in range(n) if w not in where and max_day[w] <= horizon and not is_flex[w])
+    addman_deferred = sum(1 for w in range(n) if is_addman[w] and w not in where)
+    notdue_deferred = sum(1 for w in range(n) if (max_day[w] > horizon) and w not in where)
     overflow_routes = [(k, len(v)) for k, v in routes.items() if len(v) > max_wells]
 
     # tulis balik ke week_df
@@ -1002,8 +1030,8 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
             out.at[i, "day_idx"] = 0
     for c in dtc:
         out[c] = pd.to_datetime(out[c], errors="coerce")
-    return out, {"miss_before": miss_before, "miss_after": miss_after,
-                 "overflow": overflow_routes, "overflow_wells": overflow_wells}
+    return out, {"miss_before": miss_before, "miss_after": miss_after, "addman_deferred": addman_deferred,
+                 "notdue_deferred": notdue_deferred, "overflow": overflow_routes, "overflow_wells": overflow_wells}
 
 
 def pass2_kpis(week_df, per_hi_ts, days):
@@ -1201,6 +1229,21 @@ with st.sidebar:
             help="Optimasi kedua setelah jadwal utama: boleh menggeser hasil pass-1 untuk menghapus miss-deadline. "
                  "NW/AWS + Reg A/B wajib on-time; Reg C/D boleh late; AddMan+PRQ fleksibel isi sisa; "
                  "PRQ sisa boleh menempel rute terdekat >6 (overflow, ditandai). Menggantikan rescue manual + lompat tab.")
+        addman_skip_km = st.slider("↳ Tunda AddMan jauh jika ongkos sisip > (km)", 0.0, 30.0, 0.0, 0.5,
+            disabled=not pass2_on,
+            help="0 = tes semua AddMan (km/well lebih tinggi, cakupan penuh). Turunkan untuk menunda AddMan yang "
+                 "terlalu terisolasi ke periode berikutnya → km/well lebih rendah. Contoh di data 8–14 Jul: "
+                 "~7 km ≈ 0.94 km/well (6 AddMan ditunda); 0 ≈ 1.04 km/well (semua tes). Tak memengaruhi RTN/AWS/miss.")
+        due_first = st.checkbox("↳ Prioritaskan due periode ini (not-yet-due isi sisa)", value=False,
+            disabled=not pass2_on,
+            help="Jadwalkan dulu sumur yang deadline-nya DI DALAM periode (buka crew-day seperlunya). "
+                 "Sumur yang deadline-nya periode DEPAN (not-yet-due) cuma numpang slot kosong rute existing "
+                 "(tanpa crew-day baru); yang jauh ditunda ke periode aslinya. Hemat crew-day besar. "
+                 "Contoh 8–14 Jul: crew-day 63→~44.")
+        notdue_fill_km = st.slider("   ↳ Maks detour not-yet-due numpang (km)", 0.0, 20.0, 5.0, 0.5,
+            disabled=(not pass2_on) or (not due_first),
+            help="Not-yet-due cuma diselipkan ke rute existing bila detour-nya ≤ ini (get-ahead murah). "
+                 "Besarkan → lebih banyak not-yet-due nyicil; kecilkan → makin ketat, crew-day makin hemat.")
         
         time_budget = st.slider("Time Budget / Hari (Menit)", 180, 540, 360, 30, disabled=not use_dur)
         speed = st.slider("Kecepatan Rata-rata Fleet (km/jam)", 10, 60, 25, 5)
@@ -1508,7 +1551,7 @@ pass2_summary = None
 pass2_compare = None
 if pass2_on and len(week_df):
     _wd_before = week_df.copy()
-    week_df, pass2_summary = pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote)
+    week_df, pass2_summary = pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, addman_skip_km=addman_skip_km, due_first=due_first, notdue_fill_km=notdue_fill_km)
     pass2_compare = {"before": pass2_kpis(_wd_before, per_hi_ts, days),
                      "after": pass2_kpis(week_df, per_hi_ts, days)}
 
@@ -2228,14 +2271,19 @@ with tab_cart:
     if pass2_summary is not None:
         _mb, _ma = pass2_summary["miss_before"], pass2_summary["miss_after"]
         _ov = pass2_summary.get("overflow", [])
+        _def = pass2_summary.get("addman_deferred", 0)
+        _ndef = pass2_summary.get("notdue_deferred", 0)
+        _defmsg = (f" {_def} AddMan jauh ditunda." if _def else "") + \
+                  (f" {_ndef} sumur not-yet-due (deadline periode depan) ditunda → crew-day lebih hemat." if _ndef else "")
         if _ma == 0:
             st.success(f"🚑 **Pass-2 aktif** — miss-deadline **{_mb} → {_ma}**. "
                        f"NW/AWS + Reg A/B on-time, Reg C/D boleh late, AddMan+PRQ isi sisa."
-                       + (f" PRQ overflow di {len(_ov)} rute (>6): {sorted(c for _,c in _ov)}." if _ov else ""))
+                       + (f" PRQ overflow di {len(_ov)} rute (>6): {sorted(c for _,c in _ov)}." if _ov else "")
+                       + _defmsg)
         else:
             st.warning(f"🚑 **Pass-2 aktif** — miss-deadline **{_mb} → {_ma}** (sisa {_ma} tak bisa dimuat "
                        f"walau geser + overflow; kemungkinan kapasitas/zona benar-benar penuh)."
-                       + (f" PRQ overflow di {len(_ov)} rute." if _ov else ""))
+                       + (f" PRQ overflow di {len(_ov)} rute." if _ov else "") + _defmsg)
         st.divider()
 
     # ── 🚑 Rescue Miss-Deadline (Tahap 2) ─────────────────────────────────
