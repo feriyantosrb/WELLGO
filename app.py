@@ -1063,6 +1063,38 @@ def pass2_kpis(week_df, per_hi_ts, days):
                 prq=int((sch & prq).sum()), addman=int((sch & cat.str.startswith("Add Manual")).sum()))
 
 
+def fill_notdue(week_df, days, per_hi_ts, max_wells, fill_km=5.0):
+    """Isi not-yet-due (deadline > akhir periode) ke SLOT KOSONG rute existing (tanpa crew-day baru),
+    hanya yang detour ≤ fill_km. Return (week_df_baru, jumlah_terisi, jumlah_ditunda)."""
+    base = pd.Timestamp(days[0]); horizon = len(days)
+    out = week_df.copy()
+    _s = out["scheduled"].fillna(False)
+    sch = out[_s & out["lat"].notna()]
+    nd = out[~_s & (out["max_date"] > per_hi_ts) & out["lat"].notna()].sort_values("max_date")
+    if not len(sch) or not len(nd):
+        return out, 0, int((~_s & (out["max_date"] > per_hi_ts)).sum())
+    routes = {}
+    for _, r in sch.iterrows():
+        routes.setdefault((r["plan_unit"], int(r["day_idx"])), []).append((r["lat"], r["lon"]))
+    zof = lambda u: "remote" if u in REMOTE_UNITS else "nonremote"
+    filled = 0
+    for i, w in nd.iterrows():
+        wz = "remote" if w["area"] in REMOTE_AREAS else "nonremote"
+        wmin = int((w["min_date"] - base).days + 1) if pd.notna(w["min_date"]) else 1
+        best = None
+        for (u, d), pts in routes.items():
+            if zof(u) != wz or len(pts) >= max_wells or d < max(1, wmin): continue
+            dmin = min(float(haversine_km(w["lat"], w["lon"], la, lo)) for la, lo in pts)
+            if dmin <= fill_km and (best is None or dmin < best[0]): best = (dmin, (u, d))
+        if best:
+            u, d = best[1]; routes[(u, d)].append((w["lat"], w["lon"]))
+            out.at[i, "scheduled"] = True; out.at[i, "plan_unit"] = u
+            out.at[i, "day_idx"] = d; out.at[i, "plan_day"] = days[d - 1]
+            filled += 1
+    deferred = int((~out["scheduled"].fillna(False) & (out["max_date"] > per_hi_ts)).sum())
+    return out, filled, deferred
+
+
 # ================================================================== UI Configuration
 init_db()
 
@@ -1234,14 +1266,13 @@ with st.sidebar:
             help="0 = tes semua AddMan (km/well lebih tinggi, cakupan penuh). Turunkan untuk menunda AddMan yang "
                  "terlalu terisolasi ke periode berikutnya → km/well lebih rendah. Contoh di data 8–14 Jul: "
                  "~7 km ≈ 0.94 km/well (6 AddMan ditunda); 0 ≈ 1.04 km/well (semua tes). Tak memengaruhi RTN/AWS/miss.")
-        due_first = st.checkbox("↳ Prioritaskan due periode ini (not-yet-due isi sisa)", value=False,
-            disabled=not pass2_on,
-            help="Jadwalkan dulu sumur yang deadline-nya DI DALAM periode (buka crew-day seperlunya). "
+        due_first = st.checkbox("🗓️ Prioritaskan due periode ini (not-yet-due isi sisa)", value=False,
+            help="Pass-1 due-first: jadwalkan dulu sumur yang deadline-nya DI DALAM periode (buka crew-day seperlunya). "
                  "Sumur yang deadline-nya periode DEPAN (not-yet-due) cuma numpang slot kosong rute existing "
                  "(tanpa crew-day baru); yang jauh ditunda ke periode aslinya. Hemat crew-day besar. "
-                 "Contoh 8–14 Jul: crew-day 63→~44.")
+                 "Contoh 8–14 Jul: crew-day 63→~44. Bisa dikombinasi dengan Pass-2.")
         notdue_fill_km = st.slider("   ↳ Maks detour not-yet-due numpang (km)", 0.0, 20.0, 5.0, 0.5,
-            disabled=(not pass2_on) or (not due_first),
+            disabled=not due_first,
             help="Not-yet-due cuma diselipkan ke rute existing bila detour-nya ≤ ini (get-ahead murah). "
                  "Besarkan → lebih banyak not-yet-due nyicil; kecilkan → makin ketat, crew-day makin hemat.")
         
@@ -1468,8 +1499,21 @@ for (_u, _dk) in st.session_state.get("unit_blackout", []):
     unit_blackout_by_day.setdefault(_dk, set()).add(_u)
 
 # ── Rollout Execution Framework ────────────────────────────────────────────
+notdue_fill_summary = None
 if len(elig):
-    if two_layer:
+    if due_first:
+        # PASS-1 due-first: jadwalkan sumur DUE (deadline dalam periode) dulu; not-yet-due numpang slot sisa
+        elig_due = elig[elig["max_date"] <= batch_hi].copy()
+        elig_nd = elig[elig["max_date"] > batch_hi].copy()
+        if len(elig_due):
+            wk_due = plan_week(elig_due, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day)
+        else:
+            wk_due = elig_due.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
+        nd_rows = elig_nd.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
+        week_df = pd.concat([wk_due, nd_rows], ignore_index=True)
+        week_df, _nfill, _ndef = fill_notdue(week_df, days, per_hi_ts, max_wells, notdue_fill_km)
+        notdue_fill_summary = {"filled": _nfill, "deferred": _ndef}
+    elif two_layer:
         # Lapis 1: sumur prioritas (NW/AWS/PRQ/ORQ + carry NCMP) dioptimasi lebih dulu
         _prio_mask = elig["is_nwaws"].fillna(False) | elig["req_tag"].isin(["PRQ", "ORQ"]) | elig["carry_ncmp"].fillna(False)
         prio_elig = elig[_prio_mask].copy()
@@ -1551,7 +1595,7 @@ pass2_summary = None
 pass2_compare = None
 if pass2_on and len(week_df):
     _wd_before = week_df.copy()
-    week_df, pass2_summary = pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, addman_skip_km=addman_skip_km, due_first=due_first, notdue_fill_km=notdue_fill_km)
+    week_df, pass2_summary = pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote, addman_skip_km=addman_skip_km)
     pass2_compare = {"before": pass2_kpis(_wd_before, per_hi_ts, days),
                      "after": pass2_kpis(week_df, per_hi_ts, days)}
 
@@ -1757,6 +1801,11 @@ with tab_guide:
     guide.render_guide()
 
 with tab_sched:
+    if notdue_fill_summary is not None:
+        _nf, _nd = notdue_fill_summary["filled"], notdue_fill_summary["deferred"]
+        st.info(f"🗓️ **Due-first aktif** — sumur due periode ini diprioritaskan. "
+                f"{_nf} sumur not-yet-due dicicil ke slot sisa (get-ahead gratis), **{_nd} ditunda** ke periode aslinya "
+                f"(hemat crew-day). Nyalakan Pass-2 untuk menghapus sisa miss due.")
     if len(scheduled_all) == 0:
         st.info("Belum ada jadwal yang berhasil dialokasikan pada siklus ini.")
     else:
