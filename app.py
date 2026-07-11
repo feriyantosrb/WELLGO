@@ -930,7 +930,9 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
                 reg = (d1 - d0) + (6000 if prio[w] else 0)
                 if reg > breg: breg, bw, bkey, bpos, bd0 = reg, w, k0, p0, d0
             pool.remove(bw)
-            if bkey is not None and (defer_above is None or bd0 <= defer_above):
+            # defer hanya bila di atas ambang DAN not-yet-due (deadline periode depan);
+            # sumur due (max_day<=horizon) selalu dijadwalkan (jangan pernah bikin miss beneran)
+            if bkey is not None and (defer_above is None or bd0 <= defer_above or max_day[bw] <= horizon):
                 do_insert(bw, bkey, bpos)
 
     def relocate_pass():
@@ -1263,9 +1265,10 @@ with st.sidebar:
                  "PRQ sisa boleh menempel rute terdekat >6 (overflow, ditandai). Menggantikan rescue manual + lompat tab.")
         addman_skip_km = st.slider("↳ Tunda AddMan jauh jika ongkos sisip > (km)", 0.0, 30.0, 0.0, 0.5,
             disabled=not pass2_on,
-            help="0 = tes semua AddMan (km/well lebih tinggi, cakupan penuh). Turunkan untuk menunda AddMan yang "
-                 "terlalu terisolasi ke periode berikutnya → km/well lebih rendah. Contoh di data 8–14 Jul: "
-                 "~7 km ≈ 0.94 km/well (6 AddMan ditunda); 0 ≈ 1.04 km/well (semua tes). Tak memengaruhi RTN/AWS/miss.")
+            help="Tunda AddMan yang terisolasi (ongkos sisip > ambang) — TAPI hanya yang NOT-yet-due "
+                 "(deadline periode depan); AddMan yang due periode ini selalu dijadwalkan (tak pernah bikin miss). "
+                 "Efek km/well tergantung data (kecil bila AddMan jauh justru due). Untuk hemat crew-day yang "
+                 "signifikan, pakai 'Prioritaskan due periode ini' di bawah. 0 = tes semua.")
         due_first = st.checkbox("🗓️ Prioritaskan due periode ini (not-yet-due isi sisa)", value=False,
             help="Pass-1 due-first: jadwalkan dulu sumur yang deadline-nya DI DALAM periode (buka crew-day seperlunya). "
                  "Sumur yang deadline-nya periode DEPAN (not-yet-due) cuma numpang slot kosong rute existing "
