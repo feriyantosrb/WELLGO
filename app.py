@@ -1097,6 +1097,81 @@ def fill_notdue(week_df, days, per_hi_ts, max_wells, fill_km=5.0):
     return out, filled, deferred
 
 
+COPILOT_SYSTEM = """Kamu copilot untuk WELLGO, aplikasi penjadwalan Mobile Well Test (MWT) di PT Pertamina Hulu Rokan area SLN (WK Rokan). Tugasmu MENJELASKAN & MENJAWAB pertanyaan tentang jadwal yang SUDAH dihitung engine. Kamu TIDAK menjadwalkan/mengubah apa pun — penjadwalan dilakukan engine deterministik, bukan kamu.
+
+Aturan domain WELLGO:
+- 9 unit MWT: 5 remote (area BANGKO/BALAM) + 4 non-remote (BEKASAP). Sumur remote hanya boleh unit remote & sebaliknya (constraint keras). Kapasitas 6 sumur/unit/hari (PRQ boleh overflow s.d. 8).
+- Prioritas waktu per kategori: NW/AWS + Regular A/B WAJIB on-time; Regular C/D boleh late; Add Manual & PRQ fleksibel (boleh kapan saja dalam rentang). Prioritas RTN: A>B>C>D. Regular A dipantau KPI.
+- AWS dua-fase (AWS1 lalu AWS2). "Due periode ini" = deadline (max_execution_date) di dalam periode; "not-yet-due" = deadline periode depan.
+- Pass-2 "Tekan Miss-Deadline" = optimasi kedua yang menggeser jadwal untuk menghapus miss. Due-first = dahulukan sumur due; not-yet-due isi slot sisa / ditunda (hemat crew-day).
+- Definisi: miss-deadline = sumur DUE yang tak terjadwal. km/well = jarak haversine rata-rata per sumur. crew-day = jumlah (unit,hari) terpakai.
+
+Instruksi:
+- Jawab HANYA dari KONTEKS JADWAL yang diberikan. JANGAN mengarang sumur/angka yang tak ada di konteks; bila tak ada, bilang tidak tahu / arahkan ke tab terkait.
+- Ringkas, Bahasa Indonesia kasual gaya lapangan.
+- Bila diminta mengubah jadwal, jelaskan caranya lewat kontrol yang ada (toggle Pass-2, Due-first, Cart Manual) — jangan klaim sudah mengubah.
+- Deteksi anomali: bandingkan dengan aturan domain di atas, tandai yang menyimpang (mis. sumur remote ke unit non-remote, kapasitas >6 non-PRQ, Reg A miss/late)."""
+
+
+def copilot_context(week_df, days, batch_lo, batch_hi, pass2_summary=None, notdue_fill_summary=None, max_rows=350):
+    horizon = len(days)
+    wd = week_df.copy()
+    sch = wd[wd["scheduled"].fillna(False)]
+    L = []
+    L.append(f"Periode {pd.Timestamp(batch_lo).date()}..{pd.Timestamp(batch_hi).date()} ({horizon} hari); hari 1={days[0].date()}, hari {horizon}={days[-1].date()}.")
+    L.append(f"Eligible={len(wd)}, terjadwal={len(sch)}, tak terjadwal={len(wd)-len(sch)}.")
+    miss = wd[~wd["scheduled"].fillna(False) & (wd["max_date"] <= batch_hi)]
+    L.append(f"Miss-deadline (due & tak terjadwal)={len(miss)}.")
+    if len(miss):
+        L.append("  Miss: " + ", ".join(f"{r['well']}({r['category']},dl {pd.Timestamp(r['max_date']).date()})" for _, r in miss.head(40).iterrows()))
+    import collections
+    catc = collections.Counter(str(c) for c in sch["category"])
+    L.append("Terjadwal/kategori: " + ", ".join(f"{k}={v}" for k, v in sorted(catc.items())))
+    L.append("Sumur/hari: " + ", ".join(f"h{int(d)}={n}" for d, n in sorted(sch.groupby('day_idx').size().to_dict().items())))
+    L.append(f"Crew-day terpakai={sch.groupby(['plan_unit','day_idx']).ngroups}. Terjadwal DUE={int((sch['max_date']<=batch_hi).sum())}, NOT-yet-due={int((sch['max_date']>batch_hi).sum())}.")
+    if pass2_summary:
+        L.append(f"Pass-2: miss {pass2_summary.get('miss_before')}→{pass2_summary.get('miss_after')}, AddMan ditunda={pass2_summary.get('addman_deferred',0)}, not-yet-due ditunda={pass2_summary.get('notdue_deferred',0)}, overflow rute={len(pass2_summary.get('overflow',[]))}.")
+    if notdue_fill_summary:
+        L.append(f"Due-first: not-yet-due dicicil={notdue_fill_summary.get('filled')}, ditunda={notdue_fill_summary.get('deferred')}.")
+    want = [c for c in ["well", "plan_unit", "day_idx", "category", "field", "area", "min_date", "max_date"] if c in sch.columns]
+    L.append("\nJADWAL (" + "|".join(want) + "):")
+    for _, r in sch[want].head(max_rows).iterrows():
+        cells = []
+        for c in want:
+            v = r[c]
+            if c in ("min_date", "max_date"): v = pd.Timestamp(v).date() if pd.notna(v) else "-"
+            elif c == "day_idx": v = f"h{int(v)}"
+            cells.append(str(v))
+        L.append("|".join(cells))
+    if len(sch) > max_rows:
+        L.append(f"...(+{len(sch)-max_rows} baris lagi tak ditampilkan)")
+    return "\n".join(L)
+
+
+def copilot_answer(question, context, history=None):
+    try:
+        import anthropic
+    except Exception:
+        return None, "Paket `anthropic` belum terpasang — tambahkan ke requirements.txt lalu redeploy."
+    key = None
+    try: key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception: key = None
+    if not key: key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None, "API key belum diset. Streamlit Cloud: Settings → Secrets → tambah `ANTHROPIC_API_KEY`. Lokal: `.streamlit/secrets.toml`."
+    model = "claude-sonnet-4-5"
+    try:
+        model = st.secrets.get("ANTHROPIC_MODEL", model) or model
+    except Exception: pass
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        msgs = list(history or []) + [{"role": "user", "content": f"KONTEKS JADWAL:\n{context}\n\nPERTANYAAN: {question}"}]
+        resp = client.messages.create(model=model, max_tokens=1200, system=COPILOT_SYSTEM, messages=msgs)
+        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text"), None
+    except Exception as e:
+        return None, f"Gagal memanggil API: {e}"
+
+
 # ================================================================== UI Configuration
 init_db()
 
@@ -1795,9 +1870,9 @@ def _comp_review_panel(df_src, key, only_hits=False):
         else:
             st.warning("Belum ada sumur yang dicentang.")
 
-tab_guide, tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics, tab_priority, tab_export, tab_compare = st.tabs([
+tab_guide, tab_sched, tab_map, tab_matrix, tab_cart, tab_sch, tab_diagnostics, tab_priority, tab_export, tab_compare, tab_copilot = st.tabs([
     "📘 Panduan", "📅 Jadwal Operasional", "🗺️ Peta Rute", "📊 Matriks Deviasi", "🛒 Cart Manual",
-    "🗃️ SCH Database", "📏 Analisis Jarak", "⭐ Prioritas & Status Khusus", "📤 Export", "⚖️ Komparasi"
+    "🗃️ SCH Database", "📏 Analisis Jarak", "⭐ Prioritas & Status Khusus", "📤 Export", "⚖️ Komparasi", "🤖 Copilot"
 ])
 
 with tab_guide:
@@ -3106,3 +3181,42 @@ with col_f2:
         st.session_state["force_on_nwaws"] = []
         st.session_state["rescued_wells"] = []
         st.rerun()
+
+# ── 🤖 Copilot (AI, read-only) ─────────────────────────────────────────────
+with tab_copilot:
+    ui.section("🤖 Copilot WELLGO", eyebrow="Tanya & jelaskan jadwal — read-only, tidak mengubah jadwal")
+    st.caption("Contoh: “kenapa ada sisa miss?”, “unit mana paling sibuk hari Kamis?”, “ada anomali zona/kapasitas?”, "
+               "“jelaskan kenapa crew-day turun”, “sumur due mana yang belum kebagian?”")
+    if "copilot_hist" not in st.session_state:
+        st.session_state["copilot_hist"] = []
+    for _role, _txt in st.session_state["copilot_hist"]:
+        st.markdown(f"**{'🧑 Kamu' if _role == 'user' else '🤖 Copilot'}:** {_txt}")
+    _cq = st.text_area("Pertanyaan", key="copilot_q", height=90,
+                       placeholder="Tanya apa saja tentang jadwal periode ini…")
+    _c1, _c2, _ = st.columns([1, 1, 3])
+    _ask = _c1.button("Tanya Copilot", type="primary", key="copilot_ask", disabled=(len(week_df) == 0))
+    if _c2.button("Bersihkan", key="copilot_clr"):
+        st.session_state["copilot_hist"] = []
+        st.rerun()
+    if _ask and _cq.strip():
+        _ctx = copilot_context(week_df, days, batch_lo, batch_hi,
+                               pass2_summary if "pass2_summary" in dir() else None,
+                               notdue_fill_summary if "notdue_fill_summary" in dir() else None)
+        _hist = [{"role": r, "content": t} for r, t in st.session_state["copilot_hist"]]
+        with st.spinner("Copilot menganalisis jadwal…"):
+            _ans, _err = copilot_answer(_cq.strip(), _ctx, _hist)
+        if _err:
+            st.warning(_err)
+        else:
+            st.session_state["copilot_hist"].append(("user", _cq.strip()))
+            st.session_state["copilot_hist"].append(("assistant", _ans))
+            st.rerun()
+    with st.expander("⚙️ Setup & catatan"):
+        st.markdown(
+            "- **Read-only**: copilot menjelaskan & menjawab; ia **tidak** mengubah jadwal. "
+            "Perubahan tetap lewat kontrol deterministik (toggle Pass-2, Due-first, Cart Manual).\n"
+            "- **Aktivasi**: tambahkan `anthropic` ke `requirements.txt`, lalu set `ANTHROPIC_API_KEY` "
+            "(opsional `ANTHROPIC_MODEL`) di **Streamlit → Settings → Secrets** (atau `.streamlit/secrets.toml` lokal).\n"
+            "- Jawaban di-*ground* ke ringkasan jadwal saat ini (kategori, miss, distribusi hari/unit, due vs not-yet-due, "
+            "status Pass-2/Due-first) supaya tidak mengarang."
+        )
