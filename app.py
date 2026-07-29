@@ -714,8 +714,12 @@ def pass2_tekan_miss(week_df, days, per_hi_ts, max_wells, n_remote, n_nonremote,
                 delta, pos = ins_cost(w, key)
                 if gain0 - delta > 1e-6 and (best is None or gain0 - delta > best[0]): best = (gain0 - delta, key, pos)
             if best:
-                routes[cur].remove(w); if not routes[cur]: del routes[cur]
-                routes.setdefault(best[1], []).insert(best[2], w); where[w] = best[1]; improved = True
+                routes[cur].remove(w)
+                if not routes[cur]: 
+                    del routes[cur]
+                routes.setdefault(best[1], []).insert(best[2], w)
+                where[w] = best[1]
+                improved = True
         return improved
 
     is_due = (max_day <= horizon)
