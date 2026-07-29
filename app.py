@@ -295,7 +295,7 @@ def load_candidates(file_bytes, sheet):
     status_col = next((c for c in df.columns if str(c).strip().upper() in ("WELL STATUS", "LAST_STATUS")), None)
     df["status"] = (df[status_col].astype(str).str.upper().str.strip() if status_col else "ON")
     sch_col = next((c for c in df.columns if str(c).strip().upper() in ("SCH STATUS", "SCH_STATUS")), None)
-    df["sch_status"] = (df[sch_col].astype(str).str.upper().str.strip() if sch_col else "").replace({"NAN": "", "NONE": ""})
+    df["sch_status"] = df[sch_col].astype(str).str.upper().str.strip().replace({"NAN": "", "NONE": ""}) if sch_col else ""
     return df
 
 def good_coord(lat, lon):
