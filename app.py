@@ -8,6 +8,7 @@ Run: py -m streamlit run app.py
 """
 
 import re
+import os
 import json
 import sqlite3
 import math
@@ -29,6 +30,7 @@ st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wid
 ui.inject_theme()
 
 DB_PATH = "welltest_status.db"
+ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 
 def db_connect():
     """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
@@ -776,37 +778,130 @@ def road_detour_factor(cache):
     f = float(np.median(rs))
     return f if f >= 1.0 else 1.0
 
-def load_road_dist():
-    con = db_connect()
-    try:
-        df = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
-    except Exception:
-        df = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
-    con.close()
-    # Bangun dict lewat zip kolom (jauh lebih cepat dari itertuples untuk jutaan baris).
+def _pack_coords(lat, lon):
+    """Kemas (lat,lon) bulat-5-desimal jadi satu int64 untuk penyaringan vektor cepat."""
+    ilat = np.rint(np.asarray(lat, dtype=float) * 1e5).astype(np.int64)
+    ilon = np.rint(np.asarray(lon, dtype=float) * 1e5).astype(np.int64)
+    return ilat * np.int64(20_000_000) + ilon
+
+def _dict_from_dist_df(df, need_arr=None):
+    """Dict {((alat,alon),(blat,blon)): km} dari DataFrame. Bila need_arr diberikan (array
+    int64 hasil _pack_coords), HANYA pasangan yang KEDUA ujungnya ada di need_arr yang diambil,
+    supaya dict tetap kecil di memori (cegah OOM di Streamlit Cloud saat cache jutaan pasangan)."""
+    if df is None or not len(df):
+        return {}
+    if need_arr is not None:
+        ka = _pack_coords(df["alat"].values, df["alon"].values)
+        kb = _pack_coords(df["blat"].values, df["blon"].values)
+        mask = np.isin(ka, need_arr) & np.isin(kb, need_arr)
+        df = df[mask]
+        if not len(df):
+            return {}
     a = zip(df["alat"].tolist(), df["alon"].tolist())
     b = zip(df["blat"].tolist(), df["blon"].tolist())
     return dict(zip(zip(a, b), df["km"].astype(float).tolist()))
 
+def _need_arr(need):
+    """need: iterable koordinat (lat,lon) sumur relevan → array int64 unik untuk penyaringan.
+    None/kosong → None (muat semua; hati-hati untuk cache besar)."""
+    if not need:
+        return None
+    pts = np.array(list(need), dtype=float)
+    if pts.ndim != 2 or len(pts) == 0:
+        return None
+    return np.unique(_pack_coords(pts[:, 0], pts[:, 1]))
+
+def _parquet_sig():
+    try:
+        _s = os.stat(ROAD_PARQUET)
+        return (int(_s.st_size), int(_s.st_mtime))
+    except Exception:
+        return (0, 0)
+
+@st.cache_resource(show_spinner=False)
+def _parquet_arrays(pq_sig):
+    """Baca Parquet SEKALI per sesi jadi array numpy (coords + km + kunci terkemas), lalu
+    dipakai ulang untuk penyaringan per periode TANPA baca ulang file jutaan baris tiap kali.
+    Ini yang membuat run cepat: bacaan berat hanya sekali, filter per periode murah (numpy)."""
+    if not os.path.exists(ROAD_PARQUET):
+        return None
+    try:
+        df = pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
+    except Exception:
+        return None
+    ka = _pack_coords(df["alat"].values, df["alon"].values)
+    kb = _pack_coords(df["blat"].values, df["blon"].values)
+    return (df["alat"].to_numpy(), df["alon"].to_numpy(),
+            df["blat"].to_numpy(), df["blon"].to_numpy(),
+            df["km"].to_numpy(dtype=float), ka, kb)
+
+def load_road_dist(need=None):
+    # Basis Parquet (array ter-cache sesi) + tambahan SQLite, DISARING ke pasangan antar sumur
+    # `need`. Penyaringan = np.isin atas array yang sudah di memori → cepat, tak baca file ulang.
+    na = _need_arr(need)
+    d = {}
+    arr = _parquet_arrays(_parquet_sig())
+    # Hanya ambil dari Parquet bila ada daftar sumur (na). na None = tak menyaring → jangan
+    # bangun dict penuh jutaan pasangan (cegah OOM); biarkan hanya tambahan SQLite yang dipakai.
+    if arr is not None and na is not None:
+        alat, alon, blat, blon, km, ka, kb = arr
+        sel = np.isin(ka, na) & np.isin(kb, na)
+        a = zip(alat[sel].tolist(), alon[sel].tolist())
+        b = zip(blat[sel].tolist(), blon[sel].tolist())
+        d = dict(zip(zip(a, b), km[sel].tolist()))
+    con = db_connect()
+    try:
+        sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
+    except Exception:
+        sdf = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
+    con.close()
+    if len(sdf):
+        d.update(_dict_from_dist_df(sdf, na))
+    return d
+
+def _road_dist_count():
+    """Jumlah total pasangan tersimpan (Parquet + SQLite) untuk ditampilkan — TANPA memuat
+    dict-nya. Baca num_rows dari metadata Parquet (murah) + COUNT SQLite."""
+    n = 0
+    try:
+        import pyarrow.parquet as _pq
+        n += int(_pq.ParquetFile(ROAD_PARQUET).metadata.num_rows)
+    except Exception:
+        pass
+    con = db_connect()
+    try:
+        n += int(con.execute("SELECT COUNT(*) FROM road_dist_cache").fetchone()[0])
+    except Exception:
+        pass
+    finally:
+        con.close()
+    return n
+
 def _road_dist_sig():
-    """Sidik cepat isi road_dist_cache (jumlah baris + update terakhir) sebagai kunci cache.
-    COUNT jauh lebih murah daripada memuat & membangun ulang dict jutaan entri tiap run."""
+    """Sidik cepat sumber cache (Parquet repo + SQLite) sebagai kunci cache. Berubah bila
+    Parquet berganti (redeploy) atau SQLite bertambah, sehingga dict otomatis dimuat ulang."""
     con = db_connect()
     try:
         row = con.execute("SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM road_dist_cache").fetchone()
-        return (int(row[0]), str(row[1]))
+        base = (int(row[0]), str(row[1]))
     except Exception:
-        return (0, "")
+        base = (0, "")
     finally:
         con.close()
+    try:
+        _st = os.stat(ROAD_PARQUET)
+        pq = (int(_st.st_size), int(_st.st_mtime))
+    except Exception:
+        pq = (0, 0)
+    return base + pq
 
 @st.cache_resource(show_spinner=False)
-def load_road_dist_cached(sig):
-    """Muat cache jarak jalan + faktor detour SEKALI per isi cache, lalu dipakai lintas rerun.
-    Tanpa ini, dict jutaan pasangan dibangun ulang dan median detour dihitung ulang tiap
-    interaksi UI (mis. ganti periode/pilih hari), sehingga run sangat lambat saat cache besar.
-    `sig` berasal dari _road_dist_sig(): berubah saat cache diperbarui sehingga otomatis reload."""
-    d = load_road_dist()
+def load_road_dist_cached(sig, need_hash, _need=None):
+    """Muat cache jarak jalan (DISARING ke sumur `_need`) + faktor detour, SEKALI per
+    (isi cache, set sumur). Kunci cache = (sig, need_hash) yang KECIL, sedangkan `_need`
+    (berawalan _) TIDAK ikut di-hash Streamlit. Ini penting: meng-hash frozenset ribuan
+    koordinat tiap rerun lambat, jadi kita hash sendiri sekali dan berikan int-nya saja."""
+    d = load_road_dist(_need)
     return d, road_detour_factor(d)
 
 def save_road_dist(pairs):
@@ -2128,9 +2223,10 @@ with st.sidebar:
     else:
         _src_df = spatial_db
     st.caption(f"🎯 {0 if _src_df is None or _src_df.empty else len(_src_df):,} sumur jadi sumber koordinat.")
-    _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
-    st.caption(f"📦 Cache jarak jalan: **{len(_road_cache):,} pasangan** tersimpan (permanen di server, "
-               "dimuat sekali per sesi lalu dipakai ulang tanpa memanggil OSRM).")
+    _road_n = _road_dist_count()   # jumlah untuk tampilan; TANPA memuat dict (hemat memori)
+    _pq_n = "ada" if os.path.exists(ROAD_PARQUET) else "tidak ada"
+    st.caption(f"📦 Cache jarak jalan: **{_road_n:,} pasangan** (basis Parquet repo: {_pq_n} + tambahan SQLite). "
+               "Dimuat per periode & disaring ke sumur terkait saja agar hemat memori (anti-OOM).")
     if st.button("🔄 Bangun / Perbarui matriks jarak jalan", use_container_width=True,
                  help="Ambil jarak jalan untuk sumber koordinat terpilih via OSRM, lalu simpan ke cache lokal. "
                       "Hasil parsial tetap tersimpan bila server terputus di tengah jalan."):
@@ -2149,7 +2245,7 @@ with st.sidebar:
                 _pb.empty()
                 _route_cache_store().clear()
                 load_road_dist_cached.clear()
-                _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
+                _road_n = _road_dist_count()
                 msg = f"✅ {n_pair:,} pasangan jarak jalan tersimpan."
                 if n_null:
                     msg += f" ({n_null:,} pasangan tak terjangkau, pakai haversine.)"
@@ -2158,31 +2254,24 @@ with st.sidebar:
                 _pb.empty()
                 _route_cache_store().clear()
                 load_road_dist_cached.clear()
-                _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
-                _saved = len(_road_cache)
+                _road_n = _road_dist_count()
+                _saved = _road_n
                 st.error(f"Gagal mengambil OSRM: {e}")
                 if _saved:
                     st.info(f"📦 {_saved:,} pasangan yang sempat terambil sudah tersimpan di cache. "
                             "Klik tombol lagi untuk melanjutkan sisanya (kecilkan 'Titik per permintaan' "
                             "atau perbesar 'Timeout' bila masih gagal).")
     _USE_ROAD = st.checkbox("Pakai jarak jalan nyata (OSRM) untuk optimasi", value=True,
-                            disabled=(len(_road_cache) == 0),
+                            disabled=(_road_n == 0),
                             help="Bila cache kosong, bangun matriks dulu. Saat aktif, jarak antar sumur "
                                  "yang ada di cache memakai jaringan jalan; sisanya haversine.")
+    # _ROAD_KM/_ROAD_DETOUR diisi SETELAH filter periode (disaring ke sumur periode terpilih
+    # saja) supaya dict tak menahan jutaan pasangan di memori. Di sini hanya placeholder.
+    _ROAD_KM = {}
+    _ROAD_DETOUR = 1.0
     if _USE_ROAD:
-        _ROAD_KM = _road_cache
-        _ROAD_DETOUR = _road_detour_pre
-        _cov = ""
-        if _src_df is not None and not _src_df.empty:
-            _npt = len(dict.fromkeys(_rk(a, b) for a, b in
-                                     zip(_src_df["LAT"].astype(float), _src_df["LON"].astype(float))))
-            _need = _npt * (_npt - 1)
-            if _need > 0:
-                _cov = f" · cakupan ±{min(100, round(100 * len(_road_cache) / _need))}%"
-        st.caption(f"🛣️ Mode jarak jalan **aktif** (detour khas ×{_ROAD_DETOUR:.2f}{_cov}).")
-    else:
-        _ROAD_KM = {}
-        _ROAD_DETOUR = 1.0
+        st.caption("🛣️ Mode jarak jalan **aktif** — jarak jalan diterapkan untuk sumur periode terpilih "
+                   "(cache disaring per periode agar hemat memori).")
 
     _DRAW_ROAD = st.checkbox("Gambar rute jalan nyata di peta (bukan garis lurus)", value=True,
                              help="Menarik geometri jalan dari OSRM /route saat peta dirender (sekali, lalu "
@@ -2200,14 +2289,21 @@ with st.sidebar:
     with st.expander("💾 Ekspor / Impor cache jarak jalan (file lokal portabel)"):
         st.caption("Simpan cache ke file agar tetap awet bila DB dihapus/pindah komputer, "
                    "atau bagikan ke pengguna lain tanpa perlu menarik ulang dari OSRM.")
-        if _road_cache:
-            _exp_df = pd.DataFrame([(a[0], a[1], b[0], b[1], km)
-                                    for (a, b), km in _road_cache.items()],
-                                   columns=["alat", "alon", "blat", "blon", "km"])
-            st.download_button("⬇️ Ekspor cache (CSV)", _exp_df.to_csv(index=False).encode(),
-                               "road_dist_cache.csv", "text/csv", use_container_width=True)
+        st.caption("Basis lengkap cache ada di file **road_dist_cache.parquet** (bawaan repo). "
+                   "Ekspor di bawah hanya berisi **tambahan runtime di SQLite** (pasangan baru hasil "
+                   "prefetch), yang belum masuk Parquet — gabungkan lalu ekspor ulang ke Parquet bila perlu.")
+        _con_x = db_connect()
+        try:
+            _sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", _con_x)
+        except Exception:
+            _sdf = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
+        _con_x.close()
+        if len(_sdf):
+            st.download_button(f"⬇️ Ekspor tambahan SQLite ({len(_sdf):,} pasangan, CSV)",
+                               _sdf.to_csv(index=False).encode(),
+                               "road_dist_cache_sqlite.csv", "text/csv", use_container_width=True)
         else:
-            st.caption("Cache masih kosong, belum ada yang bisa diekspor.")
+            st.caption("Belum ada tambahan runtime di SQLite.")
         _imp = st.file_uploader("Impor cache (CSV hasil ekspor)", type=["csv"], key="road_imp")
         if _imp is not None:
             _sig = (getattr(_imp, "name", ""), getattr(_imp, "size", 0))
@@ -2646,6 +2742,20 @@ if "comment" not in ncmp_df.columns:
     ncmp_df["comment"] = ""
 ncmp_df["comment"] = ncmp_df["comment"].fillna("").astype(str)
 ncmp_df["kode_hambatan"] = ncmp_df["comment"].map(carry_code)
+
+# Muat cache jarak jalan HANYA untuk pasangan antar sumur periode ini (disaring), lalu isi
+# _ROAD_KM/_ROAD_DETOUR. Dilakukan di sini (setelah filter periode) agar dict kecil dan tak
+# menahan jutaan pasangan di memori — penyebab OOM "Oh no. Error running app." di Streamlit Cloud.
+if _USE_ROAD:
+    _need_pts = frozenset(
+        _rk(la, lo) for la, lo in zip(
+            pd.to_numeric(raw["lat"], errors="coerce").tolist(),
+            pd.to_numeric(raw["lon"], errors="coerce").tolist())
+        if pd.notna(la) and pd.notna(lo))
+    if _need_pts:
+        # hash sendiri (kecil & stabil) sbg kunci cache; frozenset besar diberikan lewat _need
+        # yang tak ikut di-hash Streamlit, supaya tiap rerun tak menghash ribuan koordinat.
+        _ROAD_KM, _ROAD_DETOUR = load_road_dist_cached(_road_dist_sig(), hash(_need_pts), _need=_need_pts)
 
 _E = build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
                 executed, comp_disp_set, pending_set, ncmp_replan, woff_set)
