@@ -811,19 +811,44 @@ def _need_arr(need):
         return None
     return np.unique(_pack_coords(pts[:, 0], pts[:, 1]))
 
+def _parquet_sig():
+    try:
+        _s = os.stat(ROAD_PARQUET)
+        return (int(_s.st_size), int(_s.st_mtime))
+    except Exception:
+        return (0, 0)
+
+@st.cache_resource(show_spinner=False)
+def _parquet_arrays(pq_sig):
+    """Baca Parquet SEKALI per sesi jadi array numpy (coords + km + kunci terkemas), lalu
+    dipakai ulang untuk penyaringan per periode TANPA baca ulang file jutaan baris tiap kali.
+    Ini yang membuat run cepat: bacaan berat hanya sekali, filter per periode murah (numpy)."""
+    if not os.path.exists(ROAD_PARQUET):
+        return None
+    try:
+        df = pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
+    except Exception:
+        return None
+    ka = _pack_coords(df["alat"].values, df["alon"].values)
+    kb = _pack_coords(df["blat"].values, df["blon"].values)
+    return (df["alat"].to_numpy(), df["alon"].to_numpy(),
+            df["blat"].to_numpy(), df["blon"].to_numpy(),
+            df["km"].to_numpy(dtype=float), ka, kb)
+
 def load_road_dist(need=None):
-    # Basis permanen dari Parquet repo + tambahan baru di SQLite, DISARING ke pasangan antar
-    # sumur `need` saja. Parquet dibaca sebagai DataFrame sesaat lalu difilter, jadi dict akhir
-    # kecil walau file berisi jutaan pasangan.
+    # Basis Parquet (array ter-cache sesi) + tambahan SQLite, DISARING ke pasangan antar sumur
+    # `need`. Penyaringan = np.isin atas array yang sudah di memori → cepat, tak baca file ulang.
     na = _need_arr(need)
     d = {}
-    if os.path.exists(ROAD_PARQUET):
-        try:
-            pdf = pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
-            d.update(_dict_from_dist_df(pdf, na))
-            del pdf
-        except Exception:
-            pass
+    arr = _parquet_arrays(_parquet_sig())
+    # Hanya ambil dari Parquet bila ada daftar sumur (na). na None = tak menyaring → jangan
+    # bangun dict penuh jutaan pasangan (cegah OOM); biarkan hanya tambahan SQLite yang dipakai.
+    if arr is not None and na is not None:
+        alat, alon, blat, blon, km, ka, kb = arr
+        sel = np.isin(ka, na) & np.isin(kb, na)
+        a = zip(alat[sel].tolist(), alon[sel].tolist())
+        b = zip(blat[sel].tolist(), blon[sel].tolist())
+        d = dict(zip(zip(a, b), km[sel].tolist()))
     con = db_connect()
     try:
         sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
@@ -871,12 +896,12 @@ def _road_dist_sig():
     return base + pq
 
 @st.cache_resource(show_spinner=False)
-def load_road_dist_cached(sig, need_key=None):
-    """Muat cache jarak jalan (DISARING ke sumur `need_key`) + faktor detour, SEKALI per
-    (isi cache, set sumur), lalu dipakai lintas rerun. Penyaringan menjaga dict tetap kecil
-    agar tak OOM di Streamlit Cloud. `sig` dari _road_dist_sig() (berubah saat cache diperbarui);
-    `need_key` frozenset koordinat sumur relevan (berubah saat periode/kandidat berganti)."""
-    d = load_road_dist(need_key)
+def load_road_dist_cached(sig, need_hash, _need=None):
+    """Muat cache jarak jalan (DISARING ke sumur `_need`) + faktor detour, SEKALI per
+    (isi cache, set sumur). Kunci cache = (sig, need_hash) yang KECIL, sedangkan `_need`
+    (berawalan _) TIDAK ikut di-hash Streamlit. Ini penting: meng-hash frozenset ribuan
+    koordinat tiap rerun lambat, jadi kita hash sendiri sekali dan berikan int-nya saja."""
+    d = load_road_dist(_need)
     return d, road_detour_factor(d)
 
 def save_road_dist(pairs):
@@ -2728,7 +2753,9 @@ if _USE_ROAD:
             pd.to_numeric(raw["lon"], errors="coerce").tolist())
         if pd.notna(la) and pd.notna(lo))
     if _need_pts:
-        _ROAD_KM, _ROAD_DETOUR = load_road_dist_cached(_road_dist_sig(), _need_pts)
+        # hash sendiri (kecil & stabil) sbg kunci cache; frozenset besar diberikan lewat _need
+        # yang tak ikut di-hash Streamlit, supaya tiap rerun tak menghash ribuan koordinat.
+        _ROAD_KM, _ROAD_DETOUR = load_road_dist_cached(_road_dist_sig(), hash(_need_pts), _need=_need_pts)
 
 _E = build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
                 executed, comp_disp_set, pending_set, ncmp_replan, woff_set)
