@@ -25,6 +25,23 @@ import wellgo_ui as ui
 import wellgo_guide as guide
 import plotly.express as px
 
+# ── Instrumentasi waktu tiap fase (muncul di log Streamlit Cloud) ────────────
+# Tiap rerun, cetak durasi antar-checkpoint ke stderr supaya kelihatan proses
+# berhenti/lambat di fase mana. Nonaktifkan dgn set env WELLGO_TIMING=0.
+import time as _time
+import sys as _sys
+_T_RUN0 = _time.time()
+_T_PREV = _T_RUN0
+_TIMING_ON = os.environ.get("WELLGO_TIMING", "1") != "0"
+def _ckpt(label):
+    global _T_PREV
+    if not _TIMING_ON:
+        return
+    now = _time.time()
+    print(f"[WELLGO TIMING] {label}: +{now - _T_PREV:.2f}s (total {now - _T_RUN0:.2f}s)",
+          file=_sys.stderr, flush=True)
+    _T_PREV = now
+
 st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wide")
 
 ui.inject_theme()
@@ -2084,7 +2101,9 @@ def cmap(label, labels):
 
 
 # ================================================================== UI Configuration
+_ckpt("mulai skrip (import + config)")
 init_db()
+_ckpt("init_db")
 
 CRIT = {
     "Kedekatan jarak saja": (False, False),
@@ -2122,6 +2141,7 @@ if up is None:
 
 # ── Data Loading Awal untuk Filter Area ─────────────────────────────────────
 raw = load_candidates(up.getvalue(), sheet_kandidat)
+_ckpt(f"load_candidates (raw={len(raw)} baris)")
 raw["is_breakin"] = False
 
 # Break-In: sumur sisipan (NW/AWS/Req) dengan schema sama spt kandidat utama
@@ -2534,6 +2554,7 @@ if mpas_only:
 
 field_assign = st.session_state.get("field_assign", {})
 raw = resolve_coords(raw, spatial_db, load_coord_cache(), field_assign=field_assign)
+_ckpt("resolve_coords")
 
 # ── Mode Mapping Unit ──────────────────────────────────────────────────────
 # Dipasang SETELAH resolve_coords karena lapangan sumur bisa baru terisi dari
@@ -2779,9 +2800,11 @@ if _USE_ROAD:
         # hash sendiri (kecil & stabil) sbg kunci cache; frozenset besar diberikan lewat _need
         # yang tak ikut di-hash Streamlit, supaya tiap rerun tak menghash ribuan koordinat.
         _ROAD_KM, _ROAD_DETOUR = load_road_dist_cached(_road_dist_sig(), hash(_need_pts), _need=_need_pts)
+_ckpt(f"road_dist (pairs={len(_ROAD_KM)}, detour={_ROAD_DETOUR:.3f})")
 
 _E = build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
                 executed, comp_disp_set, pending_set, ncmp_replan, woff_set)
+_ckpt(f"build_elig (elig={len(_E['elig'])}, cand={len(_E['cand'])})")
 batch_lo, batch_hi = _E["batch_lo"], _E["batch_hi"]
 cand, comp_wells, elig, elig_all = _E["cand"], _E["comp_wells"], _E["elig"], _E["elig_all"]
 expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["ncmp_expired"]
@@ -2864,6 +2887,7 @@ if len(nocoord):
     noc = nocoord.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
     week_df = pd.concat([week_df, noc], ignore_index=True)
 
+_ckpt("plan_week (perencanaan rute)")
 week_df["zone"] = np.where(week_df["area"].isin(REMOTE_AREAS), "remote", "non-remote")
 week_df["manual"] = False
 
@@ -2924,6 +2948,7 @@ if man_un:
 _regroup_info = None
 if regroup_prox and mode == "pooled":
     week_df, _regroup_info = regroup_by_proximity(week_df, max_wells)
+    _ckpt("regroup_by_proximity")
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
@@ -5278,6 +5303,8 @@ with tab_priority:
             st.rerun()
         if force_on:
             st.caption(f"✅ **{len(force_on)}** sumur NW/AWS dipaksa ON & masuk eligible: {', '.join(sorted(force_on))}.")
+
+_ckpt("render UI (dataframe/peta/plotly) selesai")
 
 # ── Footer Cleanup Action Trigger Module ────────────────────────────────────
 st.markdown("---")
