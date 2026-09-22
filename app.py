@@ -742,7 +742,10 @@ def _solve_route(lat, lon):
 def _route_cache_store():
     return {}
 
+_RD_CALLS = [0, 0]   # [total panggilan route_distance, jumlah yang benar-benar solve TSP (cache miss)]
+
 def route_distance(lat, lon):
+    _RD_CALLS[0] += 1
     lat = np.asarray(lat, dtype=float)
     lon = np.asarray(lon, dtype=float)
     if lat.size <= 1: return 0.0
@@ -753,6 +756,7 @@ def route_distance(lat, lon):
     store = _route_cache_store()
     val = store.get(key)
     if val is None:
+        _RD_CALLS[1] += 1
         val = _solve_route(lat, lon)[1]
         if len(store) > 50000: store.clear()
         store[key] = val
@@ -875,18 +879,18 @@ def load_road_dist(need=None):
     con = db_connect()
     try:
         if na is not None and need:
-            # Saring di SQL: hanya baris yang lat/lon-nya termasuk sumur `need`. PRIMARY KEY
-            # (alat,alon,blat,blon) dipakai jadi indeks, jadi tak ada full-table scan tiap kali
-            # (penting bila welltest_status.db lokal berisi jutaan baris). Pembulatan 5 desimal
-            # disamakan dgn cara _rk menyimpannya.
+            # Saring di SQL HANYA pada dua kolom lat (alat & blat) memakai PRIMARY KEY sbg indeks.
+            # PENTING: memfilter keempat kolom (alat,alon,blat,blon) sekaligus membuat SQLite
+            # mengenumerasi perkalian kartesian keempat daftar IN (ratusan^4 kombinasi) → justru
+            # jauh lebih lambat dari full scan. Dua kolom lat sudah memangkas ke ribuan baris,
+            # lalu penyaringan pasangan yang TEPAT (alon & blon) dikerjakan _dict_from_dist_df
+            # secara vektor di numpy. Pembulatan 5 desimal disamakan dgn cara _rk menyimpannya.
             lats = sorted({round(float(p[0]), 5) for p in need})
-            lons = sorted({round(float(p[1]), 5) for p in need})
-            ql, qo = ",".join("?" * len(lats)), ",".join("?" * len(lons))
+            ql = ",".join("?" * len(lats))
             sdf = pd.read_sql(
                 "SELECT alat,alon,blat,blon,km FROM road_dist_cache "
-                f"WHERE alat IN ({ql}) AND alon IN ({qo}) "
-                f"AND blat IN ({ql}) AND blon IN ({qo})",
-                con, params=lats + lons + lats + lons)
+                f"WHERE alat IN ({ql}) AND blat IN ({ql})",
+                con, params=lats + lats)
         else:
             sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
     except Exception:
@@ -1961,6 +1965,7 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         st.session_state['audit_logs'] = {}
     # ───────────────────────────────────────────────
     
+    _ckpt(f"  plan_week mulai ({'lapis-2/prebooked' if prebooked is not None else 'lapis-1/awal'}: elig={len(elig)}, hari={len(days)}, min_wells={min_wells}, max_wells={max_wells})")
     elig = elig.reset_index(drop=True).copy()
     elig["scheduled"] = False
     elig["plan_unit"] = None
@@ -2036,7 +2041,10 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
             _pbd = prebooked[prebooked["day_idx"] == (i + day_offset)]
             if len(_pbd): pb_day = _pbd
 
+        _rd0, _rd1 = _RD_CALLS[0], _RD_CALLS[1]
         pd_ = plan_fn(pool, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, current_day=day, elastic_limit=elastic_limit, blocked_units=blocked, prebooked=pb_day, min_wells=min_wells, anchors=_anch_day)
+        _ckpt(f"    hari {i}/{len(days)}: pool={len(pool)} → sched={int(pd_['scheduled'].sum())} "
+              f"(TSP: {_RD_CALLS[0]-_rd0} panggil / {_RD_CALLS[1]-_rd1} solve)")
 
         sd = pd_[pd_["scheduled"]]
         if len(sd) == 0: continue
@@ -2174,6 +2182,7 @@ if HAS_PERIODS:
                       .sort_values("_s"))
 
 spatial_db = load_spatial_data(up.getvalue(), sheet_spasial)
+_ckpt(f"load_spatial_data (rows={len(spatial_db)})")
 
 if spatial_db.empty: st.error("⚠️ Struktur berkas Data Spasial tidak valid atau kosong. Pastikan sheet mengandung kolom: WELL, FIELD, LAT, LON.")
 
@@ -2553,8 +2562,10 @@ if mpas_only:
     raw.loc[ts2mwt, "dur"] = 60
 
 field_assign = st.session_state.get("field_assign", {})
-raw = resolve_coords(raw, spatial_db, load_coord_cache(), field_assign=field_assign)
-_ckpt("resolve_coords")
+_cc = load_coord_cache()
+_ckpt(f"load_coord_cache (rows={len(_cc)})")
+raw = resolve_coords(raw, spatial_db, _cc, field_assign=field_assign)
+_ckpt(f"resolve_coords (body, raw={len(raw)})")
 
 # ── Mode Mapping Unit ──────────────────────────────────────────────────────
 # Dipasang SETELAH resolve_coords karena lapangan sumur bisa baru terisi dari
