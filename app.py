@@ -8,6 +8,7 @@ Run: py -m streamlit run app.py
 """
 
 import re
+import os
 import json
 import sqlite3
 import math
@@ -29,6 +30,7 @@ st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wid
 ui.inject_theme()
 
 DB_PATH = "welltest_status.db"
+ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 
 def db_connect():
     """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
@@ -776,29 +778,58 @@ def road_detour_factor(cache):
     f = float(np.median(rs))
     return f if f >= 1.0 else 1.0
 
+def _dict_from_dist_df(df):
+    """Dict {((alat,alon),(blat,blon)): km} dari DataFrame kolom alat/alon/blat/blon/km.
+    Pakai zip kolom (jauh lebih cepat dari itertuples untuk jutaan baris)."""
+    if df is None or not len(df):
+        return {}
+    a = zip(df["alat"].tolist(), df["alon"].tolist())
+    b = zip(df["blat"].tolist(), df["blon"].tolist())
+    return dict(zip(zip(a, b), df["km"].astype(float).tolist()))
+
+def _load_parquet_dist():
+    """Basis cache jarak jalan dari file Parquet bawaan repo. File ini ikut ter-commit,
+    jadi cache besar bertahan tiap redeploy Streamlit Cloud tanpa perlu bangun ulang OSRM."""
+    if not os.path.exists(ROAD_PARQUET):
+        return {}
+    try:
+        df = pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
+    except Exception:
+        return {}
+    return _dict_from_dist_df(df)
+
 def load_road_dist():
+    # Basis permanen dari Parquet repo, lalu ditimpa/ditambah tambahan baru di SQLite
+    # (hasil prefetch runtime). Prefetch yang lebih baru menang atas basis.
+    d = _load_parquet_dist()
     con = db_connect()
     try:
         df = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
     except Exception:
         df = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
     con.close()
-    # Bangun dict lewat zip kolom (jauh lebih cepat dari itertuples untuk jutaan baris).
-    a = zip(df["alat"].tolist(), df["alon"].tolist())
-    b = zip(df["blat"].tolist(), df["blon"].tolist())
-    return dict(zip(zip(a, b), df["km"].astype(float).tolist()))
+    if len(df):
+        d.update(_dict_from_dist_df(df))
+    return d
 
 def _road_dist_sig():
-    """Sidik cepat isi road_dist_cache (jumlah baris + update terakhir) sebagai kunci cache.
-    COUNT jauh lebih murah daripada memuat & membangun ulang dict jutaan entri tiap run."""
+    """Sidik cepat sumber cache (Parquet repo + SQLite) sebagai kunci cache. Berubah bila
+    Parquet berganti (redeploy) atau SQLite bertambah, sehingga dict otomatis dimuat ulang.
+    COUNT jauh lebih murah daripada membangun ulang dict jutaan entri tiap run."""
     con = db_connect()
     try:
         row = con.execute("SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM road_dist_cache").fetchone()
-        return (int(row[0]), str(row[1]))
+        base = (int(row[0]), str(row[1]))
     except Exception:
-        return (0, "")
+        base = (0, "")
     finally:
         con.close()
+    try:
+        _st = os.stat(ROAD_PARQUET)
+        pq = (int(_st.st_size), int(_st.st_mtime))
+    except Exception:
+        pq = (0, 0)
+    return base + pq
 
 @st.cache_resource(show_spinner=False)
 def load_road_dist_cached(sig):
@@ -2129,8 +2160,9 @@ with st.sidebar:
         _src_df = spatial_db
     st.caption(f"🎯 {0 if _src_df is None or _src_df.empty else len(_src_df):,} sumur jadi sumber koordinat.")
     _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
-    st.caption(f"📦 Cache jarak jalan: **{len(_road_cache):,} pasangan** tersimpan (permanen di server, "
-               "dimuat sekali per sesi lalu dipakai ulang tanpa memanggil OSRM).")
+    _pq_n = "ada" if os.path.exists(ROAD_PARQUET) else "tidak ada"
+    st.caption(f"📦 Cache jarak jalan: **{len(_road_cache):,} pasangan** (basis Parquet repo: {_pq_n}, "
+               "+ tambahan SQLite). Dimuat sekali per sesi lalu dipakai ulang tanpa memanggil OSRM.")
     if st.button("🔄 Bangun / Perbarui matriks jarak jalan", use_container_width=True,
                  help="Ambil jarak jalan untuk sumber koordinat terpilih via OSRM, lalu simpan ke cache lokal. "
                       "Hasil parsial tetap tersimpan bila server terputus di tengah jalan."):
