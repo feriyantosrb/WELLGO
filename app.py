@@ -767,15 +767,21 @@ def _rk(lat, lon):
 def road_detour_factor(cache):
     """Rasio khas (median) km jalan terhadap km garis lurus dari isi cache. Dipakai
     menskala estimasi pasangan yang BELUM tercache supaya satu satuan dgn km jalan,
-    jadi pengelompokan tak terdistorsi saat cache belum lengkap."""
-    rs = []
-    for (a, b), km in cache.items():
-        h = haversine_km(a[0], a[1], b[0], b[1])
-        if h > 0.05 and km > 0:
-            rs.append(km / h)
-    if not rs:
+    jadi pengelompokan tak terdistorsi saat cache belum lengkap.
+    Vektorisasi numpy: satu kali tarik koordinat+km jadi array lalu haversine sekaligus,
+    bukan loop Python + haversine skalar per pasangan (yang bisa makan puluhan detik saat
+    cache satu periode berisi ratusan ribu pasangan → penyebab lambat di Streamlit Cloud)."""
+    n = len(cache)
+    if not n:
         return 1.0
-    f = float(np.median(rs))
+    keys = np.fromiter((c for pr in cache for ab in pr for c in ab),
+                       dtype=float, count=n * 4).reshape(n, 4)
+    km = np.fromiter(cache.values(), dtype=float, count=n)
+    h = haversine_km(keys[:, 0], keys[:, 1], keys[:, 2], keys[:, 3])
+    m = (h > 0.05) & (km > 0)
+    if not m.any():
+        return 1.0
+    f = float(np.median(km[m] / h[m]))
     return f if f >= 1.0 else 1.0
 
 def _pack_coords(lat, lon):
@@ -851,7 +857,21 @@ def load_road_dist(need=None):
         d = _dict_from_dist_df(_parquet_pairs(need), na)
     con = db_connect()
     try:
-        sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
+        if na is not None and need:
+            # Saring di SQL: hanya baris yang lat/lon-nya termasuk sumur `need`. PRIMARY KEY
+            # (alat,alon,blat,blon) dipakai jadi indeks, jadi tak ada full-table scan tiap kali
+            # (penting bila welltest_status.db lokal berisi jutaan baris). Pembulatan 5 desimal
+            # disamakan dgn cara _rk menyimpannya.
+            lats = sorted({round(float(p[0]), 5) for p in need})
+            lons = sorted({round(float(p[1]), 5) for p in need})
+            ql, qo = ",".join("?" * len(lats)), ",".join("?" * len(lons))
+            sdf = pd.read_sql(
+                "SELECT alat,alon,blat,blon,km FROM road_dist_cache "
+                f"WHERE alat IN ({ql}) AND alon IN ({qo}) "
+                f"AND blat IN ({ql}) AND blon IN ({qo})",
+                con, params=lats + lons + lats + lons)
+        else:
+            sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
     except Exception:
         sdf = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
     con.close()
@@ -882,10 +902,13 @@ def _road_dist_sig():
     Parquet berganti (redeploy) atau SQLite bertambah, sehingga dict otomatis dimuat ulang."""
     con = db_connect()
     try:
-        row = con.execute("SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM road_dist_cache").fetchone()
-        base = (int(row[0]), str(row[1]))
+        # MAX(rowid) instan (baca ekor tabel), tak full-scan tiap rerun. Naik tiap INSERT baru,
+        # cukup untuk menandai cache bertambah → dict dimuat ulang. Update in-place (jarang)
+        # selalu diikuti load_road_dist_cached.clear() di alur terkait.
+        row = con.execute("SELECT MAX(rowid) FROM road_dist_cache").fetchone()
+        base = (int(row[0] or 0),)
     except Exception:
-        base = (0, "")
+        base = (0,)
     finally:
         con.close()
     try:
