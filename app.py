@@ -811,44 +811,44 @@ def _need_arr(need):
         return None
     return np.unique(_pack_coords(pts[:, 0], pts[:, 1]))
 
-def _parquet_sig():
+def _parquet_pairs(need):
+    """Baca HANYA baris relevan dari Parquet lewat predicate pushdown pyarrow: filter kolom
+    koordinat langsung di file (lat/lon sisi-A & sisi-B harus termasuk sumur `need`), sehingga
+    yang masuk ke memori hanya ribuan baris terkait, bukan jutaan baris seluruh matriks.
+    Inilah yang membuat run ringan di Streamlit Cloud: tak ada lagi baca+kemas 4,8 juta baris
+    tiap ganti periode, dan tak ada array raksasa yang ditahan di memori sepanjang sesi.
+    Penyaringan tepat pasangan berarah tetap dilakukan pemanggil lewat _dict_from_dist_df."""
+    empty = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
+    if not need or not os.path.exists(ROAD_PARQUET):
+        return empty
     try:
-        _s = os.stat(ROAD_PARQUET)
-        return (int(_s.st_size), int(_s.st_mtime))
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        pts = np.array(list(need), dtype=float)
+        # koordinat di Parquet sudah dibulatkan 5 desimal; samakan agar cocok persis.
+        lats = pa.array(np.unique(np.rint(pts[:, 0] * 1e5) / 1e5))
+        lons = pa.array(np.unique(np.rint(pts[:, 1] * 1e5) / 1e5))
+        flt = (ds.field("alat").isin(lats) & ds.field("alon").isin(lons) &
+               ds.field("blat").isin(lats) & ds.field("blon").isin(lons))
+        tbl = ds.dataset(ROAD_PARQUET, format="parquet").to_table(
+            columns=["alat", "alon", "blat", "blon", "km"], filter=flt)
+        return tbl.to_pandas()
     except Exception:
-        return (0, 0)
-
-@st.cache_resource(show_spinner=False)
-def _parquet_arrays(pq_sig):
-    """Baca Parquet SEKALI per sesi jadi array numpy (coords + km + kunci terkemas), lalu
-    dipakai ulang untuk penyaringan per periode TANPA baca ulang file jutaan baris tiap kali.
-    Ini yang membuat run cepat: bacaan berat hanya sekali, filter per periode murah (numpy)."""
-    if not os.path.exists(ROAD_PARQUET):
-        return None
-    try:
-        df = pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
-    except Exception:
-        return None
-    ka = _pack_coords(df["alat"].values, df["alon"].values)
-    kb = _pack_coords(df["blat"].values, df["blon"].values)
-    return (df["alat"].to_numpy(), df["alon"].to_numpy(),
-            df["blat"].to_numpy(), df["blon"].to_numpy(),
-            df["km"].to_numpy(dtype=float), ka, kb)
+        # Fallback aman bila pyarrow.dataset tak tersedia: baca kolom lalu biar pemanggil saring.
+        try:
+            return pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
+        except Exception:
+            return empty
 
 def load_road_dist(need=None):
-    # Basis Parquet (array ter-cache sesi) + tambahan SQLite, DISARING ke pasangan antar sumur
-    # `need`. Penyaringan = np.isin atas array yang sudah di memori → cepat, tak baca file ulang.
+    # Basis Parquet (dibaca predicate pushdown → hanya baris terkait) + tambahan SQLite,
+    # DISARING ke pasangan antar sumur `need`. Tak ada lagi scan/penyimpanan jutaan baris.
     na = _need_arr(need)
     d = {}
-    arr = _parquet_arrays(_parquet_sig())
     # Hanya ambil dari Parquet bila ada daftar sumur (na). na None = tak menyaring → jangan
     # bangun dict penuh jutaan pasangan (cegah OOM); biarkan hanya tambahan SQLite yang dipakai.
-    if arr is not None and na is not None:
-        alat, alon, blat, blon, km, ka, kb = arr
-        sel = np.isin(ka, na) & np.isin(kb, na)
-        a = zip(alat[sel].tolist(), alon[sel].tolist())
-        b = zip(blat[sel].tolist(), blon[sel].tolist())
-        d = dict(zip(zip(a, b), km[sel].tolist()))
+    if na is not None:
+        d = _dict_from_dist_df(_parquet_pairs(need), na)
     con = db_connect()
     try:
         sdf = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
