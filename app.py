@@ -2399,7 +2399,7 @@ with st.sidebar:
         st.divider()
         max_wells = st.slider("Target Sumur / Unit / Hari", 3, 8, 6)
         min_wells = st.slider(
-            "Minimum Sumur / Trip", 1, 4, 1,
+            "Minimum Sumur / Trip", 1, 4, 4,
             help="Cegah unit berangkat seharian cuma untuk 1–2 sumur. Kalau klaster sebuah unit "
                  "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius 1,8×; kalau tetap "
                  "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
