@@ -29,6 +29,21 @@ st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wid
 ui.inject_theme()
 
 DB_PATH = "welltest_status.db"
+
+def db_connect():
+    """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
+    dipakai banyak sesi/rerun sekaligus; saat build matriks jalan menahan lock tulis, rerun
+    lain yang memanggil init_db() bisa kena 'database is locked' setelah 5 dtk (default) lalu
+    OperationalError. timeout=60 + busy_timeout membuat operasi MENUNGGU writer selesai, dan
+    WAL mengizinkan baca sembari tulis sehingga tabrakan lock jauh berkurang."""
+    con = sqlite3.connect(DB_PATH, timeout=60)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=60000")
+        con.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return con
 SHEET_DEFAULT = "Compiled Schedule"
 SHEET_UNITMAP = "Balam_South"   # sheet opsional: alokasi unit per (sub-area, field) — sumber kebenaran mutlak, bypass zona
 SHEET_STATUS = "Status_Sumur"   # sheet opsional: overlay last_status & last_unit_name per (Rentang Periode, well_name)
@@ -42,7 +57,7 @@ ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi
 
 # ------------------------------------------------------------------ persistence
 def init_db():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute("""CREATE TABLE IF NOT EXISTS execution_log(
         plan_date TEXT, well_name TEXT, unit TEXT, status TEXT, reason TEXT, updated_at TEXT,
         PRIMARY KEY(plan_date, well_name))""")
@@ -64,7 +79,7 @@ def init_db():
     con.close()
 
 def save_status(plan_date, rows):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     now = datetime.now().isoformat(timespec="seconds")
     for well, unit, status in rows:
         con.execute("""INSERT INTO execution_log(plan_date,well_name,unit,status,updated_at)
@@ -76,13 +91,13 @@ def save_status(plan_date, rows):
 
 def reset_execution_log():
     """Kosongkan seluruh SCH_Database (execution_log): COMP/NCMP hasil upload + tanda COMP manual."""
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute("DELETE FROM execution_log")
     con.commit()
     con.close()
 
 def status_in_period(lo, hi):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         q = ("SELECT well_name AS well, status, reason, comment, plan_date FROM execution_log "
              "WHERE status IN ('executed','ncmp','pending') AND plan_date BETWEEN ? AND ?")
@@ -117,7 +132,7 @@ def status_in_period(lo, hi):
 def comp_records(wells):
     """COMP (executed) per well dari execution_log → {well: [(Timestamp, reason_upper), ...]} (seluruh log).
     Dipakai utk deteksi fase AWS: kolom Reason (AS1/AS2) sbg sinyal utama, window POP sbg fallback."""
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         df = pd.read_sql("SELECT well_name AS well, plan_date, reason FROM execution_log WHERE status='executed'", con)
     except Exception:
@@ -134,7 +149,7 @@ def comp_records(wells):
 def sch_latest(wells):
     """xlookup ke execution_log: ambil schedule_date_test TERAKHIR + status per well.
     Return dict well -> (tanggal_str, label) dengan label COMP/NCMP/PENDING."""
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         df = pd.read_sql("SELECT well_name AS well, status, plan_date FROM execution_log "
                          "WHERE status IN ('executed','ncmp','pending')", con)
@@ -298,7 +313,7 @@ def import_compncmp(file_list):
     reasons = {}
     status_seen = {}
     skip_date = skip_well = skip_status = 0
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     now = datetime.now().isoformat(timespec="seconds")
     for fb in file_list:
         w = read_schdb(fb)
@@ -346,7 +361,7 @@ def import_compncmp(file_list):
             "skip_date": skip_date, "skip_well": skip_well, "skip_status": skip_status}
 
 def save_coords(pairs):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     now = datetime.now().isoformat(timespec="seconds")
     for well, lat, lon in pairs:
         if pd.notna(lat) and pd.notna(lon):
@@ -357,7 +372,7 @@ def save_coords(pairs):
     con.close()
 
 def load_coord_cache():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         df = pd.read_sql("SELECT well_name,lat,lon FROM coord_cache", con)
     except Exception:
@@ -762,17 +777,41 @@ def road_detour_factor(cache):
     return f if f >= 1.0 else 1.0
 
 def load_road_dist():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         df = pd.read_sql("SELECT alat,alon,blat,blon,km FROM road_dist_cache", con)
     except Exception:
         df = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
     con.close()
-    return {((r.alat, r.alon), (r.blat, r.blon)): float(r.km) for r in df.itertuples()}
+    # Bangun dict lewat zip kolom (jauh lebih cepat dari itertuples untuk jutaan baris).
+    a = zip(df["alat"].tolist(), df["alon"].tolist())
+    b = zip(df["blat"].tolist(), df["blon"].tolist())
+    return dict(zip(zip(a, b), df["km"].astype(float).tolist()))
+
+def _road_dist_sig():
+    """Sidik cepat isi road_dist_cache (jumlah baris + update terakhir) sebagai kunci cache.
+    COUNT jauh lebih murah daripada memuat & membangun ulang dict jutaan entri tiap run."""
+    con = db_connect()
+    try:
+        row = con.execute("SELECT COUNT(*), COALESCE(MAX(updated_at),'') FROM road_dist_cache").fetchone()
+        return (int(row[0]), str(row[1]))
+    except Exception:
+        return (0, "")
+    finally:
+        con.close()
+
+@st.cache_resource(show_spinner=False)
+def load_road_dist_cached(sig):
+    """Muat cache jarak jalan + faktor detour SEKALI per isi cache, lalu dipakai lintas rerun.
+    Tanpa ini, dict jutaan pasangan dibangun ulang dan median detour dihitung ulang tiap
+    interaksi UI (mis. ganti periode/pilih hari), sehingga run sangat lambat saat cache besar.
+    `sig` berasal dari _road_dist_sig(): berubah saat cache diperbarui sehingga otomatis reload."""
+    d = load_road_dist()
+    return d, road_detour_factor(d)
 
 def save_road_dist(pairs):
     """pairs: iterable of ((rlat,rlon),(rlat,rlon), km)."""
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     now = datetime.now().isoformat(timespec="seconds")
     con.executemany("""INSERT INTO road_dist_cache(alat,alon,blat,blon,km,updated_at)
         VALUES(?,?,?,?,?,?) ON CONFLICT(alat,alon,blat,blon) DO UPDATE SET
@@ -819,7 +858,7 @@ def osrm_build_matrix(coords, base_url, chunk=40, timeout=120, retries=3, profil
 
     blocks = [list(range(i, min(i + chunk, n))) for i in range(0, n, chunk)]
     total = len(blocks) * len(blocks)
-    done = 0
+    done = saved = 0
     try:
         for bs in blocks:
             for bd in blocks:
@@ -836,10 +875,17 @@ def osrm_build_matrix(coords, base_url, chunk=40, timeout=120, retries=3, profil
                 done += 1
                 if progress:
                     progress(done / total)
+                # Flush berkala: tiap tulisan pendek (lock singkat), memori & WAL terjaga,
+                # dan progres tersimpan bertahap alih-alih satu tulisan raksasa di akhir.
+                if len(out) >= 20000:
+                    save_road_dist(out)
+                    saved += len(out)
+                    out = []
     finally:
-        if out:                                # simpan hasil parsial walau ada gangguan
+        if out:                                # simpan sisa / hasil parsial walau ada gangguan
             save_road_dist(out)
-    return len(out), n_null
+            saved += len(out)
+    return saved, n_null
 
 def _dist_matrix(lat, lon):
     """Matriks jarak N×N untuk optimasi. Jalan nyata bila aktif & tersedia, sisanya haversine."""
@@ -866,9 +912,12 @@ def _dist_matrix(lat, lon):
 _ROAD_GEOM = {}          # {((alat,alon),(blat,blon)): [[lon,lat],…]} berarah a→b
 _DRAW_ROAD = False       # di-set dari sidebar
 _GEOM_FAIL = False       # short-circuit sesi bila OSRM tak terjangkau saat render
+_GEOM_FETCH_N = 0        # jumlah geometri diambil live pada render ini (dibatasi agar render tetap responsif)
+_GEOM_FETCH_MAX = 40     # plafon fetch OSRM /route per render; sisanya garis lurus & ter-cache bertahap
+_GEOM_TO_CAP = 8         # batas atas timeout per pasangan saat render (detik) — cegah render menggantung
 
 def load_road_geom():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     try:
         df = pd.read_sql("SELECT alat,alon,blat,blon,geom FROM road_geom_cache", con)
     except Exception:
@@ -884,7 +933,7 @@ def load_road_geom():
 
 def save_road_geom(items):
     """items: iterable of ((alat,alon),(blat,blon), geom_list)."""
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     now = datetime.now().isoformat(timespec="seconds")
     con.executemany("""INSERT INTO road_geom_cache(alat,alon,blat,blon,geom,updated_at)
         VALUES(?,?,?,?,?,?) ON CONFLICT(alat,alon,blat,blon) DO UPDATE SET
@@ -915,8 +964,9 @@ def road_route_path(lons, lats, order, base_url, timeout=30, profile="driving"):
     """Bangun satu path [[lon,lat],…] menyusuri jalan nyata untuk urutan `order`.
     Pasangan tanpa geometri di-cache (fetch sekali) atau jatuh ke garis lurus.
     Bila OSRM gagal sekali, sisa render pakai garis lurus (short-circuit sesi)."""
-    global _GEOM_FAIL
+    global _GEOM_FAIL, _GEOM_FETCH_N
     path, new = [], []
+    _to = min(int(timeout) if timeout else _GEOM_TO_CAP, _GEOM_TO_CAP)
     def _push(seg):
         if path and path[-1] == seg[0]:
             path.extend(seg[1:])
@@ -926,9 +976,13 @@ def road_route_path(lons, lats, order, base_url, timeout=30, profile="driving"):
         i, j = order[t], order[t + 1]
         A, B = _rk(lats[i], lons[i]), _rk(lats[j], lons[j])
         g = _ROAD_GEOM.get((A, B))
-        if g is None and not _GEOM_FAIL:
+        # Ambil geometri live hanya bila belum di-cache, OSRM belum gagal, dan plafon fetch
+        # per render belum terlampaui. Timeout dibatasi (_GEOM_TO_CAP) + sekali percobaan agar
+        # satu pasangan lambat/tak terjangkau tidak membuat render menggantung bermenit-menit.
+        if g is None and not _GEOM_FAIL and _GEOM_FETCH_N < _GEOM_FETCH_MAX:
+            _GEOM_FETCH_N += 1
             try:
-                g = _osrm_route_geom(A, B, base_url, timeout, profile=profile)
+                g = _osrm_route_geom(A, B, base_url, _to, retries=1, profile=profile)
             except Exception:
                 _GEOM_FAIL = True
                 g = None
@@ -977,10 +1031,19 @@ def build_kml(df, title="WELLGO Route"):
             P.append(f'<Folder><name>{_html.escape(str(u))} ({len(g)} sumur)</name>')
             for _, r in g.iterrows():
                 dl = pd.Timestamp(r["max_date"]).strftime("%Y-%m-%d") if pd.notna(r.get("max_date")) else "-"
-                desc = (f"Unit: {_html.escape(str(u))} | Hari {int(day_idx)} ({dstr})<br/>"
-                        f"Kategori: {_html.escape(str(r.get('category','-')))} ({_html.escape(str(r.get('tipe','-')))})<br/>"
+                # Tag kategori ringkas: NW / AWS / PRQ / ORQ / RTN (sama seperti di peta app).
+                _tp = str(r.get("tipe", "")).upper()
+                _rt = str(r.get("req_tag", "")).upper()
+                _cat = ("NW" if _tp == "NW" else "AWS" if _tp == "AWS"
+                        else "PRQ" if _rt == "PRQ" else "ORQ" if _rt == "ORQ" else "RTN")
+                _durv = r.get("dur")
+                _dur = f"{int(round(float(_durv)))} menit" if pd.notna(_durv) else "-"
+                # Nama placemark = label pin yang tampil di Google My Maps: Well · Kategori · Durasi.
+                _pin = f'{r["well"]} · {_cat} · {_dur}'
+                desc = (f"Kategori: {_cat} ({_html.escape(str(r.get('category','-')))}) | Durasi tes: {_dur}<br/>"
+                        f"Unit: {_html.escape(str(u))} | Hari {int(day_idx)} ({dstr})<br/>"
                         f"Sub-area: {_html.escape(str(r.get('subarea','-')))} | Deadline: {dl}")
-                P.append(f'<Placemark><name>{_html.escape(str(r["well"]))}</name>'
+                P.append(f'<Placemark><name>{_html.escape(_pin)}</name>'
                          f'<styleUrl>#{sid}</styleUrl><description><![CDATA[{desc}]]></description>'
                          f'<Point><coordinates>{r["lon"]},{r["lat"]},0</coordinates></Point></Placemark>')
             if len(g) > 1:
@@ -1000,6 +1063,66 @@ def build_kml(df, title="WELLGO Route"):
         P.append('</Folder>')
     P.append('</Document></kml>')
     return "\n".join(P)
+
+def build_route_html(df, title="WELLGO Route"):
+    """Peta rute mandiri (satu file HTML) memakai Leaflet + tile OpenStreetMap. Tiap titik
+    diberi label permanen nomor urut + nama sumur, dan popup berisi kategori, durasi, unit,
+    deadline. Garis rute per unit mengikuti urutan TSP. Dibuka langsung di browser tanpa
+    upload apa pun dan tanpa akun Google (butuh internet untuk memuat peta dasar)."""
+    import json as _json, html as _html
+    d = df.copy()
+    if "has_coord" in d.columns:
+        d = d[d["has_coord"].fillna(False)]
+    d = d[d["lat"].notna() & d["lon"].notna()].copy()
+    palette = ["#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6",
+               "#bf9b30", "#469990", "#9A6324", "#800000", "#808000", "#000075", "#e6194B"]
+    units = list(dict.fromkeys(str(u) for u in d["plan_unit"])) if "plan_unit" in d.columns else []
+    ucol = {u: palette[i % len(palette)] for i, u in enumerate(units)}
+    markers, routes = [], []
+    _grp = d.groupby(["day_idx", "plan_unit"]) if "day_idx" in d.columns else d.groupby("plan_unit")
+    for key, g in _grp:
+        u = key[1] if isinstance(key, tuple) else key
+        g = g.reset_index(drop=True)
+        order, _ = optimize_route(g["lat"].values, g["lon"].values)
+        col = ucol.get(str(u), "#4363d8")
+        pts = []
+        for seq, idx in enumerate(order, start=1):
+            r = g.loc[idx]
+            tp = str(r.get("tipe", "")).upper()
+            rt = str(r.get("req_tag", "")).upper()
+            cat = ("NW" if tp == "NW" else "AWS" if tp == "AWS"
+                   else "PRQ" if rt == "PRQ" else "ORQ" if rt == "ORQ" else "RTN")
+            durv = r.get("dur")
+            dur = f"{int(round(float(durv)))} menit" if pd.notna(durv) else "-"
+            dl = pd.Timestamp(r["max_date"]).strftime("%Y-%m-%d") if pd.notna(r.get("max_date")) else "-"
+            markers.append({"lat": float(r["lat"]), "lon": float(r["lon"]), "well": str(r["well"]),
+                            "cat": cat, "dur": dur, "unit": str(u), "seq": seq, "color": col, "deadline": dl})
+            pts.append([float(r["lat"]), float(r["lon"])])
+        if len(pts) > 1:
+            routes.append({"coords": pts, "color": col})
+    data = _json.dumps({"markers": markers, "routes": routes})
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{_html.escape(str(title))}</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>"
+        "<style>html,body,#map{height:100%;margin:0}"
+        ".lbl{background:rgba(255,255,255,.85);border:0;border-radius:3px;padding:1px 4px;"
+        "font:600 11px system-ui,sans-serif;color:#111;box-shadow:0 1px 2px rgba(0,0,0,.3)}</style>"
+        "</head><body><div id='map'></div>"
+        "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>"
+        "<script>const DATA=" + data + ";"
+        "const map=L.map('map');"
+        "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',"
+        "{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);"
+        "DATA.routes.forEach(r=>L.polyline(r.coords,{color:r.color,weight:3,opacity:.8}).addTo(map));"
+        "const b=[];DATA.markers.forEach(m=>{"
+        "const mk=L.circleMarker([m.lat,m.lon],{radius:7,color:'#fff',weight:1,fillColor:m.color,fillOpacity:.95}).addTo(map);"
+        "mk.bindTooltip(m.seq+'. '+m.well,{permanent:true,direction:'right',className:'lbl'});"
+        "mk.bindPopup('<b>'+m.well+'</b><br>'+m.cat+' · '+m.dur+'<br>Unit: '+m.unit+'<br>Deadline: '+m.deadline);"
+        "b.push([m.lat,m.lon]);});"
+        "if(b.length)map.fitBounds(b,{padding:[30,30]});else map.setView([1.6,101.3],9);"
+        "</script></body></html>")
 
 def convex_hull(pts):
     pts = sorted(set(map(tuple, pts)))
@@ -2005,9 +2128,9 @@ with st.sidebar:
     else:
         _src_df = spatial_db
     st.caption(f"🎯 {0 if _src_df is None or _src_df.empty else len(_src_df):,} sumur jadi sumber koordinat.")
-    _road_cache = load_road_dist()
+    _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
     st.caption(f"📦 Cache jarak jalan: **{len(_road_cache):,} pasangan** tersimpan (permanen di server, "
-               "dibaca ulang tiap run tanpa memanggil OSRM).")
+               "dimuat sekali per sesi lalu dipakai ulang tanpa memanggil OSRM).")
     if st.button("🔄 Bangun / Perbarui matriks jarak jalan", use_container_width=True,
                  help="Ambil jarak jalan untuk sumber koordinat terpilih via OSRM, lalu simpan ke cache lokal. "
                       "Hasil parsial tetap tersimpan bila server terputus di tengah jalan."):
@@ -2025,7 +2148,8 @@ with st.sidebar:
                                                    progress=lambda f: _pb.progress(min(1.0, f)))
                 _pb.empty()
                 _route_cache_store().clear()
-                _road_cache = load_road_dist()
+                load_road_dist_cached.clear()
+                _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
                 msg = f"✅ {n_pair:,} pasangan jarak jalan tersimpan."
                 if n_null:
                     msg += f" ({n_null:,} pasangan tak terjangkau, pakai haversine.)"
@@ -2033,7 +2157,8 @@ with st.sidebar:
             except Exception as e:
                 _pb.empty()
                 _route_cache_store().clear()
-                _road_cache = load_road_dist()
+                load_road_dist_cached.clear()
+                _road_cache, _road_detour_pre = load_road_dist_cached(_road_dist_sig())
                 _saved = len(_road_cache)
                 st.error(f"Gagal mengambil OSRM: {e}")
                 if _saved:
@@ -2046,7 +2171,7 @@ with st.sidebar:
                                  "yang ada di cache memakai jaringan jalan; sisanya haversine.")
     if _USE_ROAD:
         _ROAD_KM = _road_cache
-        _ROAD_DETOUR = road_detour_factor(_road_cache)
+        _ROAD_DETOUR = _road_detour_pre
         _cov = ""
         if _src_df is not None and not _src_df.empty:
             _npt = len(dict.fromkeys(_rk(a, b) for a, b in
@@ -2099,6 +2224,7 @@ with st.sidebar:
                         save_road_dist(_pairs)
                         st.session_state["_road_imp_sig"] = _sig
                         _route_cache_store().clear()
+                        load_road_dist_cached.clear()
                         st.success(f"✅ {len(_pairs):,} pasangan diimpor ke cache.")
                         st.rerun()
                 except Exception as e:
@@ -3764,12 +3890,17 @@ with tab_map:
         miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. **★ = sumur seed** (anchor pertama tiap rute unit). Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
         if _DRAW_ROAD and _seg_flat:
-            _why = ("server OSRM tak terjangkau saat render" if _GEOM_FAIL
-                    else "geometri jalannya belum ada di cache untuk periode ini")
-            st.warning(f"🛣️ {_seg_flat} dari {_seg_road + _seg_flat} segmen rute digambar **garis lurus** "
-                       f"karena {_why}. Buka **🛣️ Optimasi Jarak Jalan Nyata (OSRM)** di sidebar, lalu "
-                       "jalankan **prefetch geometri jalan** agar rute periode ini mengikuti jalan nyata "
-                       "(setelah ter-cache, ganti periode tak perlu ambil ulang).")
+            if _GEOM_FAIL:
+                st.warning(f"🛣️ {_seg_flat} dari {_seg_road + _seg_flat} segmen rute digambar **garis lurus** "
+                           "karena **server OSRM tak terjangkau** saat render (fetch dihentikan agar peta tak "
+                           "menggantung). Cek OSRM Base URL di sidebar, atau host OSRM sendiri untuk hasil "
+                           "yang konsisten dan cepat.")
+            else:
+                st.info(f"🛣️ {_seg_flat} dari {_seg_road + _seg_flat} segmen rute masih **garis lurus** karena "
+                        "geometri jalannya belum ter-cache. Geometri diambil bertahap tiap kali peta dirender "
+                        f"(maksimum {_GEOM_FETCH_MAX} pasangan per render) lalu disimpan lokal, jadi render "
+                        "peta ini beberapa kali sampai semua rute mengikuti jalan. Sekali ter-cache, ganti "
+                        "periode tak perlu ambil ulang.")
 
     else:
         # --- RENDER PLOTLY (Lasso Select) ---
@@ -4638,6 +4769,57 @@ with tab_export:
                    "Atau buka langsung di **Google Earth**.")
     else:
         st.info("Belum ada rute terjadwal untuk diekspor.")
+
+    st.divider()
+    ui.section("Buka Rute Langsung di Google Maps", eyebrow="Tanpa upload KML — klik untuk langsung navigasi per unit")
+    if view_day is not None and len(_kml_src):
+        _gd = _kml_src[_kml_src["plan_day"] == view_day]
+        if len(_gd):
+            st.caption(f"Rute hari **{view_day.date()}** per unit. Setiap tautan membuka Google Maps dengan sumur "
+                       "terurut sebagai titik perjalanan, langsung siap navigasi tanpa upload apa pun. Urutannya "
+                       "sama dengan rute TSP pada peta.")
+            for u, sub in _gd.groupby("plan_unit"):
+                s = sub.reset_index(drop=True)
+                if not len(s):
+                    continue
+                order, _ = optimize_route(s["lat"].values, s["lon"].values)
+                pts = [f'{s.loc[i, "lat"]:.6f},{s.loc[i, "lon"]:.6f}' for i in order]
+                if len(pts) == 1:
+                    url = f"https://www.google.com/maps/search/?api=1&query={pts[0]}"
+                else:
+                    # URL path-style /maps/dir/ menampung banyak titik dan langsung merutekan.
+                    url = "https://www.google.com/maps/dir/" + "/".join(pts)
+                _note = ""
+                if len(pts) > 10:
+                    _note = " · ⚠️ Google Maps membatasi ±10 titik untuk navigasi; sisanya mungkin terpotong"
+                st.markdown(f"- **{u}** ({len(pts)} titik) → [Buka rute di Google Maps]({url}){_note}")
+        else:
+            st.caption("Tidak ada rute untuk tanggal ini.")
+    else:
+        st.caption("Pilih **1 tanggal tunggal** di tab Peta Rute untuk membuat tautan rute Google Maps per unit.")
+
+    st.divider()
+    ui.section("Peta Rute Berlabel (HTML) — buka di browser, tanpa upload",
+               eyebrow="Tiap titik menampilkan nama Well — tanpa My Maps, tanpa akun Google")
+    if len(_kml_src):
+        h1, h2 = st.columns(2)
+        h1.download_button("🗺️ Unduh Peta HTML (semua rute)",
+                           build_route_html(_kml_src, title=f"WELLGO {week_lo.date()}–{week_hi.date()}").encode("utf-8"),
+                           file_name=f"wellgo_peta_{week_lo.date()}_{week_hi.date()}.html", mime="text/html")
+        if view_day is not None:
+            _hd = _kml_src[_kml_src["plan_day"] == view_day]
+            if len(_hd):
+                h2.download_button(f"🗺️ Unduh Peta HTML {view_day.date()}",
+                                   build_route_html(_hd, title=f"WELLGO {view_day.date()}").encode("utf-8"),
+                                   file_name=f"wellgo_peta_{view_day.date()}.html", mime="text/html", type="primary")
+        else:
+            h2.caption("Pilih 1 tanggal di tab Peta untuk peta HTML harian.")
+        st.caption("Buka file `.html` ini di browser mana pun. Tiap titik menampilkan **nomor urut + nama sumur** "
+                   "sebagai label tetap; klik titik untuk lihat kategori, durasi, unit, dan deadline. Garis rute "
+                   "per unit mengikuti urutan yang sama dengan aplikasi. Tanpa upload, tanpa akun Google "
+                   "(butuh internet untuk memuat peta dasar).")
+    else:
+        st.info("Belum ada rute terjadwal untuk peta HTML.")
 
 with tab_compare:
     ui.section("Komparasi Rute: Manual (History) vs WELLGO", eyebrow="Evaluasi Efisiensi Jarak & Distribusi Harian")
