@@ -42,12 +42,31 @@ def _ckpt(label):
           file=_sys.stderr, flush=True)
     _T_PREV = now
 
+# Engine baca Excel cepat: calamine (berbasis Rust) jauh lebih cepat dari openpyxl untuk
+# workbook besar/berstyle (openpyxl bisa puluhan detik hanya untuk membuka file, bahkan saat
+# membaca sheet kecil). Fallback otomatis ke default pandas bila calamine tak terpasang.
+try:
+    import python_calamine as _pcal  # noqa: F401
+    _XLS_ENGINE = "calamine"
+except Exception:
+    _XLS_ENGINE = None
+
+def _read_excel(src, **kw):
+    if _XLS_ENGINE and "engine" not in kw:
+        try:
+            return pd.read_excel(src, engine=_XLS_ENGINE, **kw)
+        except Exception:
+            try: src.seek(0)
+            except Exception: pass
+    return pd.read_excel(src, **kw)
+
 st.set_page_config(page_title="WELLGO", page_icon="wellgo_icon.png", layout="wide")
 
 ui.inject_theme()
 
 DB_PATH = "welltest_status.db"
 ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
+ROAD_GEOM_PARQUET = "road_geom_cache.parquet"   # basis geometri polyline jalan (utk gambar peta) bawaan repo
 
 def db_connect():
     """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
@@ -275,7 +294,7 @@ def read_schdb(file_bytes):
     execution_log — supaya bisa dipakai dua jalur: impor status harian (yang memang menulis
     ke database) dan tarikan riwayat untuk komparasi (yang tidak boleh menulis apa pun)."""
     try:
-        xls = pd.ExcelFile(BytesIO(file_bytes))
+        xls = pd.ExcelFile(BytesIO(file_bytes), engine=_XLS_ENGINE)
     except Exception:
         return pd.DataFrame(columns=SCHDB_COLS)
     sht = None
@@ -419,7 +438,7 @@ def to_dt(col):
 def load_unit_map(file_bytes, sheet=SHEET_MAPUNIT):
     """Return {(sub_area, field): (unit, ...)}. Sub-area kosong = berlaku utk semua sub-area."""
     try:
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
+        df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
     except Exception:
         return {}
     df.columns = [str(c).strip().upper() for c in df.columns]
@@ -453,7 +472,7 @@ def unit_map_allow(df, umap):
 @st.cache_data(show_spinner=False)
 def load_spatial_data(file_bytes, sheet):
     try:
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
+        df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
         df.columns = [str(c).strip().upper() for c in df.columns]
         req_cols = {"WELL", "FIELD", "LAT", "LON"}
         if not req_cols.issubset(set(df.columns)): return pd.DataFrame()
@@ -467,7 +486,7 @@ def load_spatial_data(file_bytes, sheet):
 
 @st.cache_data(show_spinner=False)
 def load_candidates(file_bytes, sheet):
-    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet)
+    df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
     df.columns = [str(c).strip() for c in df.columns]
     ren = {
         "well_name": "well", "Surface Lat": "lat", "Surface Lon": "lon",
@@ -479,6 +498,10 @@ def load_candidates(file_bytes, sheet):
 
     if "last_unit_name" in df.columns: ren["last_unit_name"] = "unit"
     elif "unit_name" in df.columns: ren["unit_name"] = "unit"
+    # Simpan kolom unit_name ASLI (fasilitas TS spesifik, mis. Bangko_TS_A) sebelum rename,
+    # dipakai filter "TS Spesifik Down". Beda dari `unit` yang bisa berasal dari last_unit_name.
+    _uncol = next((c for c in df.columns if str(c).strip().lower() == "unit_name"), None)
+    df["unit_name_ts"] = df[_uncol].astype(str) if _uncol else ""
     df = df.rename(columns=ren)
 
     for c in ["lat", "lon", "string_type", "remark", "remark_iems", "field", "area", "unit"]:
@@ -500,7 +523,7 @@ def load_candidates(file_bytes, sheet):
 
     df["status_src"] = "compiled"
     try:
-        so = pd.read_excel(BytesIO(file_bytes), sheet_name=SHEET_STATUS)
+        so = _read_excel(BytesIO(file_bytes), sheet_name=SHEET_STATUS)
         so.columns = [str(c).strip() for c in so.columns]
         _pick = lambda cols, names: next((c for c in cols if str(c).strip().lower() in names), None)
         wcol = _pick(so.columns, {"well_name", "well"})
@@ -553,7 +576,7 @@ def load_candidates(file_bytes, sheet):
 
     # Override alokasi Balam_South (Revisi X-Ray)
     try:
-        _bs = pd.read_excel(BytesIO(file_bytes), sheet_name=SHEET_UNITMAP)
+        _bs = _read_excel(BytesIO(file_bytes), sheet_name=SHEET_UNITMAP)
         _bs.columns = [str(c).strip().upper() for c in _bs.columns]
         if {"FIELD", "UNIT"}.issubset(_bs.columns):
             _has_sub = "OP_SUB_AREA_CODE" in _bs.columns
@@ -599,9 +622,14 @@ def load_candidates(file_bytes, sheet):
                           np.where(cat_u.str.contains("AWS"), "AWS", "REG"))
     rmk = (df["remark"].astype(str).fillna("") + " " + df["remark_iems"].astype(str).fillna("")).str.upper()
     is_req = rmk.str.contains("REQ", na=False) | rmk.str.contains("DEEPENING", na=False)
+    # PRQ juga dikenali LANGSUNG dari test_category = "PRQ" (mis. di sheet BreakIn). Remark sumur
+    # PRQ itu memuat kepentingan/alasannya dan tetap tampil sebagai keterangan lewat kolom remark.
+    cat_prq = cat_u.str.contains(r"\bPRQ\b", regex=True, na=False)
+    is_req = is_req | cat_prq
     df["force_week"] = cat_force | is_req
     ops_req = is_req & rmk.str.contains("OPS", na=False)
-    df["req_tag"] = np.where(ops_req, "ORQ", np.where(is_req, "PRQ", ""))
+    # test_category PRQ selalu PRQ (bukan ORQ) walau remark memuat OPS.
+    df["req_tag"] = np.where(cat_prq, "PRQ", np.where(ops_req, "ORQ", np.where(is_req, "PRQ", "")))
     df["is_addmanual"] = cat_u.str.contains("MANUAL", na=False) & (df["req_tag"] == "") & ~cat_force
     df["is_gp"] = st_.eq("GP")
     df["is_reg_a"] = cat_u.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
@@ -720,7 +748,15 @@ def _solve_route(lat, lon):
             used[bn] = True
 
         improved = True
-        while improved and n > 3:
+        # Batas keras jumlah lintasan 2-opt. Jarak jalan bersifat ASIMETRIS (D[i,j] != D[j,i]),
+        # sedangkan cek perbaikan hanya menimbang dua sisi batas, bukan sisi internal yang ikut
+        # terbalik. Pada sebagian konfigurasi ini membuat "perbaikan" palsu diterima lalu dibalik
+        # lagi tanpa henti (loop tak berujung → app menggantung). 2-opt normal konvergen dalam
+        # segelintir lintasan; batas ini hanya memutus osilasi, hasil kasus konvergen tak berubah.
+        _cap2opt = 50 + 4 * n
+        _pass2opt = 0
+        while improved and n > 3 and _pass2opt < _cap2opt:
+            _pass2opt += 1
             improved = False
             for i in range(1, n - 2):
                 oi1 = order[i - 1]
@@ -1055,20 +1091,69 @@ _GEOM_FETCH_N = 0        # jumlah geometri diambil live pada render ini (dibatas
 _GEOM_FETCH_MAX = 40     # plafon fetch OSRM /route per render; sisanya garis lurus & ter-cache bertahap
 _GEOM_TO_CAP = 8         # batas atas timeout per pasangan saat render (detik) — cegah render menggantung
 
-def load_road_geom():
+def load_road_geom(need=None):
+    """Geometri polyline jalan {((alat,alon),(blat,blon)): [[lon,lat],…]}.
+    Basis persist di road_geom_cache.parquet (bawaan repo) + tambahan SQLite hasil OSRM live.
+    Bila `need` diberikan, DISARING ke sumur terkait (via dua kolom lat, pola sama dgn jarak)
+    supaya tak memuat ratusan ribu polyline ke memori sekaligus (anti-OOM di Streamlit)."""
+    out = {}
+    # Basis Parquet, disaring pushdown ke sumur `need`.
+    if need and os.path.exists(ROAD_GEOM_PARQUET):
+        try:
+            import pyarrow as pa
+            import pyarrow.dataset as ds
+            pts = np.array(list(need), dtype=float)
+            lats = pa.array(np.unique(np.rint(pts[:, 0] * 1e5) / 1e5))
+            flt = ds.field("alat").isin(lats) & ds.field("blat").isin(lats)
+            tbl = ds.dataset(ROAD_GEOM_PARQUET, format="parquet").to_table(
+                columns=["alat", "alon", "blat", "blon", "geom"], filter=flt)
+            for r in tbl.to_pylist():
+                try:
+                    g = r["geom"]
+                    g = json.loads(g) if isinstance(g, str) else g
+                    out[((r["alat"], r["alon"]), (r["blat"], r["blon"]))] = g
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # Tambahan SQLite (hasil OSRM live tersimpan lokal), disaring bila ada `need`.
     con = db_connect()
     try:
-        df = pd.read_sql("SELECT alat,alon,blat,blon,geom FROM road_geom_cache", con)
+        if need:
+            lats = sorted({round(float(p[0]), 5) for p in need})
+            ql = ",".join("?" * len(lats))
+            df = pd.read_sql(
+                "SELECT alat,alon,blat,blon,geom FROM road_geom_cache "
+                f"WHERE alat IN ({ql}) AND blat IN ({ql})", con, params=lats + lats)
+        else:
+            df = pd.read_sql("SELECT alat,alon,blat,blon,geom FROM road_geom_cache", con)
     except Exception:
         df = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "geom"])
     con.close()
-    out = {}
     for r in df.itertuples():
         try:
             out[((r.alat, r.alon), (r.blat, r.blon))] = json.loads(r.geom)
         except Exception:
             continue
     return out
+
+def _road_geom_count():
+    """Jumlah geometri tersimpan (Parquet + SQLite) untuk tampilan sidebar, TANPA memuat dict."""
+    n = 0
+    try:
+        import pyarrow.parquet as _pq
+        if os.path.exists(ROAD_GEOM_PARQUET):
+            n += int(_pq.ParquetFile(ROAD_GEOM_PARQUET).metadata.num_rows)
+    except Exception:
+        pass
+    con = db_connect()
+    try:
+        n += int(con.execute("SELECT COUNT(*) FROM road_geom_cache").fetchone()[0])
+    except Exception:
+        pass
+    finally:
+        con.close()
+    return n
 
 def save_road_geom(items):
     """items: iterable of ((alat,alon),(blat,blon), geom_list)."""
@@ -1755,8 +1840,11 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     # Add Manual: tetap eligible walau window sudah lewat, selama masih bisa dimulai dalam periode
     # (min_date <= batch_hi). Prioritas rendah diatur belakangan; di sini hanya soal kelayakan.
     _addman_c = raw["is_addmanual"].fillna(False) if "is_addmanual" in raw.columns else pd.Series(False, index=raw.index)
-    # Add Manual pun HARUS overlap window periode (tak boleh overdue). Hanya PRQ/ORQ yg boleh overdue.
-    addman_c = _addman_c & win_in_range
+    # Add Manual A/B/C/D = kandidat BACKLOG (late/early). Justru window-nya SUDAH lewat / belum
+    # buka, jadi mereka TIDAK boleh disyaratkan overlap window — kalau disyaratkan, backlog malah
+    # tersaring keluar dan tak pernah terjadwal. Mereka selalu jadi kandidat; penjadwalannya
+    # dilakukan di pass pengisi (fill_mode) SETELAH optimasi utama, mengisi sisa kapasitas unit.
+    addman_c = _addman_c
     comp_wells = raw[raw["well"].isin(comp_disp_set)].copy()
     pending_wells = raw[raw["well"].isin(pending_set)].copy()
     pending_nodata = sorted(pending_set - set(pending_wells["well"]))
@@ -1956,8 +2044,11 @@ def bench_manual(hist, per_lo, per_hi, coord_map, pool):
 
 def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed,
               use_urg, use_dur, early_days=0, elastic_limit=5.0, unit_blackout=None, prebooked=None, day_offset=0,
-              min_wells=1, anchors=None, plan_fn=None):
+              min_wells=1, anchors=None, plan_fn=None, fill_mode=False):
     # plan_fn = mesin penjadwal per-hari (default heuristik plan()).
+    # fill_mode = pass pengisi (mis. Add Manual backlog): jendela min-max per-hari DILONGGARKAN
+    #   supaya sumur backlog boleh mengisi sisa kapasitas di hari mana pun (tetap tunduk kapasitas,
+    #   zona, dan kedekatan lewat plan()). Dipakai setelah optimasi utama dgn prebooked = hasilnya.
     plan_fn = plan_fn or plan
               
     # ── RESET TRACKER SAAT RUN BARU (Anti Numpuk) ──
@@ -1979,8 +2070,15 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
     is_addman = elig["is_addmanual"].fillna(False) if "is_addmanual" in elig.columns else pd.Series(False, index=elig.index)
     fw_c = elig["force_week"].fillna(False) if "force_week" in elig.columns else pd.Series(False, index=elig.index)
     cc_c = elig["carry_ncmp"].fillna(False) if "carry_ncmp" in elig.columns else pd.Series(False, index=elig.index)
-    
-    bypass_reg = (fw_c & ~is_nwaws) | (cc_c & ~is_nwaws)
+    # PRQ dari sheet BreakIn WAJIB tunduk min-max (tak boleh early/late). Hanya PRQ dari Compiled
+    # Schedule yang boleh di luar window. Jadi PRQ BreakIn TIDAK ikut bypass_reg (yang lahir dari
+    # force_week) dan jendelanya dipaksa strict di bawah.
+    if "req_tag" in elig.columns and "is_breakin" in elig.columns:
+        prq_bk = (elig["req_tag"] == "PRQ") & elig["is_breakin"].fillna(False)
+    else:
+        prq_bk = pd.Series(False, index=elig.index)
+
+    bypass_reg = ((fw_c & ~is_nwaws) | (cc_c & ~is_nwaws)) & ~prq_bk
 
     np_in = elig["np_in_range"].fillna(False) if "np_in_range" in elig.columns else pd.Series(False, index=elig.index)
     next_wt = elig["next_wt"] if "next_wt" in elig.columns else pd.Series(pd.NaT, index=elig.index)
@@ -2001,9 +2099,16 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         forbid_late = strict_no_late & is_late
 
         cond_reg = (~is_nwaws) & (win_reg | np_ok | bypass_reg) & ~forbid_late
+        # PRQ BreakIn: jendela strict min_date..max_date (abaikan bypass & early-slack, tak boleh late).
+        if prq_bk.any():
+            win_strict = (elig["min_date"] <= day) & (elig["max_date"] >= day)
+            cond_reg = cond_reg.where(~prq_bk, win_strict)
         cond_nw = is_nwaws & (win_nw | overdue_nw)
         
         pidx = elig.index[rem & (cond_reg | cond_nw)]
+        if fill_mode:
+            # Backlog: abaikan jendela: semua sisa (rem) layak mengisi kapasitas hari ini.
+            pidx = elig.index[rem]
         if len(pidx) == 0: continue
 
         pool = elig.loc[pidx].copy()
@@ -2197,9 +2302,19 @@ with st.sidebar:
     if mpas_only:
         ts_unavail = st.multiselect("Area Fasilitas TS Down (Dialihkan ke MWT)", all_areas,
                                     default=default_tsdown)
+        # Filter TS SPESIFIK yang down (mis. Bangko_TS_A, Bangko_TS_B): lebih halus daripada
+        # per-area. Daftar diambil dari kolom unit_name (fasilitas TS) di sheet Compiled Schedule.
+        _uns = raw["unit_name_ts"] if "unit_name_ts" in raw.columns else pd.Series(dtype=str)
+        _ts_units = sorted(v for v in _uns.dropna().astype(str).unique()
+                           if "TS" in v.upper() and v.strip() and v.strip().lower() != "nan")
+        ts_unit_down = st.multiselect("TS Spesifik Down (Dialihkan ke MWT)", _ts_units,
+                                      help="Pilih fasilitas TS tertentu (dari kolom unit_name) yang sedang "
+                                           "down. Sumur pada TS ini (reguler & backlog) dialihkan ke MWT. "
+                                           "Jumlah yang dialihkan (khusus periode terpilih) tampil di bawah "
+                                           "setelah optimizer jalan.")
         mwt_unavail = st.multiselect("Area Fleet MWT Down (Dialihkan ke TS)", all_areas)
     else:
-        ts_unavail, mwt_unavail = [], []
+        ts_unavail, ts_unit_down, mwt_unavail = [], [], []
     
     st.divider()
     ui.section("⏱️ Status Realisasi Harian")
@@ -2330,9 +2445,14 @@ with st.sidebar:
                                   "di-cache lokal). Pasangan yang belum ada geometrinya digambar garis lurus. "
                                   "Butuh koneksi ke server OSRM saat pertama kali render.")
     if _DRAW_ROAD:
-        _ROAD_GEOM = load_road_geom()
+        # Dimuat SETELAH jadwal terbentuk (disaring ke sumur terjadwal saja) supaya tak menahan
+        # ratusan ribu polyline di memori. Di sini hanya tampilkan jumlah tersedia (murah).
+        _ROAD_GEOM = {}
         _GEOM_FAIL = False
-        st.caption(f"🧭 Geometri jalan tersimpan: **{len(_ROAD_GEOM):,} pasangan**.")
+        _geom_n = _road_geom_count()
+        _gpq = "ada" if os.path.exists(ROAD_GEOM_PARQUET) else "tidak ada"
+        st.caption(f"🧭 Geometri jalan tersedia: **{_geom_n:,} pasangan** (Parquet repo: {_gpq} + SQLite). "
+                   "Dimuat & disaring ke rute terjadwal saat peta dirender.")
     else:
         _ROAD_GEOM = {}
     _osrm_url_cfg, _osrm_to_cfg = osrm_url, int(osrm_timeout)
@@ -2550,16 +2670,29 @@ if comp_files:
 
 if excl_areas: raw = raw[~raw["area"].isin(excl_areas)].copy()
 
-ts_redirected = raw[raw["is_ts"] & raw["area"].isin(ts_unavail)].copy()
+# TS ke MWT HANYA untuk fasilitas TS yang ditandai down: (area TS-nya dipilih di "Area TS Down")
+# ATAU (fasilitas TS spesifiknya di kolom unit_name dipilih di "TS Spesifik Down"). Ini berlaku
+# untuk SEMUA sumur TS pada fasilitas itu, reguler maupun backlog. TS pada fasilitas yang TIDAK
+# ditandai down tetap urusan armada TS dan tak dijadwalkan MWT (termasuk backlog-nya).
+def _ts_down_mask(df):
+    unc = df["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in df.columns else pd.Series("", index=df.index)
+    sel = {str(x).strip() for x in ts_unit_down}
+    return (df["is_ts"] & df["area"].isin(ts_unavail)) | unc.isin(sel)
+
+ts_redirected = raw[_ts_down_mask(raw)].copy()
 mwt_redirected = raw[raw["is_mpas"] & raw["area"].isin(mwt_unavail)].copy()
-ts_wells = raw[raw["is_ts"] & ~raw["area"].isin(ts_unavail)].copy()
+ts_wells = raw[raw["is_ts"] & ~_ts_down_mask(raw)].copy()
+# Umpan balik akurat PER PERIODE terpilih (raw sudah difilter periode di atas), bukan seluruh data.
+if len(ts_unit_down) or len(ts_unavail):
+    _am_r = ts_redirected["is_addmanual"].fillna(False) if "is_addmanual" in ts_redirected.columns else pd.Series(False, index=ts_redirected.index)
+    st.sidebar.caption(f"↪️ {len(ts_redirected)} sumur TS dialihkan ke MWT untuk periode ini "
+                       f"({int(_am_r.sum())} di antaranya backlog Add Manual).")
 if mpas_only:
     plannable = (((raw["is_mpas"] | raw["unit_unknown"]) & ~raw["area"].isin(mwt_unavail))
-                 | (raw["is_ts"] & raw["area"].isin(ts_unavail)))
+                 | _ts_down_mask(raw))
     raw = raw[plannable].copy()
     # Sumur TS yang dialihkan ke MWT → durasi pengetesan dipaksa 60 menit
-    ts2mwt = raw["is_ts"] & raw["area"].isin(ts_unavail)
-    raw.loc[ts2mwt, "dur"] = 60
+    raw.loc[_ts_down_mask(raw), "dur"] = 60
 
 field_assign = st.session_state.get("field_assign", {})
 _cc = load_coord_cache()
@@ -2818,6 +2951,13 @@ _E = build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
 _ckpt(f"build_elig (elig={len(_E['elig'])}, cand={len(_E['cand'])})")
 batch_lo, batch_hi = _E["batch_lo"], _E["batch_hi"]
 cand, comp_wells, elig, elig_all = _E["cand"], _E["comp_wells"], _E["elig"], _E["elig_all"]
+# Add Manual A/B/C/D = kandidat BACKLOG (late/early) → JANGAN ikut optimasi utama. Disisihkan
+# untuk dijadwalkan di pass tersendiri setelah optimasi selesai (mengisi sisa kapasitas unit).
+if "is_addmanual" in elig.columns:
+    _addman_pool = elig[elig["is_addmanual"].fillna(False)].copy()
+    elig = elig[~elig["is_addmanual"].fillna(False)].copy()
+else:
+    _addman_pool = elig.iloc[0:0].copy()
 expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["ncmp_expired"]
 ncmp_replan, nocoord, off_wells = _E["ncmp_replan"], _E["nocoord"], _E["off_wells"]
 pending_nodata, pending_wells = _E["pending_nodata"], _E["pending_wells"]
@@ -2894,6 +3034,23 @@ if len(elig):
         week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, day_offset=day_offset)
 else:
     week_df = elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
+
+# ── Pass Add Manual (backlog) ──────────────────────────────────────────────
+# Dijalankan SETELAH optimasi utama selesai. prebooked = seluruh sumur yang sudah terjadwal,
+# sehingga plan_week hanya menaruh Add Manual di SISA kapasitas unit. fill_mode melonggarkan
+# jendela (backlog late/early). elastic_limit dibesarkan (batas kedekatan dilonggarkan) supaya
+# backlog TETAP bisa mengisi kapasitas sisa walau jauh dari klaster — tujuan utamanya memang
+# menutup backlog, kedekatan hanya untuk memilih slot terbaik, bukan menggagalkan penjadwalan.
+if len(_addman_pool):
+    _pb_main = week_df[week_df["scheduled"].fillna(False)].copy() if "scheduled" in week_df.columns else None
+    wk_add = plan_week(_addman_pool, days, mode, max_wells, n_remote, n_nonremote,
+                       time_budget, speed, use_urg, use_dur, early_days, 999.0,
+                       unit_blackout=unit_blackout_by_day, min_wells=1, anchors=route_anchors,
+                       prebooked=(_pb_main if (_pb_main is not None and len(_pb_main)) else None),
+                       day_offset=day_offset, fill_mode=True)
+    week_df = pd.concat([week_df, wk_add], ignore_index=True)
+    _ckpt(f"plan_week Add Manual backlog (pool={len(_addman_pool)}, terjadwal {int(wk_add['scheduled'].fillna(False).sum())})")
+
 if len(nocoord):
     noc = nocoord.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
     week_df = pd.concat([week_df, noc], ignore_index=True)
@@ -2963,6 +3120,19 @@ if regroup_prox and mode == "pooled":
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
+# Muat geometri jalan HANYA untuk sumur terjadwal (yang akan digambar di peta), disaring dari
+# Parquet+SQLite. Dilakukan di sini (bukan di sidebar) supaya dict kecil & tak menahan ratusan
+# ribu polyline di memori. Pasangan yang belum ada tetap bisa ditarik live dari OSRM saat render.
+if _DRAW_ROAD and len(scheduled_all):
+    _geom_need = frozenset(
+        _rk(la, lo) for la, lo in zip(
+            pd.to_numeric(scheduled_all["lat"], errors="coerce").tolist(),
+            pd.to_numeric(scheduled_all["lon"], errors="coerce").tolist())
+        if pd.notna(la) and pd.notna(lo))
+    if _geom_need:
+        _ROAD_GEOM = load_road_geom(_geom_need)
+    _ckpt(f"load_road_geom (dimuat {len(_ROAD_GEOM):,} polyline utk rute terjadwal)")
+
 # Laporkan hasil grouping ulang: berapa yang berpindah unit & berapa km yang dihemat.
 if _regroup_info and (_regroup_info["grup"] or _regroup_info.get("tak_untung")):
     _ri = _regroup_info
@@ -3029,6 +3199,16 @@ else:
     scheduled_all["timing"] = None
     scheduled_all["timing_label"] = None
     scheduled_all["out_dir"] = None
+
+# Add Manual backlog: keterangan "late/early backlog" (PRQ dikecualikan — tapi PRQ tak pernah
+# jadi Add Manual, jadi caveat ini otomatis terpenuhi). Arah late/early dari posisi thd window.
+if len(scheduled_all) > 0 and "is_addmanual" in scheduled_all.columns:
+    _amask = scheduled_all["is_addmanual"].fillna(False)
+    _rtg = scheduled_all.get("req_tag", pd.Series("", index=scheduled_all.index)).fillna("")
+    _amask = _amask & ~_rtg.isin(["PRQ", "ORQ"])
+    _dir = scheduled_all["out_dir"].fillna("")
+    scheduled_all.loc[_amask, "timing_label"] = _dir[_amask].map(
+        lambda d: f"{d} backlog" if d in ("early", "late") else "backlog")
 
 sched_wells = set(scheduled_all["well"]) if len(scheduled_all) else set()
 leftover = week_df[~week_df["scheduled"]].copy()
@@ -4787,7 +4967,7 @@ with tab_sch:
         for f in comp_files:
             st.markdown(f"**File:** `{f.name}`")
             try:
-                df_raw = pd.read_excel(BytesIO(f.getvalue()))
+                df_raw = _read_excel(BytesIO(f.getvalue()))
                 st.dataframe(df_raw, use_container_width=True)
             except Exception as e:
                 st.error(f"Gagal memuat pratinjau untuk file ini: {str(e)}")
