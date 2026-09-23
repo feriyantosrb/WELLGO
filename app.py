@@ -2577,6 +2577,11 @@ with st.sidebar:
                  "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
                  "Sumur mendesak (deadline hari itu/terlewat, NW/AWS, PRQ/ORQ) DIKECUALIKAN — "
                  "trip 1 sumur tetap jalan kalau memang wajib. Set 1 = perilaku lama.")
+        schedule_backlog = st.checkbox(
+            "Jadwalkan Backlog (Add Manual late/early)", value=False,
+            help="Default MATI: sumur backlog (test_category Add Manual A/B/C/D di luar PRQ) TIDAK "
+                 "dijadwalkan. Nyalakan untuk mengisi SISA kapasitas unit dgn backlog SETELAH optimasi "
+                 "utama selesai; sumur backlog yang terjadwal diberi keterangan late/early backlog.")
         n_remote = st.slider("Unit Area Remote (Bangko/Balam)", 1, 5, 5)
         n_nonremote = st.slider("Unit Area Non-Remote (Bekasap)", 1, 4, 4)
         
@@ -3041,7 +3046,7 @@ else:
 # jendela (backlog late/early). elastic_limit dibesarkan (batas kedekatan dilonggarkan) supaya
 # backlog TETAP bisa mengisi kapasitas sisa walau jauh dari klaster — tujuan utamanya memang
 # menutup backlog, kedekatan hanya untuk memilih slot terbaik, bukan menggagalkan penjadwalan.
-if len(_addman_pool):
+if len(_addman_pool) and schedule_backlog:
     _pb_main = week_df[week_df["scheduled"].fillna(False)].copy() if "scheduled" in week_df.columns else None
     wk_add = plan_week(_addman_pool, days, mode, max_wells, n_remote, n_nonremote,
                        time_budget, speed, use_urg, use_dur, early_days, 999.0,
@@ -3050,6 +3055,12 @@ if len(_addman_pool):
                        day_offset=day_offset, fill_mode=True)
     week_df = pd.concat([week_df, wk_add], ignore_index=True)
     _ckpt(f"plan_week Add Manual backlog (pool={len(_addman_pool)}, terjadwal {int(wk_add['scheduled'].fillna(False).sum())})")
+elif len(_addman_pool):
+    # Toggle "Jadwalkan Backlog" MATI → backlog tak dijadwalkan, tapi tetap ditampilkan sebagai
+    # kandidat belum terjadwal (bisa dilihat/di-assign manual), bukan dihilangkan diam-diam.
+    week_df = pd.concat([week_df, _addman_pool.assign(scheduled=False, plan_unit=None,
+                                                      plan_day=pd.NaT, day_idx=0)], ignore_index=True)
+    _ckpt(f"Backlog TIDAK dijadwalkan (toggle mati) — {len(_addman_pool)} sumur backlog disisihkan")
 
 if len(nocoord):
     noc = nocoord.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
