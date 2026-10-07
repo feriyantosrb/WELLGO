@@ -68,6 +68,26 @@ DB_PATH = "welltest_status.db"
 ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 ROAD_GEOM_PARQUET = "road_geom_cache.parquet"   # basis geometri polyline jalan (utk gambar peta) bawaan repo
 
+# Gaya tooltip peta pydeck. Default deck.gl menaruh tooltip di posisi kursor (kanan-bawah titik)
+# sehingga terasa "melayang jauh". transform di bawah menggeser kotak tooltip agar TEPAT DI ATAS
+# titik yang disentuh (center horizontal, naik setinggi kotaknya + sedikit jarak), lalu diberi
+# latar gelap, padding, dan white-space pre-line supaya multi-baris rapi dan mudah dibaca.
+MAP_TOOLTIP_STYLE = {
+    "backgroundColor": "rgba(17, 24, 39, 0.96)",
+    "color": "#F9FAFB",
+    "fontSize": "12px",
+    "fontFamily": "Inter, Arial, sans-serif",
+    "lineHeight": "1.45",
+    "padding": "8px 11px",
+    "borderRadius": "8px",
+    "maxWidth": "300px",
+    "whiteSpace": "pre-line",
+    "boxShadow": "0 6px 18px rgba(0, 0, 0, 0.35)",
+    "pointerEvents": "none",
+    "zIndex": "10000",
+    "transform": "translate(-50%, calc(-100% - 16px))",
+}
+
 def db_connect():
     """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
     dipakai banyak sesi/rerun sekaligus; saat build matriks jalan menahan lock tulis, rerun
@@ -1082,6 +1102,33 @@ def _dist_matrix(lat, lon):
             if v is not None:
                 D[i, j] = v
     return D
+
+def road_min_to_pts(wlat, wlon, pts):
+    """Jarak TERDEKAT (km) dari satu sumur ke kumpulan titik rute, pakai JALAN NYATA bila
+    aktif & tercache (coba dua arah karena cache berarah), selain itu haversine diskalakan
+    _ROAD_DETOUR agar sesatuan dgn km jalan — persis logika fallback _dist_matrix. Dipakai
+    Rescue supaya 'rute terdekat' mengikuti garis jalan, bukan garis lurus. None bila pts kosong."""
+    if not pts:
+        return None
+    plat = np.array([p[0] for p in pts], dtype=float)
+    plon = np.array([p[1] for p in pts], dtype=float)
+    hav = haversine_km(float(wlat), float(wlon), plat, plon)
+    if not _USE_ROAD or not _ROAD_KM:
+        return float(np.min(hav))
+    wk = _rk(wlat, wlon)
+    best = None
+    for i, p in enumerate(pts):
+        pk = _rk(p[0], p[1])
+        v = _ROAD_KM.get((wk, pk))
+        if v is None:
+            v = _ROAD_KM.get((pk, wk))   # cache berarah → coba arah balik
+        if v is None:
+            _h = float(hav[i])
+            v = _h * _ROAD_DETOUR if _ROAD_DETOUR and _ROAD_DETOUR > 1.0 else _h
+        v = float(v)
+        if best is None or v < best:
+            best = v
+    return best
 
 # ── Geometri rute jalan nyata (OSRM /route) untuk gambar di peta ─────────────
 _ROAD_GEOM = {}          # {((alat,alon),(blat,blon)): [[lon,lat],…]} berarah a→b
@@ -4246,7 +4293,7 @@ with tab_map:
         
         view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=zoom_lvl)
         tip = "{well} [{katfull}]{seed_txt} · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
-        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
+        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip, "style": MAP_TOOLTIP_STYLE}))
         miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. **★ = sumur seed** (anchor pertama tiap rute unit). Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
         if _DRAW_ROAD and _seg_flat:
@@ -4349,8 +4396,9 @@ with tab_cart:
     ui.section("🚑 Rescue Miss-Deadline (Tahap 2)", eyebrow="Gabungkan sumur miss ke rute existing TERDEKAT (distance-first, overflow ≤8)")
     SOFT_CAP = 8
     _miss_c = int(missed["has_coord"].fillna(True).sum()) if len(missed) else 0
+    _rescue_metric = "jarak **garis jalan nyata**" if _USE_ROAD and _ROAD_KM else "jarak garis lurus (haversine)"
     st.caption(f"**{len(missed)}** sumur miss deadline ({_miss_c} berkoordinat). Tiap sumur **digabung ke rute unit+hari "
-               f"yang sudah ada & paling dekat** dalam window-nya (utamakan jarak), kapasitas dilonggarkan sampai "
+               f"yang sudah ada & paling dekat** dalam window-nya (utamakan {_rescue_metric}), kapasitas dilonggarkan sampai "
                f"**{SOFT_CAP}**/unit/hari. Sumur yang jaraknya melebihi batas detour **dibiarkan miss** biar total jarak tidak meledak.")
     _detour_cap = st.slider("Batas jarak ke rute terdekat (km) — sumur lebih jauh dibiarkan miss", 2, 100, 7, key="rescue_detour")
 
@@ -4401,9 +4449,7 @@ with tab_cart:
                     _pts = _rt_pts.get((_u, _di))
                     if not _pts:
                         continue
-                    _d = (float(np.min(haversine_km(_w["lat"], _w["lon"],
-                          np.array([p[0] for p in _pts]), np.array([p[1] for p in _pts]))))
-                          if _has_c else 0.0)
+                    _d = road_min_to_pts(_w["lat"], _w["lon"], _pts) if _has_c else 0.0
                     if _best is None or _d < _best[2]:
                         _best = (_u, _di, _d)
             if _best is None:
@@ -4470,8 +4516,7 @@ with tab_cart:
                     _cnt = _counts.get(_k, 0)
                     if _cnt >= SOFT_CAP:    # overflow lunak maksimal 8
                         continue
-                    _dist = float(np.min(haversine_km(_w["lat"], _w["lon"],
-                                  np.array([p[0] for p in _pts]), np.array([p[1] for p in _pts])))) if _has_c else 0.0
+                    _dist = road_min_to_pts(_w["lat"], _w["lon"], _pts) if _has_c else 0.0
                     _score = _dist + _cnt * 0.001   # distance-first; isi unit cuma tiebreaker halus
                     if _best is None or _score < _best[0]:
                         _best = (_score, _u, _di, _dist)
@@ -5393,7 +5438,7 @@ with tab_compare:
                     tip = "{well} [{katfull}] · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
                     view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=8.5)
                     st.caption(f"**{title}**")
-                    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
+                    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip, "style": MAP_TOOLTIP_STYLE}))
 
                 map1, map2 = st.columns(2)
                 with map1:
