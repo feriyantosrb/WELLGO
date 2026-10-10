@@ -2661,6 +2661,14 @@ with st.sidebar:
         
         elastic_limit = st.slider("Batas Persebaran Rute (Elastic Limit km)", 5, 50, 5, 1, help="Mencegah efek 'chaining' di mana armada merangkai jarak dekat tapi ujung ke ujungnya terlalu jauh.")
 
+        pad_promote_km = st.slider(
+            "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
+            help="Sumur biasa (RTN) yang letaknya dalam radius ini dari sumur prioritas (NW/AWS/PRQ) "
+                 "ikut diangkat ke Lapis 1, supaya satu pad dijadwalkan sebagai SATU klaster padat "
+                 "dan unit yang dikirim ke sumur wajib sekalian menyelesaikan tetangganya. Tetangga "
+                 "yang tak terjadwal di Lapis 1 tetap dicoba lagi di Lapis 2, jadi tak ada yang hilang. "
+                 "0 = matikan (perilaku lama).")
+
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
                  "mana digarap hari apa dan pakai berapa unit, keanggotaan tiap klaster disusun ULANG "
@@ -3089,12 +3097,34 @@ else:
 
 if len(elig):
     if two_layer or dl_mode != "Off" or dl_scope == "Deadline di rentang + lainnya":
-        # Lapis 1: sumur prioritas (NW/AWS/PRQ/ORQ + carry NCMP) dioptimasi lebih dulu
-        _prio_mask = elig["is_nwaws"].fillna(False) | elig["req_tag"].isin(["PRQ", "ORQ"]) | elig["carry_ncmp"].fillna(False) | dl_guard
+        # Lapis 1: sumur prioritas (NW/AWS/PRQ/ORQ + carry NCMP + dl_guard) dioptimasi lebih dulu
+        _base_prio = elig["is_nwaws"].fillna(False) | elig["req_tag"].isin(["PRQ", "ORQ"]) | elig["carry_ncmp"].fillna(False) | dl_guard
         if dl_scope == "Deadline di rentang + lainnya":
-            _prio_mask = _prio_mask | dl_scope_win
+            _base_prio = _base_prio | dl_scope_win
+        # Promosi tetangga SEPAD ke Lapis 1: sumur biasa (RTN) dalam radius pad_promote_km dari
+        # sumur prioritas & zona sama ikut diangkat, supaya satu pad dijadwalkan sebagai SATU
+        # klaster padat dan unit yang menuju sumur wajib sekalian menyelesaikan tetangganya
+        # (mencegah pad kelaparan unit hanya karena satu-satunya sumur prioritasnya tampak lemah).
+        _promote = pd.Series(False, index=elig.index)
+        if pad_promote_km and pad_promote_km > 0 and _base_prio.any():
+            _la = pd.to_numeric(elig["lat"], errors="coerce")
+            _lo = pd.to_numeric(elig["lon"], errors="coerce")
+            _hc = _la.notna() & _lo.notna()
+            _pm = _base_prio & _hc
+            if _pm.any():
+                _plat = _la[_pm].values; _plon = _lo[_pm].values
+                _pzr = elig.loc[_pm, "area"].astype(str).str.upper().isin(REMOTE_AREAS).values
+                for _i in elig.index[(~_base_prio) & _hc]:
+                    _zr = str(elig.at[_i, "area"]).upper() in REMOTE_AREAS
+                    _sel = (_pzr == _zr)
+                    if not _sel.any():
+                        continue
+                    if float(np.min(haversine_km(float(_la[_i]), float(_lo[_i]),
+                                                 _plat[_sel], _plon[_sel]))) <= pad_promote_km:
+                        _promote.at[_i] = True
+        _prio_mask = _base_prio | _promote
+        _promoted_wells = set(elig.loc[_promote, "well"])
         prio_elig = elig[_prio_mask].copy()
-        reg_elig = elig[~_prio_mask].copy()
         # Longgarkan batas persebaran HANYA di lapis 1, supaya sumur deadline yang berjauhan
         # muat dalam satu klaster & tak memakan unit ekstra. Rute reguler tak ikut longgar.
         _el_prio = min(50.0, elastic_limit * _DL_MULT.get(dl_mode, 1.0))
@@ -3102,8 +3132,14 @@ if len(elig):
             wk_prio = plan_week(prio_elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, _el_prio, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, day_offset=day_offset)
         else:
             wk_prio = prio_elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
-        # Lapis 2: reguler mengisi sisa kapasitas; sumur prioritas terjadwal jadi 'prebooked'
-        pb = wk_prio[wk_prio["scheduled"]].copy()
+        # Lapis 2: reguler mengisi sisa kapasitas; sumur Lapis-1 yang terjadwal jadi 'prebooked'.
+        pb = wk_prio[wk_prio["scheduled"].fillna(False)].copy()
+        _sched1 = set(pb["well"])
+        # Tetangga yang DIPROMOSIKAN tapi tak terjadwal di Lapis 1 dikembalikan ke Lapis 2 supaya
+        # tak hilang; buang dari wk_prio agar tak dobel saat digabung dengan wk_reg.
+        if _promoted_wells:
+            wk_prio = wk_prio[wk_prio["scheduled"].fillna(False) | ~wk_prio["well"].isin(_promoted_wells)].copy()
+        reg_elig = elig[(~_base_prio) & ~elig["well"].isin(_sched1)].copy()
         if len(reg_elig):
             wk_reg = plan_week(reg_elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, prebooked=pb if len(pb) else None, day_offset=day_offset)
         else:
