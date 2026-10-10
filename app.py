@@ -4694,7 +4694,156 @@ with tab_cart:
             st.dataframe(pd.DataFrame(_over).sort_values(["Unit", "Hari", "Urgensi"], ascending=[True, True, False]),
                          use_container_width=True, hide_index=True)
             st.caption("Take-out lewat panel **Keluarkan Sumur** di tab Jadwal Operasional (pilih unit), atau biarkan jika overflow oke.")
-    
+
+    # ── ⚖️ Preemption Prioritas: dahulukan sumur deadline-keras ─────────────────
+    # Untuk sumur miss berdeadline DI DALAM periode, cari unit-hari dalam window-nya yang bisa
+    # memberi slot dengan MENGGESER sumur yang lebih rendah prioritas DAN deadline-nya lebih
+    # longgar (bukan NW/AWS/PRQ, bukan forced, bukan assign manual). Penempatan dijaga tetap
+    # kompak (sumur baru harus dalam batas persebaran dari anggota yang tersisa, atau unit-hari
+    # diambil alih penuh lalu diisi tetangga sepad) sehingga rute TIDAK meledak. Memakai
+    # manual_assign/unassign yang sudah ada, dan bisa dibatalkan.
+    st.divider()
+    ui.section("⚖️ Preemption Prioritas", eyebrow="Dahulukan sumur deadline-keras dengan menggeser sumur yang lebih longgar")
+    _hard = missed.iloc[0:0].copy()
+    if len(missed):
+        _hd = missed[missed["has_coord"].fillna(False) & missed["lat"].notna()].copy()
+        if len(_hd):
+            _hard = _hd[_hd["max_date"].notna() & (_hd["max_date"] >= batch_lo) & (_hd["max_date"] <= batch_hi)].copy()
+    st.caption(f"**{len(_hard)}** sumur miss berdeadline di dalam periode jadi kandidat didahulukan. Yang digeser hanya "
+               "sumur **berprioritas lebih rendah DAN deadline lebih longgar** (bukan NW/AWS/PRQ, bukan forced, bukan "
+               "assign manual). Penempatan dijaga kompak (dalam batas persebaran) jadi rute tak meledak. Sumur yang "
+               "digeser ditampilkan terang supaya tradeoff-nya jelas, dan bisa dibatalkan.")
+    _slack_margin = st.slider("Minimal selisih deadline sumur yang digeser (hari lebih longgar dari sumur wajib)",
+                              0, 30, 3, key="preempt_margin")
+    pc1, pc2 = st.columns(2)
+    _do_preempt = pc1.button("⚖️ Jalankan Preemption", type="primary", disabled=(not len(_hard)), key="btn_preempt")
+    _do_pre_cancel = pc2.button("↩️ Batal Preemption", disabled=(not st.session_state.get("preempt_wells")), key="btn_preempt_cancel")
+
+    if _do_pre_cancel:
+        for _w in st.session_state.get("preempt_wells", []):
+            st.session_state.get("manual_assign", {}).pop(_w, None)
+        _bmp = set(st.session_state.get("preempt_bumped", []))
+        st.session_state["manual_unassign"] = [w for w in st.session_state.get("manual_unassign", []) if w not in _bmp]
+        st.session_state["preempt_wells"] = []
+        st.session_state["preempt_bumped"] = []
+        st.session_state["preempt_ran"] = False
+        st.rerun()
+
+    if _do_preempt and len(_hard):
+        def _val(tp, rt, mx):
+            tier = 0 if (str(tp) in ("NW", "AWS") or str(rt).upper() in ("PRQ", "ORQ")) else 1
+            return (tier, pd.Timestamp(mx) if pd.notna(mx) else pd.Timestamp.max)
+        _mem = {}
+        for _, _r in scheduled_all.iterrows():
+            _k = (_r["plan_unit"], int(_r["day_idx"]))
+            _fu = _r.get("forced_unit")
+            _mem.setdefault(_k, []).append({
+                "well": _r["well"], "val": _val(_r.get("tipe"), _r.get("req_tag"), _r.get("max_date")),
+                "mx": _r.get("max_date"),
+                "forced": (_fu is not None and not (isinstance(_fu, float) and pd.isna(_fu)) and str(_fu) != "None"),
+                "manual": bool(_r.get("manual", False)), "lat": _r.get("lat"), "lon": _r.get("lon")})
+        _sch_now = set(scheduled_all["well"]) if len(scheduled_all) else set()
+        _elig_set = set(elig_all["well"]) if len(elig_all) else set()
+        _skip_nb = _sch_now | set(executed) | set(pending_set)
+        _unh = raw.drop_duplicates("well").copy()
+        _unh = _unh[pd.to_numeric(_unh["lat"], errors="coerce").notna()
+                    & _unh["well"].isin(_elig_set) & ~_unh["well"].isin(_skip_nb)]
+        _act_rem = list(REMOTE_UNITS)[:n_remote]; _act_non = list(NONREMOTE_UNITS)[:n_nonremote]
+        _pdate = {di + day_offset: days[di - 1] for di in range(1, horizon + 1)}
+        _assign = dict(st.session_state.get("manual_assign", {}))
+        _bumped, _rescued = [], []
+        for _, _w in _hard.sort_values("urgency").iterrows():
+            _wn = _w["well"]; _wval = _val(_w.get("tipe"), _w.get("req_tag"), _w.get("max_date"))
+            _area = str(_w.get("area", "")).upper()
+            _pool = _act_rem if _area in REMOTE_AREAS else _act_non
+            _allow = _w.get("allow_units")
+            if _allow: _pool = [u for u in (_act_rem + _act_non) if u in _allow]
+            _gdays = [di + day_offset for di in range(1, horizon + 1)
+                      if (pd.isna(_w["min_date"]) or days[di - 1] >= _w["min_date"])
+                      and (pd.isna(_w["max_date"]) or days[di - 1] <= _w["max_date"])]
+            _best = None  # (need, dist, unit, day, bump_list)
+            for _d in _gdays:
+                for _u in _pool:
+                    _ms = _mem.get((_u, _d), [])
+                    _bump = [m for m in _ms if m["val"] > _wval and pd.notna(m["mx"])
+                             and (pd.Timestamp(m["mx"]) - pd.Timestamp(_w["max_date"])).days >= _slack_margin
+                             and not m["forced"] and not m["manual"]]
+                    _keepm = [m for m in _ms if m not in _bump]
+                    _need = max(0, 1 - (max_wells - len(_ms)))
+                    if _need > len(_bump): continue
+                    _kpts = [(m["lat"], m["lon"]) for m in _keepm if pd.notna(m["lat"])]
+                    _dA = float(road_min_to_pts(_w["lat"], _w["lon"], _kpts)) if _kpts else 0.0
+                    if _kpts and _dA > elastic_limit: continue
+                    if _best is None or (_need, _dA) < (_best[0], _best[1]):
+                        _bw = sorted(_bump, key=lambda m: pd.Timestamp(m["mx"]), reverse=True)[:_need]
+                        _best = (_need, _dA, _u, _d, _bw)
+            if _best is None: continue
+            _, _, _bu, _bd, _bw = _best
+            for m in _bw:
+                _assign.pop(m["well"], None)
+                _bumped.append(m["well"])
+                _mem[(_bu, _bd)] = [x for x in _mem[(_bu, _bd)] if x["well"] != m["well"]]
+            _assign[_wn] = {"unit": _bu, "day_idx": _bd}
+            _rescued.append(_wn)
+            _mem.setdefault((_bu, _bd), []).append({"well": _wn, "val": _wval, "mx": _w.get("max_date"),
+                "forced": False, "manual": True, "lat": _w.get("lat"), "lon": _w.get("lon")})
+            # isi slot sisa unit-hari ini dgn tetangga sepad yang belum terjadwal (co-schedule)
+            _room = max_wells - len(_mem[(_bu, _bd)])
+            if _room > 0 and len(_unh):
+                _dd = _pdate.get(_bd)
+                _uu = _unh[(pd.Series([str(a).upper() in REMOTE_AREAS for a in _unh["area"]], index=_unh.index))
+                           == (_bu in REMOTE_UNITS)].copy()
+                if len(_uu):
+                    _uu["_d"] = haversine_km(float(_w["lat"]), float(_w["lon"]),
+                                             pd.to_numeric(_uu["lat"], errors="coerce").values,
+                                             pd.to_numeric(_uu["lon"], errors="coerce").values)
+                    for _, _nb in _uu.sort_values("_d").iterrows():
+                        if _room <= 0 or _nb["_d"] > elastic_limit: break
+                        _nbw = _nb["well"]
+                        if _nbw in _assign or _nbw in _rescued or _nbw in _bumped: continue
+                        if pd.notna(_nb.get("min_date")) and pd.notna(_dd) and _nb["min_date"] > _dd: continue
+                        _allw = _nb.get("allow_units")
+                        if _allw and _bu not in _allw: continue
+                        _assign[_nbw] = {"unit": _bu, "day_idx": _bd}
+                        _rescued.append(_nbw)
+                        _mem[(_bu, _bd)].append({"well": _nbw, "val": (9, pd.Timestamp.max),
+                            "mx": _nb.get("max_date"), "forced": False, "manual": True,
+                            "lat": _nb.get("lat"), "lon": _nb.get("lon")})
+                        _room -= 1
+        st.session_state["manual_assign"] = _assign
+        if _bumped:
+            st.session_state["manual_unassign"] = list(set(st.session_state.get("manual_unassign", [])) | set(_bumped))
+        st.session_state["preempt_wells"] = _rescued
+        st.session_state["preempt_bumped"] = _bumped
+        st.session_state["preempt_ran"] = True
+        st.rerun()
+
+    _pw = st.session_state.get("preempt_wells", [])
+    if not _pw and st.session_state.get("preempt_ran"):
+        st.info("Preemption tidak menemukan unit-hari yang bisa digeser tanpa melanggar aturan: di hari-hari "
+                "window sumur wajib, semua kursi diisi sumur yang **sama atau lebih prioritas**, atau deadline-nya "
+                "**tidak lebih longgar** dari batas slider, atau forced/manual. Ini menandakan kapasitas hari itu "
+                "memang kurang — perlu tambah unit/hari, bukan sekadar menggeser.")
+    if _pw:
+        _pb = st.session_state.get("preempt_bumped", [])
+        _pplaced = [w for w in _pw if w in set(scheduled_all["well"])]
+        st.success(f"✅ {len(_pplaced)} sumur masuk lewat preemption (termasuk tetangga sepad yang ikut) · "
+                   f"{len(_pb)} sumur lebih longgar digeser.")
+        if _pb:
+            _bdf = raw.drop_duplicates("well").set_index("well")
+            _brows = []
+            for w in _pb:
+                if w in _bdf.index:
+                    _mx = _bdf.loc[w].get("max_date")
+                    _brows.append({"Digeser": w,
+                        "Kategori": _fv(_bdf.loc[w].get("kat_full", _bdf.loc[w].get("category"))),
+                        "Deadline": pd.to_datetime(_mx).strftime("%Y-%m-%d") if pd.notna(_mx) else "-",
+                        "Nasib": ("Aman: ditunda (deadline di luar periode)" if (pd.notna(_mx) and _mx > batch_hi)
+                                  else "⚠️ Perlu dicek: deadline masih di dalam periode")})
+            if _brows:
+                st.warning("Sumur yang digeser demi mendahulukan sumur deadline-keras (periksa kolom Nasib):")
+                st.dataframe(pd.DataFrame(_brows), use_container_width=True, hide_index=True)
+
     st.divider()
     ui.section("Matriks Ketersediaan Kapasitas", eyebrow="Visualisasi load per unit harian")
 
