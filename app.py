@@ -112,10 +112,9 @@ REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
 NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
 ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi slot sisa, jangan geser yang lain)
-KEEP_THIN_URG = 3        # REG dengan urgensi <= ini (H-3/kurang) dianggap "deadline mepet": tripnya tak
-                         # dibatalkan walau tipis (<min_wells) DAN dijamin dapat unit walau jauh/terisolasi,
-                         # supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ selalu dikecualikan tanpa melihat
-                         # urgensi. Dipakai di pembatalan trip tipis & pass jaminan sumur wajib di plan().
+KEEP_THIN_URG = 2        # REG dengan urgensi <= ini (H-2/kurang) dianggap "deadline mepet": tripnya tak
+                         # dibatalkan walau tipis (<min_wells), supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ
+                         # selalu dikecualikan tanpa melihat urgensi (lihat pembatalan trip tipis di plan()).
 
 # ------------------------------------------------------------------ persistence
 def init_db():
@@ -1721,50 +1720,6 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             break
         if not assigned_this_round: break
 
-    # ── JAMINAN SUMUR WAJIB (anti miss-deadline karena jauh / kalah kompetisi unit) ──
-    # Sumur wajib (NW/AWS, PRQ/ORQ, atau deadline mepet urg<=KEEP_THIN_URG) yang MASIH tak
-    # terjadwal setelah pemilihan field — biasanya karena ditolak elastic_limit (jauh dari klaster)
-    # atau fieldnya kalah berebut unit — ditempel ke unit yang BERHAK & masih punya slot, dengan
-    # elastic_limit DIABAIKAN. Bila unit permissible masih kosong ia jadi anchor rute baru, lalu
-    # _grow menarik sumur terdekat yang eligible (termasuk yang tadinya tertunda ke periode depan)
-    # sehingga tripnya efisien, bukan rute 1 sumur yang memutar jauh. Window & kapasitas tetap
-    # dihormati; mapping/forced unit tetap kunci mati. Inilah yang menjamin NW/AWS & deadline-mepet
-    # tidak lenyap jadi miss hanya karena terisolasi.
-    _must = [i for i in list(unassigned)
-             if urg_arr[i] < ADDMAN_URG
-             and (nwaws_arr[i] or prqorq_arr[i] or urg_arr[i] <= KEEP_THIN_URG)]
-    for i in sorted(_must, key=lambda x: urg_arr[x]):
-        if i not in unassigned:
-            continue
-        if has_fu[i]:
-            _cands = ([fu_arr[i]] if (fu_arr[i] in unit_clusters
-                      and len(unit_clusters[fu_arr[i]]) < max_wells) else [])
-        else:
-            _cands = [u for u in unit_clusters
-                      if _unit_ok(i, u) and len(unit_clusters[u]) < max_wells]
-        if not _cands:
-            continue
-        # Pilih unit: klaster permissible TERDEKAT (hemat unit), tapi kalau yang terdekat pun
-        # lebih jauh dari ambang elastic, unit kosong lebih baik (buka rute baru di unit longgar).
-        bu, bcost = None, None
-        for u in _cands:
-            c = unit_clusters[u]
-            cost = float(_EL_BASE) if not c else float(dist_mat[c, i].min())
-            if bcost is None or cost < bcost:
-                bu, bcost = u, cost
-        unit_clusters[bu].append(i)
-        unassigned.discard(i)
-        used_units.add(bu)
-        _grow(bu, field_arr[i])   # tarik tetangga eligible (termasuk yg tertunda) → trip efisien
-        log_entry = {
-            "Unit": bu, "Field Pemenang": field_arr[i],
-            "Alasan Field": "Jaminan sumur wajib — anti miss-deadline (elastic diabaikan).",
-            "Sumur Anchor": df.loc[i, "well"],
-            "Alasan Anchor": f"Dikunci masuk {bu} walau jauh (H-{int(urg_arr[i])}); tetangga eligible ditarik _grow.",
-        }
-        if log_entry not in st.session_state['audit_logs'][day_str]:
-            st.session_state['audit_logs'][day_str].append(log_entry)
-
     for u, c in unit_clusters.items():
         if c:
             df.loc[c, "scheduled"] = True
@@ -2694,7 +2649,7 @@ with st.sidebar:
                  "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius 1,8×; kalau tetap "
                  "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
                  "Sumur mendesak DIKECUALIKAN — NW/AWS & PRQ/ORQ selalu, plus REG yang deadline-nya "
-                 "sudah mepet (H-3/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
+                 "sudah mepet (H-2/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
                  "lenyap jadi miss deadline. Set 1 = perilaku lama.")
         schedule_backlog = st.checkbox(
             "Jadwalkan Backlog (Add Manual late/early)", value=False,
@@ -4549,6 +4504,104 @@ with tab_cart:
                 xl_sheet(_wn, _near_df, "Miss-Deadline-Terdekat", "MissTerdekat")
             st.download_button("⬇️ Unduh list (.xlsx)", _buf_near.getvalue(),
                                file_name="miss_deadline_unit_terdekat.xlsx", key="dl_miss_near",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # ── 🔎 Diagnosis: KENAPA tiap sumur miss (read-only, tak mengubah rute) ───────
+        # Untuk tiap sumur miss: hari eligible-nya, berapa slot unit kosong di hari-hari itu,
+        # unit-hari kosong TERDEKAT + jaraknya (0 km = unit benar-benar kosong, bisa buka rute
+        # baru), lalu tetangga terdekat & statusnya. Ini memisahkan 3 akar: (a) ada unit kosong
+        # tapi optimizer tak membukanya, (b) slot ada tapi jauh = terisolasi, (c) semua unit penuh
+        # di semua hari window = kapasitas kurang (butuh unit/hari tambahan).
+        with st.expander(f"🔎 Diagnosis kenapa miss ({len(missed)} sumur) — tidak mengubah rute", expanded=True):
+            _occ, _rtp = {}, {}
+            for _, _r in scheduled_all.iterrows():
+                _k = (_r["plan_unit"], int(_r["day_idx"]))
+                _occ[_k] = _occ.get(_k, 0) + 1
+                if bool(_r.get("has_coord", True)) and pd.notna(_r.get("lat")):
+                    _rtp.setdefault(_k, []).append((float(_r["lat"]), float(_r["lon"])))
+            _act_remote = list(REMOTE_UNITS)[:n_remote]
+            _act_nonrem = list(NONREMOTE_UNITS)[:n_nonremote]
+            _sched_wu = {_r["well"]: (_r["plan_unit"], int(_r["day_idx"]))
+                         for _, _r in scheduled_all.iterrows()} if len(scheduled_all) else {}
+            _miss_wset = set(missed["well"])
+            def _wstat(_wn):
+                if _wn in _sched_wu:
+                    _u, _d = _sched_wu[_wn]; return f"{_u}·H{_d}"
+                if _wn in _miss_wset: return "miss"
+                return "ditunda/antre"
+            _allc = raw.drop_duplicates("well").copy()
+            _allc = _allc[pd.to_numeric(_allc["lat"], errors="coerce").notna()]
+            _nbw = _allc["well"].tolist()
+            _nbla = pd.to_numeric(_allc["lat"], errors="coerce").values
+            _nblo = pd.to_numeric(_allc["lon"], errors="coerce").values
+
+            _diag_rows = []
+            for _, _w in missed.sort_values(["urgency", "max_date"]).iterrows():
+                _wn = _w["well"]
+                _area = str(_w.get("area", "")).upper()
+                _pool = _act_remote if _area in REMOTE_AREAS else _act_nonrem
+                _allow = _w.get("allow_units")
+                if _allow:
+                    _pool = [u for u in (_act_remote + _act_nonrem) if u in _allow]
+                _gdays = [di + day_offset for di in range(1, horizon + 1)
+                          if (pd.isna(_w["min_date"]) or days[di - 1] >= _w["min_date"])
+                          and (pd.isna(_w["max_date"]) or days[di - 1] <= _w["max_date"])]
+                _hasc = bool(_w.get("has_coord", True)) and pd.notna(_w.get("lat"))
+                _slots, _best = 0, None   # _best=(dist, unit, gd, is_empty)
+                for _gd in _gdays:
+                    for _u in _pool:
+                        _cnt = _occ.get((_u, _gd), 0)
+                        if _cnt >= max_wells:
+                            continue
+                        _slots += (max_wells - _cnt)
+                        _pts = _rtp.get((_u, _gd), [])
+                        if not _pts:
+                            _dist, _emp = 0.0, True           # unit benar-benar kosong hari itu
+                        elif _hasc:
+                            _dist, _emp = float(road_min_to_pts(_w["lat"], _w["lon"], _pts)), False
+                        else:
+                            _dist, _emp = 0.0, False
+                        if _best is None or _dist < _best[0]:
+                            _best = (_dist, _u, _gd, _emp)
+                if not _gdays:
+                    _alasan, _nearest = "Window tak jatuh di horizon render", "-"
+                elif _best is None:
+                    _alasan = "🔴 Semua unit PENUH di semua hari window (butuh unit/hari tambahan)"
+                    _nearest = "-"
+                elif _best[3]:
+                    _alasan = f"🟢 ADA unit KOSONG di window — optimizer tak membukanya"
+                    _nearest = f"{_best[1]}·H{int(_best[2])} (unit kosong, 0 km)"
+                elif _best[0] <= _detour_cap:
+                    _alasan = f"🟡 Slot dekat tersedia ({_best[0]:.1f} km ≤ batas {_detour_cap} km)"
+                    _nearest = f"{_best[1]}·H{int(_best[2])} ({_best[0]:.1f} km)"
+                else:
+                    _alasan = f"🟠 Slot ada tapi JAUH ({_best[0]:.1f} km) — sumur terisolasi"
+                    _nearest = f"{_best[1]}·H{int(_best[2])} ({_best[0]:.1f} km)"
+                _neigh = []
+                if _hasc:
+                    _hv = haversine_km(float(_w["lat"]), float(_w["lon"]), _nbla, _nblo)
+                    for _j in np.argsort(_hv):
+                        if _nbw[_j] == _wn:
+                            continue
+                        _neigh.append(f"{_nbw[_j]} [{_wstat(_nbw[_j])}] {_hv[_j]:.1f}km")
+                        if len(_neigh) >= 3:
+                            break
+                _diag_rows.append({
+                    "Well": _wn, "Kategori": _fv(_w.get("kat_full", _w.get("category"))),
+                    "Deadline": pd.to_datetime(_w.get("max_date")).strftime("%Y-%m-%d") if pd.notna(_w.get("max_date")) else "-",
+                    "Hari Eligible": len(_gdays), "Slot Kosong (window)": int(_slots),
+                    "Unit-Hari Kosong Terdekat": _nearest, "Kemungkinan Sebab": _alasan,
+                    "Tetangga Terdekat (status)": " | ".join(_neigh) if _neigh else "-"})
+            _diag_df = pd.DataFrame(_diag_rows)
+            st.caption("Legenda sebab: 🟢 ada unit kosong yang tak dibuka · 🟡 slot dekat tersedia · "
+                       "🟠 slot ada tapi jauh (terisolasi) · 🔴 semua unit penuh (kapasitas kurang). "
+                       "Status tetangga: `UNIT·Hhari` = terjadwal, `ditunda/antre` = belum dijadwalkan, `miss`.")
+            st.dataframe(_diag_df, use_container_width=True, hide_index=True)
+            _buf_diag = BytesIO()
+            with pd.ExcelWriter(_buf_diag, engine="openpyxl") as _wd:
+                xl_sheet(_wd, _diag_df, "Diagnosis-Miss", "DiagMiss")
+            st.download_button("⬇️ Unduh diagnosis (.xlsx)", _buf_diag.getvalue(),
+                               file_name="diagnosis_miss_deadline.xlsx", key="dl_miss_diag",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     rc1, rc2 = st.columns([1, 1])
