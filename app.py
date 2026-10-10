@@ -1485,6 +1485,10 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
 
     urg_arr = pd.to_numeric(df["urgency"], errors="coerce").fillna(0).values
     dur_arr = pd.to_numeric(df["dur"], errors="coerce").fillna(0).values
+    # NW/AWS: bobot skor field disamakan dengan urgensi 0 (50000) tanpa melihat urgensi aslinya,
+    # supaya field berisi NW/AWS ikut naik prioritas pemilihannya.
+    nwaws_arr = (df["tipe"].isin(["NW", "AWS"]).values if "tipe" in df.columns
+                 else np.zeros(len(df), dtype=bool))
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1609,10 +1613,11 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
         for fld in pd.unique(un_fields):
             f_wells = [w for w in un_list if field_arr[w] == fld]
             if not f_wells: continue
-            urgs = urg_arr[f_wells]
             score = 0
-            for u in urgs:
-                if u >= ADDMAN_URG: score += 1
+            for w in f_wells:
+                u = urg_arr[w]
+                if nwaws_arr[w]: score += 50000   # NW/AWS = setara urgensi 0
+                elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
                 elif u == 0: score += 50000
                 elif u == 1: score += 10000
