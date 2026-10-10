@@ -112,9 +112,10 @@ REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
 NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
 ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi slot sisa, jangan geser yang lain)
-KEEP_THIN_URG = 2        # REG dengan urgensi <= ini (H-2/kurang) dianggap "deadline mepet": tripnya tak
-                         # dibatalkan walau tipis (<min_wells), supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ
-                         # selalu dikecualikan tanpa melihat urgensi (lihat pembatalan trip tipis di plan()).
+KEEP_THIN_URG = 3        # REG dengan urgensi <= ini (H-3/kurang) dianggap "deadline mepet": tripnya tak
+                         # dibatalkan walau tipis (<min_wells) DAN dijamin dapat unit walau jauh/terisolasi,
+                         # supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ selalu dikecualikan tanpa melihat
+                         # urgensi. Dipakai di pembatalan trip tipis & pass jaminan sumur wajib di plan().
 
 # ------------------------------------------------------------------ persistence
 def init_db():
@@ -1720,6 +1721,50 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             break
         if not assigned_this_round: break
 
+    # ── JAMINAN SUMUR WAJIB (anti miss-deadline karena jauh / kalah kompetisi unit) ──
+    # Sumur wajib (NW/AWS, PRQ/ORQ, atau deadline mepet urg<=KEEP_THIN_URG) yang MASIH tak
+    # terjadwal setelah pemilihan field — biasanya karena ditolak elastic_limit (jauh dari klaster)
+    # atau fieldnya kalah berebut unit — ditempel ke unit yang BERHAK & masih punya slot, dengan
+    # elastic_limit DIABAIKAN. Bila unit permissible masih kosong ia jadi anchor rute baru, lalu
+    # _grow menarik sumur terdekat yang eligible (termasuk yang tadinya tertunda ke periode depan)
+    # sehingga tripnya efisien, bukan rute 1 sumur yang memutar jauh. Window & kapasitas tetap
+    # dihormati; mapping/forced unit tetap kunci mati. Inilah yang menjamin NW/AWS & deadline-mepet
+    # tidak lenyap jadi miss hanya karena terisolasi.
+    _must = [i for i in list(unassigned)
+             if urg_arr[i] < ADDMAN_URG
+             and (nwaws_arr[i] or prqorq_arr[i] or urg_arr[i] <= KEEP_THIN_URG)]
+    for i in sorted(_must, key=lambda x: urg_arr[x]):
+        if i not in unassigned:
+            continue
+        if has_fu[i]:
+            _cands = ([fu_arr[i]] if (fu_arr[i] in unit_clusters
+                      and len(unit_clusters[fu_arr[i]]) < max_wells) else [])
+        else:
+            _cands = [u for u in unit_clusters
+                      if _unit_ok(i, u) and len(unit_clusters[u]) < max_wells]
+        if not _cands:
+            continue
+        # Pilih unit: klaster permissible TERDEKAT (hemat unit), tapi kalau yang terdekat pun
+        # lebih jauh dari ambang elastic, unit kosong lebih baik (buka rute baru di unit longgar).
+        bu, bcost = None, None
+        for u in _cands:
+            c = unit_clusters[u]
+            cost = float(_EL_BASE) if not c else float(dist_mat[c, i].min())
+            if bcost is None or cost < bcost:
+                bu, bcost = u, cost
+        unit_clusters[bu].append(i)
+        unassigned.discard(i)
+        used_units.add(bu)
+        _grow(bu, field_arr[i])   # tarik tetangga eligible (termasuk yg tertunda) → trip efisien
+        log_entry = {
+            "Unit": bu, "Field Pemenang": field_arr[i],
+            "Alasan Field": "Jaminan sumur wajib — anti miss-deadline (elastic diabaikan).",
+            "Sumur Anchor": df.loc[i, "well"],
+            "Alasan Anchor": f"Dikunci masuk {bu} walau jauh (H-{int(urg_arr[i])}); tetangga eligible ditarik _grow.",
+        }
+        if log_entry not in st.session_state['audit_logs'][day_str]:
+            st.session_state['audit_logs'][day_str].append(log_entry)
+
     for u, c in unit_clusters.items():
         if c:
             df.loc[c, "scheduled"] = True
@@ -2649,7 +2694,7 @@ with st.sidebar:
                  "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius 1,8×; kalau tetap "
                  "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
                  "Sumur mendesak DIKECUALIKAN — NW/AWS & PRQ/ORQ selalu, plus REG yang deadline-nya "
-                 "sudah mepet (H-2/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
+                 "sudah mepet (H-3/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
                  "lenyap jadi miss deadline. Set 1 = perilaku lama.")
         schedule_backlog = st.checkbox(
             "Jadwalkan Backlog (Add Manual late/early)", value=False,
