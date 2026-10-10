@@ -112,6 +112,9 @@ REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
 NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
 ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi slot sisa, jangan geser yang lain)
+KEEP_THIN_URG = 2        # REG dengan urgensi <= ini (H-2/kurang) dianggap "deadline mepet": tripnya tak
+                         # dibatalkan walau tipis (<min_wells), supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ
+                         # selalu dikecualikan tanpa melihat urgensi (lihat pembatalan trip tipis di plan()).
 
 # ------------------------------------------------------------------ persistence
 def init_db():
@@ -1498,6 +1501,14 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
         return False
     nwaws1_arr = (np.array([_is_nwaws1(c) for c in df["category"].values], dtype=bool)
                   if "category" in df.columns else np.zeros(len(df), dtype=bool))
+    # Pembatalan trip tipis (<min_wells) TIDAK boleh menjatuhkan sumur yang tak bisa menunggu.
+    # Sesuai janji help text min_wells: NW/AWS & PRQ/ORQ selalu dikecualikan; REG baru dikecualikan
+    # saat deadline sudah mepet (urgensi <= KEEP_THIN_URG). Ini yang membuat sumur prioritas/deadline
+    # terisolasi tetap dibukakan rute di unit longgar, bukan lenyap jadi miss deadline.
+    nwaws_arr = (df["tipe"].isin(["NW", "AWS"]).values if "tipe" in df.columns
+                 else np.zeros(len(df), dtype=bool))
+    prqorq_arr = (df["req_tag"].isin(["PRQ", "ORQ"]).values if "req_tag" in df.columns
+                  else np.zeros(len(df), dtype=bool))
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1694,7 +1705,8 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             if min_wells > 1 and len(unit_clusters[u]) < min_wells:
                 _grow(u, target_fld, elim=_EL_BASE * 1.8)
             if min_wells > 1 and len(unit_clusters[u]) < min_wells \
-               and not any(urg_arr[i] <= 0 for i in unit_clusters[u]):
+               and not any(nwaws_arr[i] or prqorq_arr[i] or urg_arr[i] <= KEEP_THIN_URG
+                           for i in unit_clusters[u]):
                 unassigned.update(unit_clusters[u])
                 unit_clusters[u] = []
                 used_units.discard(u)
@@ -2636,8 +2648,9 @@ with st.sidebar:
             help="Cegah unit berangkat seharian cuma untuk 1–2 sumur. Kalau klaster sebuah unit "
                  "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius 1,8×; kalau tetap "
                  "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
-                 "Sumur mendesak (deadline hari itu/terlewat, NW/AWS, PRQ/ORQ) DIKECUALIKAN — "
-                 "trip 1 sumur tetap jalan kalau memang wajib. Set 1 = perilaku lama.")
+                 "Sumur mendesak DIKECUALIKAN — NW/AWS & PRQ/ORQ selalu, plus REG yang deadline-nya "
+                 "sudah mepet (H-2/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
+                 "lenyap jadi miss deadline. Set 1 = perilaku lama.")
         schedule_backlog = st.checkbox(
             "Jadwalkan Backlog (Add Manual late/early)", value=False,
             help="Default MATI: sumur backlog (test_category Add Manual A/B/C/D di luar PRQ) TIDAK "
