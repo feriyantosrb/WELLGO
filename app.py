@@ -1485,10 +1485,19 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
 
     urg_arr = pd.to_numeric(df["urgency"], errors="coerce").fillna(0).values
     dur_arr = pd.to_numeric(df["dur"], errors="coerce").fillna(0).values
-    # NW/AWS: bobot skor field disamakan dengan urgensi 0 (50000) tanpa melihat urgensi aslinya,
-    # supaya field berisi NW/AWS ikut naik prioritas pemilihannya.
-    nwaws_arr = (df["tipe"].isin(["NW", "AWS"]).values if "tipe" in df.columns
-                 else np.zeros(len(df), dtype=bool))
+    # HANYA NW1/AWS1: bobot skor field disamakan dengan urgensi 0 (50000) tanpa melihat urgensi
+    # aslinya, supaya field berisi NW1/AWS1 ikut naik prioritas pemilihannya. NW2/NW3/AWS2 tidak.
+    def _is_nwaws1(cat):
+        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+        m = re.search(r"NEW WELL\s*([123])", c)
+        if m:
+            return m.group(1) == "1"
+        if "AWS" in c:
+            m = re.search(r"AWS\s*([12])", c)
+            return bool(m) and m.group(1) == "1"
+        return False
+    nwaws1_arr = (np.array([_is_nwaws1(c) for c in df["category"].values], dtype=bool)
+                  if "category" in df.columns else np.zeros(len(df), dtype=bool))
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1616,7 +1625,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             score = 0
             for w in f_wells:
                 u = urg_arr[w]
-                if nwaws_arr[w]: score += 50000   # NW/AWS = setara urgensi 0
+                if nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
                 elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
                 elif u == 0: score += 50000
