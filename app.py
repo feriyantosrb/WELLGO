@@ -830,8 +830,6 @@ def optimize_route(lat, lon):
 # jaraknya dipakai; pasangan yang belum ada JATUH ke haversine, jadi tak pernah patah.
 _ROAD_KM = {}            # {((rlat,rlon),(rlat,rlon)): km}  berarah
 _USE_ROAD = False        # di-set dari sidebar setelah cache dimuat
-_TIER_SCORING = True     # di-set dari sidebar: skor field berjenjang kategori (NW/AWS>REG A>B>C>D>RTN)
-_TIER_BASE = 1_000_000_000  # bobot dominan per-tier di skor field; selalu > total skor urgensi satu field
 _ROAD_DETOUR = 1.0       # rasio khas km_jalan/km_lurus dari cache, utk skala pasangan tak tercache
 _OSRM_INSECURE = False   # abaikan verifikasi sertifikat SSL panggilan OSRM (proxy korporat)
 
@@ -1511,27 +1509,6 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                  else np.zeros(len(df), dtype=bool))
     prqorq_arr = (df["req_tag"].isin(["PRQ", "ORQ"]).values if "req_tag" in df.columns
                   else np.zeros(len(df), dtype=bool))
-    # Tier prioritas kategori (0 = paling wajib): NW/AWS & PRQ/ORQ = 0, REG A=1, B=2, C=3, D=4,
-    # RTN/lainnya=5, Add Manual=6. Dipakai skor field berjenjang agar unit langka diambil tier
-    # tinggi dulu, sehingga yang terpaksa miss jatuh ke tier terendah (bukan NW/AWS/REG A).
-    def _well_tier(tp, rt, cat):
-        if str(tp) in ("NW", "AWS"):
-            return 0
-        if str(rt).upper() in ("PRQ", "ORQ"):
-            return 0
-        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
-        m = re.search(r"REGULAR\s*([ABCD])\b", c)
-        if m:
-            return {"A": 1, "B": 2, "C": 3, "D": 4}[m.group(1)]
-        if "MANUAL" in c:
-            return 6
-        return 5
-    if "category" in df.columns:
-        _rtg = df["req_tag"] if "req_tag" in df.columns else pd.Series("", index=df.index)
-        tier_arr = np.array([_well_tier(t, r, c) for t, r, c in
-                             zip(df["tipe"], _rtg, df["category"])], dtype=int)
-    else:
-        tier_arr = np.full(len(df), 5, dtype=int)
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1668,12 +1645,6 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 elif u <= 4: score += 1000
                 elif u <= 7: score += 100
                 else: score += 10
-            if _TIER_SCORING:
-                # Tier mendominasi: field yang memuat sumur tier lebih tinggi SELALU di atas field
-                # yang isinya hanya tier lebih rendah, berapa pun padatnya. Skor urgensi hanya
-                # pembeda di dalam tier yang sama. Tier field = tier terbaik (terkecil) anggotanya.
-                _bt = int(min(tier_arr[w] for w in f_wells))
-                score = (6 - _bt) * _TIER_BASE + score
             field_scores[fld] = score
 
         if not field_scores: break
@@ -2697,14 +2668,6 @@ with st.sidebar:
                  "dan unit yang dikirim ke sumur wajib sekalian menyelesaikan tetangganya. Tetangga "
                  "yang tak terjadwal di Lapis 1 tetap dicoba lagi di Lapis 2, jadi tak ada yang hilang. "
                  "0 = matikan (perilaku lama).")
-
-        _TIER_SCORING = st.checkbox(
-            "Prioritas berjenjang kategori (NW/AWS > REG A > B > C > D > RTN)", value=True,
-            help="Saat kursi unit langka, field yang memuat sumur kategori lebih tinggi SELALU "
-                 "didahulukan atas field yang isinya hanya kategori lebih rendah, berapa pun padatnya. "
-                 "Urgensi (H-) tetap jadi penentu di dalam kategori yang sama. Tujuannya: yang terpaksa "
-                 "miss jatuh ke REG B/C/D dan RTN, bukan NW/AWS/REG A. Matikan untuk skor lama (padat "
-                 "menang, tanpa jenjang kategori).")
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
