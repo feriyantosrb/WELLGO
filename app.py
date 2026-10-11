@@ -68,10 +68,11 @@ DB_PATH = "welltest_status.db"
 ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 ROAD_GEOM_PARQUET = "road_geom_cache.parquet"   # basis geometri polyline jalan (utk gambar peta) bawaan repo
 
-# Gaya tooltip peta pydeck. Default deck.gl menaruh tooltip di posisi kursor (kanan-bawah titik)
-# sehingga terasa "melayang jauh". transform di bawah menggeser kotak tooltip agar TEPAT DI ATAS
-# titik yang disentuh (center horizontal, naik setinggi kotaknya + sedikit jarak), lalu diberi
-# latar gelap, padding, dan white-space pre-line supaya multi-baris rapi dan mudah dibaca.
+# Gaya tooltip peta pydeck. Dibiarkan mengikuti posisi default deck.gl (menempel di kursor) dengan
+# sedikit offset bawah-kanan, lalu diberi latar gelap, padding, dan white-space pre-line supaya
+# multi-baris rapi dan mudah dibaca. CATATAN: JANGAN pakai transform translateY negatif untuk
+# menaruh tooltip di ATAS titik — kontainer deck.gl memotong luapan (overflow hidden) sehingga
+# tooltip yang didorong ke atas ikut terpotong dan tampak TIDAK MUNCUL. Offset positif aman.
 MAP_TOOLTIP_STYLE = {
     "backgroundColor": "rgba(17, 24, 39, 0.96)",
     "color": "#F9FAFB",
@@ -85,7 +86,8 @@ MAP_TOOLTIP_STYLE = {
     "boxShadow": "0 6px 18px rgba(0, 0, 0, 0.35)",
     "pointerEvents": "none",
     "zIndex": "10000",
-    "transform": "translate(-50%, calc(-100% - 16px))",
+    "marginTop": "10px",
+    "marginLeft": "12px",
 }
 
 def db_connect():
