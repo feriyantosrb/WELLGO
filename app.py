@@ -68,27 +68,10 @@ DB_PATH = "welltest_status.db"
 ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 ROAD_GEOM_PARQUET = "road_geom_cache.parquet"   # basis geometri polyline jalan (utk gambar peta) bawaan repo
 
-# Gaya tooltip peta pydeck. Dibiarkan mengikuti posisi default deck.gl (menempel di kursor) dengan
-# sedikit offset bawah-kanan, lalu diberi latar gelap, padding, dan white-space pre-line supaya
-# multi-baris rapi dan mudah dibaca. CATATAN: JANGAN pakai transform translateY negatif untuk
-# menaruh tooltip di ATAS titik — kontainer deck.gl memotong luapan (overflow hidden) sehingga
-# tooltip yang didorong ke atas ikut terpotong dan tampak TIDAK MUNCUL. Offset positif aman.
-MAP_TOOLTIP_STYLE = {
-    "backgroundColor": "rgba(17, 24, 39, 0.96)",
-    "color": "#F9FAFB",
-    "fontSize": "12px",
-    "fontFamily": "Inter, Arial, sans-serif",
-    "lineHeight": "1.45",
-    "padding": "8px 11px",
-    "borderRadius": "8px",
-    "maxWidth": "300px",
-    "whiteSpace": "pre-line",
-    "boxShadow": "0 6px 18px rgba(0, 0, 0, 0.35)",
-    "pointerEvents": "none",
-    "zIndex": "10000",
-    "marginTop": "10px",
-    "marginLeft": "12px",
-}
+# Tooltip peta pydeck memakai bentuk {"text": ...} bawaan. CATATAN: pada Streamlit/pydeck versi
+# terbaru, menambahkan key "style" pada tooltip membuat tooltip TIDAK DIRENDER sama sekali, jadi
+# jangan tambahkan style di sini. Posisi default (menempel di kursor) memang agak melayang, tapi
+# itu konsekuensi deck.gl di Streamlit; yang penting tooltip-nya muncul.
 
 def db_connect():
     """Koneksi SQLite dengan busy_timeout panjang + WAL. Di Streamlit Cloud satu file DB
@@ -4358,7 +4341,7 @@ with tab_map:
         
         view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=zoom_lvl)
         tip = "{well} [{katfull}]{seed_txt} · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
-        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip, "style": MAP_TOOLTIP_STYLE}))
+        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
         miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. **★ = sumur seed** (anchor pertama tiap rute unit). Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
         if _DRAW_ROAD and _seg_flat:
@@ -5788,7 +5771,7 @@ with tab_compare:
                     tip = "{well} [{katfull}] · {ket}\nTanggal Plan: {tgl_str} | Unit: {plan_unit}\nWindow Execution: {min_str} → {max_str}"
                     view = pdk.ViewState(latitude=lat_init, longitude=lon_init, zoom=8.5)
                     st.caption(f"**{title}**")
-                    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip, "style": MAP_TOOLTIP_STYLE}))
+                    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
 
                 map1, map2 = st.columns(2)
                 with map1:
