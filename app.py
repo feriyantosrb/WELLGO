@@ -4640,6 +4640,44 @@ with tab_cart:
                                file_name="diagnosis_miss_deadline.xlsx", key="dl_miss_diag",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # ── 📊 Bottleneck kapasitas: kursi vs kebutuhan per hari & zona ─────────────
+        with st.expander("📊 Bottleneck kapasitas per hari & zona (berapa unit kurang)", expanded=True):
+            _ar = scheduled_all["area"].astype(str).str.upper() if len(scheduled_all) else pd.Series(dtype=object)
+            _cap_rows = []
+            for _gd in day_nums:
+                _dt = days[_gd - day_offset - 1]
+                for _zname, _nz, _isrem in (("Remote", n_remote, True), ("Non-Remote", n_nonremote, False)):
+                    _cap = int(_nz) * int(max_wells)
+                    _used = int(((scheduled_all["day_idx"] == _gd) & (_ar.isin(REMOTE_AREAS) == _isrem)).sum()) if len(scheduled_all) else 0
+                    _free = _cap - _used
+                    _me = 0
+                    if len(missed):
+                        for _, _mw in missed.iterrows():
+                            if (str(_mw.get("area", "")).upper() in REMOTE_AREAS) != _isrem:
+                                continue
+                            if (pd.isna(_mw["min_date"]) or _dt >= _mw["min_date"]) \
+                               and (pd.isna(_mw["max_date"]) or _dt <= _mw["max_date"]):
+                                _me += 1
+                    _cap_rows.append({"Hari": _dt.strftime("%Y-%m-%d"), "Zona": _zname, "Unit": int(_nz),
+                        "Kapasitas": _cap, "Terpakai": _used, "Sisa Slot": _free, "Miss butuh hari ini": _me,
+                        "Status": ("🔴 Jenuh & ada miss" if (_free <= 0 and _me > 0)
+                                   else ("🟠 Penuh" if _free <= 0 else "🟢 Ada sisa"))})
+            _cap_df = pd.DataFrame(_cap_rows)
+            st.caption("Kapasitas = Unit × target sumur/unit. 'Miss butuh hari ini' = sumur miss yang window-nya "
+                       "mencakup hari itu. 🔴 = hari jenuh yang masih ada sumur miss menuntut, di situlah kapasitas "
+                       "perlu ditambah.")
+            st.dataframe(_cap_df, use_container_width=True, hide_index=True)
+            _crit = _cap_df[_cap_df["Status"].str.startswith("🔴")]
+            if len(_crit):
+                _lines = [f"**{r['Hari']}** {r['Zona']}: {int(r['Miss butuh hari ini'])} sumur miss menuntut, sisa 0 "
+                          f"(butuh +{int(np.ceil(r['Miss butuh hari ini'] / max(1, max_wells)))} unit utk menutup)"
+                          for _, r in _crit.iterrows()]
+                st.warning("Hari jenuh yang menahan sumur miss, inilah titik kekurangan kapasitas:\n\n- "
+                           + "\n- ".join(_lines))
+            else:
+                st.info("Tidak ada hari yang jenuh sekaligus menahan miss. Miss yang tersisa (bila ada) lebih karena "
+                        "jarak atau aturan window, bukan kekurangan kursi.")
+
     rc1, rc2 = st.columns([1, 1])
     _do_rescue = rc1.button("🚑 Jalankan Rescue Miss-Deadline", type="primary", disabled=(len(missed) == 0), key="btn_rescue")
     _do_cancel = rc2.button("↩️ Batal Rescue", disabled=(not st.session_state.get("rescued_wells")), key="btn_rescue_cancel")
