@@ -829,6 +829,26 @@ def _osrm_ctx():
 def _rk(lat, lon):
     return (round(float(lat), 5), round(float(lon), 5))
 
+# Basis urgensi penjadwalan. Default False = urgensi dari H-deadline (max_date - hari). Bila True,
+# urgensi diganti dengan TIER KATEGORI: NW/AWS & PRQ/ORQ paling prioritas, lalu REG A, B, C, D,
+# lalu RTN/lainnya. Deadline diabaikan untuk urutan prioritas (tetap dipakai untuk kelayakan window).
+# Di-set dari sidebar. Hanya mengubah PRIORITAS, bukan kelayakan.
+_URG_BY_TIER = False
+
+def _tier_urgency_series(cat, tipe, rtag):
+    """Nilai urgensi berbasis tier (makin kecil makin prioritas) supaya memetakan ke skor field
+    yang sudah ada secara berjenjang: NW/AWS & PRQ/ORQ = -1 (→100000), REG A=0 (→50000),
+    B=1 (→10000), C=2 (→5000), D=3 (→1000), RTN/lainnya=8 (→10). cat/tipe/rtag = Series."""
+    cu = cat.astype(str).str.upper()
+    u = pd.Series(8.0, index=cat.index)
+    u[cu.str.contains(r"REGULAR\s*A\b", regex=True, na=False)] = 0.0
+    u[cu.str.contains(r"REGULAR\s*B\b", regex=True, na=False)] = 1.0
+    u[cu.str.contains(r"REGULAR\s*C\b", regex=True, na=False)] = 2.0
+    u[cu.str.contains(r"REGULAR\s*D\b", regex=True, na=False)] = 3.0
+    _top = tipe.astype(str).isin(["NW", "AWS"]) | rtag.astype(str).str.upper().isin(["PRQ", "ORQ"])
+    u[_top] = -1.0
+    return u
+
 def road_detour_factor(cache):
     """Rasio khas (median) km jalan terhadap km garis lurus dari isi cache. Dipakai
     menskala estimasi pasangan yang BELUM tercache supaya satu satuan dgn km jalan,
@@ -1621,7 +1641,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             score = 0
             for w in f_wells:
                 u = urg_arr[w]
-                if nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
+                if (not _URG_BY_TIER) and nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
                 elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
                 elif u == 0: score += 50000
@@ -2172,6 +2192,11 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         pool = elig.loc[pidx].copy()
         # Urgensi dasar berdasarkan kalender asli
         pool["urgency"] = (pool["max_date"] - day).dt.days.fillna(0)
+        if _URG_BY_TIER:
+            # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
+            pool["urgency"] = _tier_urgency_series(
+                pool["category"], pool.get("tipe", pd.Series("", index=pool.index)),
+                pool.get("req_tag", pd.Series("", index=pool.index)))
         
         mid = bypass_reg.loc[pidx]
         nw = is_nwaws.loc[pidx]
@@ -2185,7 +2210,8 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         # Efek: PRQ akan dapat skor lapangan 10.000, KALAH dari reguler H-0 yang dapat 50.000.
         # Tapi saat di hari tersebut tidak ada H-0 (hari longgar), PRQ akan langsung dieksekusi.
         is_prq_orq = mid
-        pool.loc[is_prq_orq & (pool["urgency"] <= 0), "urgency"] = 1
+        if not _URG_BY_TIER:
+            pool.loc[is_prq_orq & (pool["urgency"] <= 0), "urgency"] = 1
         # ──────────────────────────────────────────────────────────
 
         pool.loc[is_addman.loc[pidx], "urgency"] = ADDMAN_URG
@@ -2653,6 +2679,14 @@ with st.sidebar:
                  "dan unit yang dikirim ke sumur wajib sekalian menyelesaikan tetangganya. Tetangga "
                  "yang tak terjadwal di Lapis 1 tetap dicoba lagi di Lapis 2, jadi tak ada yang hilang. "
                  "0 = matikan (perilaku lama).")
+
+        _URG_BY_TIER = st.checkbox(
+            "Urgensi berbasis TIER kategori (eksperimen) — NW/AWS > A > B > C > D > RTN", value=False,
+            help="MATI (default): urgensi dari H-deadline (sumur paling dekat deadline didahulukan). "
+                 "NYALA: urgensi ditentukan kategori, bukan deadline — NW/AWS & PRQ/ORQ paling prioritas, "
+                 "lalu REG A, B, C, D, lalu RTN. Deadline tetap dipakai untuk kelayakan window, hanya "
+                 "URUTAN prioritas yang berubah. Catatan: skor field tetap menjumlahkan per-sumur, jadi "
+                 "lapangan padat tier rendah masih bisa bersaing; ini mode latihan untuk membandingkan.")
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
