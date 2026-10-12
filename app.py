@@ -4345,19 +4345,6 @@ with tab_map:
         miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. **★ = sumur seed** (anchor pertama tiap rute unit). Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
 
-        # ── 🔧 Tes tooltip (diagnostik) ─────────────────────────────────────────
-        # Peta mini 3 titik dengan tooltip paling sederhana. Kalau DI SINI pun tooltip tak muncul,
-        # masalahnya di browser/versi (hard refresh Ctrl+Shift+R, coba browser lain), bukan di data
-        # peta utama. Kalau di sini MUNCUL tapi di peta atas tidak, masalahnya spesifik ke data/layer.
-        with st.expander("🔧 Tes tooltip (arahkan kursor ke titik)", expanded=False):
-            _td = pd.DataFrame({"lon": [101.30, 101.40, 101.50], "lat": [1.50, 1.55, 1.60],
-                                "nama": ["Tes A", "Tes B", "Tes C"], "info": ["satu", "dua", "tiga"]})
-            _tl = pdk.Layer("ScatterplotLayer", data=_td, get_position=["lon", "lat"],
-                            get_fill_color=[230, 80, 60], get_radius=4000, pickable=True)
-            st.pydeck_chart(pdk.Deck(layers=[_tl],
-                initial_view_state=pdk.ViewState(latitude=1.55, longitude=101.40, zoom=9),
-                map_style="road", tooltip={"text": "{nama}: {info}"}))
-            st.caption("Harusnya muncul teks seperti `Tes A: satu` saat kursor di atas titik merah.")
         if _DRAW_ROAD and _seg_flat:
             if _GEOM_FAIL:
                 st.warning(f"🛣️ {_seg_flat} dari {_seg_road + _seg_flat} segmen rute digambar **garis lurus** "
@@ -4916,6 +4903,144 @@ with tab_cart:
             if _brows:
                 st.warning("Sumur yang digeser demi mendahulukan sumur deadline-keras (periksa kolom Nasib):")
                 st.dataframe(pd.DataFrame(_brows), use_container_width=True, hide_index=True)
+
+    # ── 🔁 Rescue + Re-optimasi: geser sumur kurang urgent (relokasi), demi miss lebih urgent ──
+    # Pure improvement: m hanya menggeser w yang kategori SAMA/LEBIH RENDAH dan KURANG urgent, dan
+    # hanya bila w bisa direlokasi ke slot lain (tak ada miss baru). m & w tetap dalam window & zona.
+    st.divider()
+    ui.section("🔁 Rescue + Re-optimasi", eyebrow="Geser sumur kurang urgent (direlokasi, bukan dibuang) demi sumur miss yang lebih urgent")
+    _rp_cap = st.slider("Batas jarak sumur miss ke rute yang menampungnya (km)", 2, 50, int(_detour_cap), key="repair_cap")
+    st.caption("Untuk tiap sumur miss (urut paling urgent): cari rute unit+hari yang **lewat dekat** dalam window-nya. "
+               "Ada slot kosong → langsung taruh. Penuh → satu sumur **kategori sama/lebih rendah DAN kurang urgent** "
+               "digeser lalu **direlokasi ke hari lain yang masih ada slot**. Hanya digeser bila relokasi berhasil, jadi "
+               "TIDAK ada miss baru, murni perbaikan. Bisa dibatalkan.")
+    rp1, rp2 = st.columns(2)
+    _do_repair = rp1.button("🔁 Jalankan Rescue + Re-optimasi", type="primary", disabled=(not len(missed)), key="btn_repair")
+    _do_rp_cancel = rp2.button("↩️ Batal Re-optimasi", disabled=(not st.session_state.get("repair_wells")), key="btn_repair_cancel")
+
+    if _do_rp_cancel:
+        for _w in st.session_state.get("repair_assign_keys", []):
+            st.session_state.get("manual_assign", {}).pop(_w, None)
+        st.session_state["repair_wells"] = []
+        st.session_state["repair_assign_keys"] = []
+        st.session_state["repair_moves"] = []
+        st.session_state["repair_ran"] = False
+        st.rerun()
+
+    if _do_repair and len(missed):
+        def _rtier(tp, rt, cat):
+            if str(tp) in ("NW", "AWS"): return 0
+            if str(rt).upper() in ("PRQ", "ORQ"): return 0
+            c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+            mm = re.search(r"REGULAR\s*([ABCD])\b", c)
+            if mm: return {"A": 1, "B": 2, "C": 3, "D": 4}[mm.group(1)]
+            if "MANUAL" in c: return 6
+            return 5
+        _act_rem = list(REMOTE_UNITS)[:n_remote]; _act_non = list(NONREMOTE_UNITS)[:n_nonremote]
+        _mem = {}
+        for _, r in scheduled_all.iterrows():
+            k = (r["plan_unit"], int(r["day_idx"]))
+            fu = r.get("forced_unit")
+            _mem.setdefault(k, []).append({
+                "well": r["well"], "lat": r.get("lat"), "lon": r.get("lon"), "mx": r.get("max_date"),
+                "tier": _rtier(r.get("tipe"), r.get("req_tag"), r.get("category")),
+                "forced": (fu is not None and not (isinstance(fu, float) and pd.isna(fu)) and str(fu) != "None"),
+                "manual": bool(r.get("manual", False)), "area": str(r.get("area", "")).upper(),
+                "min": r.get("min_date"), "allow": r.get("allow_units")})
+        def _pts(k):
+            return [(x["lat"], x["lon"]) for x in _mem.get(k, []) if pd.notna(x["lat"])]
+        def _perm(area, allow):
+            pool = _act_rem if area in REMOTE_AREAS else _act_non
+            if allow: pool = [u for u in (_act_rem + _act_non) if u in allow]
+            return pool
+        def _gd(_mn, _mx):
+            return [di + day_offset for di in range(1, horizon + 1)
+                    if (pd.isna(_mn) or days[di - 1] >= _mn) and (pd.isna(_mx) or days[di - 1] <= _mx)]
+        def _reloc(w):
+            best = None
+            for d2 in _gd(w["min"], w["mx"]):
+                for u2 in _perm(w["area"], w["allow"]):
+                    k2 = (u2, d2)
+                    if len(_mem.get(k2, [])) >= max_wells: continue
+                    p = _pts(k2)
+                    if p:
+                        dd = float(road_min_to_pts(w["lat"], w["lon"], p))
+                        if dd > _rp_cap: continue
+                    else:
+                        dd = float(_rp_cap)   # unit-hari kosong: buka trip baru (fallback)
+                    if best is None or dd < best[2]:
+                        best = (u2, d2, dd)
+            return best
+        _assign = dict(st.session_state.get("manual_assign", {}))
+        _moves, _rescued = [], []
+        _ms = missed[missed["has_coord"].fillna(False) & missed["lat"].notna()].copy()
+        _ms["_tier"] = [_rtier(t, r, c) for t, r, c in zip(
+            _ms["tipe"] if "tipe" in _ms else pd.Series("", index=_ms.index),
+            _ms["req_tag"] if "req_tag" in _ms else pd.Series("", index=_ms.index),
+            _ms["category"] if "category" in _ms else pd.Series("", index=_ms.index))]
+        for _, m in _ms.sort_values(["_tier", "max_date"]).iterrows():
+            mw = m["well"]; m_tier = int(m["_tier"]); m_mx = m.get("max_date")
+            pool = _perm(str(m.get("area", "")).upper(), m.get("allow_units"))
+            best = None   # (need_bump, dist, u, d, w, reloc)
+            for d in _gd(m.get("min_date"), m_mx):
+                for u in pool:
+                    k = (u, d)
+                    p = _pts(k)
+                    if not p: continue
+                    dm = float(road_min_to_pts(m["lat"], m["lon"], p))
+                    if dm > _rp_cap: continue
+                    if max_wells - len(_mem.get(k, [])) >= 1:
+                        cand = (0, dm, u, d, None, None)
+                    else:
+                        _bc = [x for x in _mem[k] if x["tier"] >= m_tier and pd.notna(x["mx"]) and pd.notna(m_mx)
+                               and pd.Timestamp(x["mx"]) > pd.Timestamp(m_mx) and not x["forced"] and not x["manual"]]
+                        _bc.sort(key=lambda x: pd.Timestamp(x["mx"]), reverse=True)
+                        _ch = _rc = None
+                        for w in _bc:
+                            _r = _reloc(w)
+                            if _r is not None:
+                                _ch, _rc = w, _r; break
+                        if _ch is None: continue
+                        cand = (1, dm, u, d, _ch, _rc)
+                    if best is None or cand[:2] < best[:2]:
+                        best = cand
+            if best is None: continue
+            _, _dm, bu, bd, bw, brc = best
+            if bw is not None:
+                ru, rd, _ = brc
+                _mem[(bu, bd)] = [x for x in _mem[(bu, bd)] if x["well"] != bw["well"]]
+                _mem.setdefault((ru, rd), []).append(dict(bw))
+                _assign[bw["well"]] = {"unit": ru, "day_idx": rd}
+                _moves.append((bw["well"], f"{bu}·H{bd}", f"{ru}·H{rd}"))
+                _rescued.append(bw["well"])
+            _assign[mw] = {"unit": bu, "day_idx": bd}
+            _mem.setdefault((bu, bd), []).append({"well": mw, "lat": m["lat"], "lon": m["lon"],
+                "mx": m_mx, "tier": m_tier, "forced": False, "manual": True,
+                "area": str(m.get("area", "")).upper(), "min": m.get("min_date"), "allow": m.get("allow_units")})
+            _moves.append((mw, "MISS", f"{bu}·H{bd}"))
+            _rescued.append(mw)
+        st.session_state["manual_assign"] = _assign
+        st.session_state["repair_wells"] = _rescued
+        st.session_state["repair_assign_keys"] = _rescued
+        st.session_state["repair_moves"] = _moves
+        st.session_state["repair_ran"] = True
+        st.rerun()
+
+    _rpw = st.session_state.get("repair_wells", [])
+    if not _rpw and st.session_state.get("repair_ran"):
+        st.info("Re-optimasi tak menemukan pergeseran yang murni perbaikan: tiap sumur miss tak punya rute yang lewat "
+                "cukup dekat dalam window-nya, atau slotnya hanya diisi sumur yang sama/lebih urgent atau kategori lebih "
+                "tinggi, atau sumur yang bisa digeser tak punya slot relokasi. Sisa miss ini butuh kapasitas tambahan.")
+    if _rpw:
+        _mv = st.session_state.get("repair_moves", [])
+        _nin = sum(1 for a, b, c in _mv if b == "MISS")
+        _nmv = sum(1 for a, b, c in _mv if b != "MISS")
+        st.success(f"✅ Re-optimasi: **{_nin}** sumur miss masuk · **{_nmv}** sumur kurang urgent digeser harinya "
+                   "(tak ada yang jadi miss baru).")
+        if _mv:
+            _rows = [{"Sumur": a, "Dari": b, "Ke": c, "Jenis": ("Miss → masuk" if b == "MISS" else "Digeser (relokasi)")}
+                     for a, b, c in _mv]
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
 
     st.divider()
     ui.section("Matriks Ketersediaan Kapasitas", eyebrow="Visualisasi load per unit harian")
