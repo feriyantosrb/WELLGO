@@ -837,6 +837,10 @@ def _rk(lat, lon):
 _URG_MODE = "deadline"
 TIER_TIEBREAK = 0.001    # bobot nudge kategori di mode hybrid; sangat kecil agar tak pernah melompati
                          # jenjang skor deadline, jadi deadline tetap dominan dan miss tetap minimal.
+# NW/AWS & REG A yang window-nya overlap periode tapi deadline di luar periode: bila True, jangan
+# ditunda ke periode depan, melainkan diperlakukan seolah jatuh tempo akhir periode agar dijadwalkan
+# periode ini. Di-set dari sidebar. Tidak berlaku di mode urgensi "tier" (sudah prioritas lewat tier).
+_NODEFER_HICAT = True
 
 def _tier_urgency_series(cat, tipe, rtag):
     """Nilai urgensi berbasis tier (makin kecil makin prioritas) supaya memetakan ke skor field
@@ -2216,12 +2220,22 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         pool = elig.loc[pidx].copy()
         # Urgensi dasar berdasarkan kalender asli
         pool["urgency"] = (pool["max_date"] - day).dt.days.fillna(0)
+        if _NODEFER_HICAT and _URG_MODE != "tier":
+            # NW/AWS & REG A yang window-nya buka di periode tapi deadline-nya jatuh SETELAH akhir
+            # periode: jangan ditunda ke periode depan. Perlakukan seolah jatuh tempo akhir periode
+            # supaya urgensinya naik dan ikut berebut slot sekarang (dieksekusi periode ini).
+            _pe = pd.Timestamp(days[-1])
+            _hicat = (pool["tipe"].isin(["NW", "AWS"])
+                      | pool["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False))
+            _nd = _hicat & pool["max_date"].notna() & (pool["max_date"] > _pe)
+            if _nd.any():
+                pool.loc[_nd, "urgency"] = float((_pe - day).days)
         if _URG_MODE == "tier":
             # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
             pool["urgency"] = _tier_urgency_series(
                 pool["category"], pool.get("tipe", pd.Series("", index=pool.index)),
                 pool.get("req_tag", pd.Series("", index=pool.index)))
-        
+
         mid = bypass_reg.loc[pidx]
         nw = is_nwaws.loc[pidx]
 
@@ -2716,6 +2730,15 @@ with st.sidebar:
         _URG_MODE = {"H-deadline (default)": "deadline",
                      "Hybrid (deadline + tiebreak kategori)": "hybrid",
                      "Tier penuh (eksperimen)": "tier"}[_urg_mode_lbl]
+
+        _NODEFER_HICAT = st.checkbox(
+            "NW/AWS & REG A: jadwalkan periode ini (jangan ditunda walau deadline lewat periode)", value=True,
+            help="Sumur NW/AWS dan Regular A yang window-nya sudah buka di periode ini TAPI deadline-nya "
+                 "jatuh setelah akhir periode: diperlakukan seolah jatuh tempo akhir periode supaya ikut "
+                 "berebut slot dan dieksekusi sekarang, bukan ditunda ke periode depan. Tidak membuatnya "
+                 "mengalahkan sumur yang deadline-nya memang lebih cepat; hanya menaikkan dari 'diabaikan' "
+                 "jadi 'bersaing'. Konsekuensinya sebagian sumur tier rendah bisa tergeser bila kapasitas "
+                 "ketat. Tidak berlaku di mode urgensi Tier penuh.")
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
