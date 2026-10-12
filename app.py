@@ -829,11 +829,14 @@ def _osrm_ctx():
 def _rk(lat, lon):
     return (round(float(lat), 5), round(float(lon), 5))
 
-# Basis urgensi penjadwalan. Default False = urgensi dari H-deadline (max_date - hari). Bila True,
-# urgensi diganti dengan TIER KATEGORI: NW/AWS & PRQ/ORQ paling prioritas, lalu REG A, B, C, D,
-# lalu RTN/lainnya. Deadline diabaikan untuk urutan prioritas (tetap dipakai untuk kelayakan window).
-# Di-set dari sidebar. Hanya mengubah PRIORITAS, bukan kelayakan.
-_URG_BY_TIER = False
+# Basis urgensi penjadwalan, di-set dari sidebar. Hanya mengubah PRIORITAS, bukan kelayakan window.
+#   "deadline" (default) : urgensi dari H-deadline (max_date - hari). Sumur paling dekat deadline duluan.
+#   "tier"               : urgensi = TIER kategori (NW/AWS>A>B>C>D>RTN), deadline diabaikan utk urutan.
+#   "hybrid"             : urgensi tetap H-deadline (penentu utama), kategori hanya PEMECAH SERI saat
+#                          deadline mirip (nudge kecil) + jadi kunci kedua pemilihan seed.
+_URG_MODE = "deadline"
+TIER_TIEBREAK = 0.001    # bobot nudge kategori di mode hybrid; sangat kecil agar tak pernah melompati
+                         # jenjang skor deadline, jadi deadline tetap dominan dan miss tetap minimal.
 
 def _tier_urgency_series(cat, tipe, rtag):
     """Nilai urgensi berbasis tier (makin kecil makin prioritas) supaya memetakan ke skor field
@@ -1514,6 +1517,19 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                  else np.zeros(len(df), dtype=bool))
     prqorq_arr = (df["req_tag"].isin(["PRQ", "ORQ"]).values if "req_tag" in df.columns
                   else np.zeros(len(df), dtype=bool))
+    # Tier kategori per sumur (0=paling prioritas) utk mode hybrid: pemecah seri skor field &
+    # kunci kedua pemilihan seed. NW/AWS & PRQ/ORQ=0, REG A=1, B=2, C=3, D=4, RTN/lainnya=5.
+    def _row_tier(tp, rt, cat):
+        if str(tp) in ("NW", "AWS") or str(rt).upper() in ("PRQ", "ORQ"):
+            return 0
+        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+        mt = re.search(r"REGULAR\s*([ABCD])\b", c)
+        return {"A": 1, "B": 2, "C": 3, "D": 4}[mt.group(1)] if mt else 5
+    if "category" in df.columns:
+        _rtg0 = df["req_tag"] if "req_tag" in df.columns else pd.Series("", index=df.index)
+        tier_arr = np.array([_row_tier(t, r, c) for t, r, c in zip(df["tipe"], _rtg0, df["category"])], dtype=int)
+    else:
+        tier_arr = np.full(len(df), 5, dtype=int)
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1641,7 +1657,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             score = 0
             for w in f_wells:
                 u = urg_arr[w]
-                if (not _URG_BY_TIER) and nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
+                if (_URG_MODE != "tier") and nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
                 elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
                 elif u == 0: score += 50000
@@ -1650,6 +1666,10 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 elif u <= 4: score += 1000
                 elif u <= 7: score += 100
                 else: score += 10
+                if _URG_MODE == "hybrid":
+                    # Pemecah seri kategori: nudge amat kecil (tak melompati jenjang deadline),
+                    # jadi di antara field berskor-deadline mirip, kategori lebih tinggi menang.
+                    score += (5 - int(tier_arr[w])) * TIER_TIEBREAK
             field_scores[fld] = score
 
         if not field_scores: break
@@ -1660,7 +1680,11 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             if target_fld in _thin_fields: continue
             f_wells = [w for w in unassigned if field_arr[w] == target_fld and not has_fu[w]]
             if not f_wells: continue
-            f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], dur_arr[x]))
+            if _URG_MODE in ("hybrid", "tier"):
+                # Seed = paling urgent (deadline), lalu kategori tertinggi, lalu durasi terpendek.
+                f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], int(tier_arr[x]), dur_arr[x]))
+            else:
+                f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], dur_arr[x]))
             seed = f_wells_sorted[0]
             zone = "remote" if area_arr[seed] in REMOTE_AREAS else "nonremote"
 
@@ -2192,7 +2216,7 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         pool = elig.loc[pidx].copy()
         # Urgensi dasar berdasarkan kalender asli
         pool["urgency"] = (pool["max_date"] - day).dt.days.fillna(0)
-        if _URG_BY_TIER:
+        if _URG_MODE == "tier":
             # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
             pool["urgency"] = _tier_urgency_series(
                 pool["category"], pool.get("tipe", pd.Series("", index=pool.index)),
@@ -2210,7 +2234,7 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         # Efek: PRQ akan dapat skor lapangan 10.000, KALAH dari reguler H-0 yang dapat 50.000.
         # Tapi saat di hari tersebut tidak ada H-0 (hari longgar), PRQ akan langsung dieksekusi.
         is_prq_orq = mid
-        if not _URG_BY_TIER:
+        if _URG_MODE != "tier":
             pool.loc[is_prq_orq & (pool["urgency"] <= 0), "urgency"] = 1
         # ──────────────────────────────────────────────────────────
 
@@ -2680,13 +2704,18 @@ with st.sidebar:
                  "yang tak terjadwal di Lapis 1 tetap dicoba lagi di Lapis 2, jadi tak ada yang hilang. "
                  "0 = matikan (perilaku lama).")
 
-        _URG_BY_TIER = st.checkbox(
-            "Urgensi berbasis TIER kategori (eksperimen) — NW/AWS > A > B > C > D > RTN", value=False,
-            help="MATI (default): urgensi dari H-deadline (sumur paling dekat deadline didahulukan). "
-                 "NYALA: urgensi ditentukan kategori, bukan deadline — NW/AWS & PRQ/ORQ paling prioritas, "
-                 "lalu REG A, B, C, D, lalu RTN. Deadline tetap dipakai untuk kelayakan window, hanya "
-                 "URUTAN prioritas yang berubah. Catatan: skor field tetap menjumlahkan per-sumur, jadi "
-                 "lapangan padat tier rendah masih bisa bersaing; ini mode latihan untuk membandingkan.")
+        _urg_mode_lbl = st.radio(
+            "Basis urgensi penjadwalan",
+            ["H-deadline (default)", "Hybrid (deadline + tiebreak kategori)", "Tier penuh (eksperimen)"],
+            index=0,
+            help="• H-deadline: sumur paling dekat deadline didahulukan (paling patuh deadline, miss paling "
+                 "sedikit). • Hybrid: deadline tetap penentu utama, kategori hanya pemecah seri saat deadline "
+                 "mirip (NW/AWS>A>B>C>D), jadi miss tetap minim tapi kategori tinggi diutamakan di antara yang "
+                 "setara. • Tier penuh: urgensi murni kategori, abaikan deadline (miss bisa meledak, hanya untuk "
+                 "latihan). Ketiganya tetap menghormati kelayakan window, zona, dan mapping unit.")
+        _URG_MODE = {"H-deadline (default)": "deadline",
+                     "Hybrid (deadline + tiebreak kategori)": "hybrid",
+                     "Tier penuh (eksperimen)": "tier"}[_urg_mode_lbl]
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
