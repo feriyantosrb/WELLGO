@@ -3887,9 +3887,17 @@ with tab_candidates:
         rt = str(r.get("req_tag", "")).upper()
         return rt if rt in ("PRQ", "ORQ") else "RTN"
 
+    def _tier_lbl(r):
+        # Tier prioritas kategori: NW/AWS, lalu REG A/B/C/D; selain itu "-".
+        if str(r.get("tipe", "")) in ("NW", "AWS"): return "NW/AWS"
+        c = " ".join(str(r.get("category", "")).upper().replace("-", " ").replace("_", " ").split())
+        m = re.search(r"REGULAR\s*([ABCD])\b", c)
+        return m.group(1) if m else "-"
+
     cd = raw.copy()
     cd["Status Periode"] = cd.apply(_cand_status, axis=1)
     cd["Kategori"] = cd.apply(_kat_lbl, axis=1)
+    cd["Tier"] = cd.apply(_tier_lbl, axis=1)
     cd["Overlap Window"] = np.where((cd["min_date"] <= batch_hi) & (cd["max_date"] >= batch_lo), "✓", "—")
 
     if unit_map:
@@ -3934,7 +3942,7 @@ with tab_candidates:
     if pick_stat != "Semua": view = view[view["Status Periode"] == pick_stat]
     if pick_fld != "Semua": view = view[view["field"].astype(str) == pick_fld]
 
-    show = view[["well", "field", "area", "subarea", "Kategori", "min_date", "max_date", "Overlap Window", "Status Periode"]].rename(
+    show = view[["well", "field", "area", "subarea", "Kategori", "Tier", "min_date", "max_date", "Overlap Window", "Status Periode"]].rename(
         columns={"well": "Well", "field": "Field", "area": "Area", "subarea": "Sub-area",
                  "min_date": "Min Date", "max_date": "Max Date (deadline)"}).copy()
     if unit_map:
