@@ -841,6 +841,8 @@ TIER_TIEBREAK = 0.001    # bobot nudge kategori di mode hybrid; sangat kecil aga
 # ditunda ke periode depan, melainkan diperlakukan seolah jatuh tempo akhir periode agar dijadwalkan
 # periode ini. Di-set dari sidebar. Tidak berlaku di mode urgensi "tier" (sudah prioritas lewat tier).
 _NODEFER_HICAT = True
+_NODEFER_H0 = False      # True = perlakukan sebagai H-0 (urgensi 0) sejak hari pertama (agresif);
+                         # False = perlakukan jatuh tempo akhir periode (sedang).
 
 def _tier_urgency_series(cat, tipe, rtag):
     """Nilai urgensi berbasis tier (makin kecil makin prioritas) supaya memetakan ke skor field
@@ -2229,7 +2231,7 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
                       | pool["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False))
             _nd = _hicat & pool["max_date"].notna() & (pool["max_date"] > _pe)
             if _nd.any():
-                pool.loc[_nd, "urgency"] = float((_pe - day).days)
+                pool.loc[_nd, "urgency"] = 0.0 if _NODEFER_H0 else float((_pe - day).days)
         if _URG_MODE == "tier":
             # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
             pool["urgency"] = _tier_urgency_series(
@@ -2731,14 +2733,18 @@ with st.sidebar:
                      "Hybrid (deadline + tiebreak kategori)": "hybrid",
                      "Tier penuh (eksperimen)": "tier"}[_urg_mode_lbl]
 
-        _NODEFER_HICAT = st.checkbox(
-            "NW/AWS & REG A: jadwalkan periode ini (jangan ditunda walau deadline lewat periode)", value=True,
-            help="Sumur NW/AWS dan Regular A yang window-nya sudah buka di periode ini TAPI deadline-nya "
-                 "jatuh setelah akhir periode: diperlakukan seolah jatuh tempo akhir periode supaya ikut "
-                 "berebut slot dan dieksekusi sekarang, bukan ditunda ke periode depan. Tidak membuatnya "
-                 "mengalahkan sumur yang deadline-nya memang lebih cepat; hanya menaikkan dari 'diabaikan' "
-                 "jadi 'bersaing'. Konsekuensinya sebagian sumur tier rendah bisa tergeser bila kapasitas "
-                 "ketat. Tidak berlaku di mode urgensi Tier penuh.")
+        _nodefer_lbl = st.radio(
+            "NW/AWS & REG A (window buka, deadline lewat periode)",
+            ["Mati (biarkan ditunda)", "Sedang (jatuh tempo akhir periode)", "Kuat (H-0 sejak hari pertama)"],
+            index=1,
+            help="Untuk sumur NW/AWS & Regular A yang window-nya sudah buka di periode ini tapi deadline-nya "
+                 "jatuh setelah akhir periode. • Mati: biarkan ditunda ke periode depan. • Sedang: perlakukan "
+                 "seolah jatuh tempo akhir periode (bersaing wajar, tidak mengalahkan yang deadline-nya lebih "
+                 "cepat). • Kuat: perlakukan seperti H-0 sejak hari pertama (prioritas paling tinggi, akan "
+                 "menggeser sumur tier rendah yang deadline-nya lebih lambat bila kapasitas ketat). Tidak "
+                 "berlaku di mode urgensi Tier penuh.")
+        _NODEFER_HICAT = not _nodefer_lbl.startswith("Mati")
+        _NODEFER_H0 = _nodefer_lbl.startswith("Kuat")
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
