@@ -4344,6 +4344,20 @@ with tab_map:
         st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view, map_style="road", tooltip={"text": tip}))
         miss_note = "  📌 Miss Deadline = pin ring merah + label nama, tipe, & window." if (show_miss and len(miss_map)) else ""
         st.caption(f"💡 {legend}. Ring Merah=NW, Oranye=AWS. **★ = sumur seed** (anchor pertama tiap rute unit). Garis biru menghubungkan sequence rute TSP antar sumur.{miss_note}")
+
+        # ── 🔧 Tes tooltip (diagnostik) ─────────────────────────────────────────
+        # Peta mini 3 titik dengan tooltip paling sederhana. Kalau DI SINI pun tooltip tak muncul,
+        # masalahnya di browser/versi (hard refresh Ctrl+Shift+R, coba browser lain), bukan di data
+        # peta utama. Kalau di sini MUNCUL tapi di peta atas tidak, masalahnya spesifik ke data/layer.
+        with st.expander("🔧 Tes tooltip (arahkan kursor ke titik)", expanded=False):
+            _td = pd.DataFrame({"lon": [101.30, 101.40, 101.50], "lat": [1.50, 1.55, 1.60],
+                                "nama": ["Tes A", "Tes B", "Tes C"], "info": ["satu", "dua", "tiga"]})
+            _tl = pdk.Layer("ScatterplotLayer", data=_td, get_position=["lon", "lat"],
+                            get_fill_color=[230, 80, 60], get_radius=4000, pickable=True)
+            st.pydeck_chart(pdk.Deck(layers=[_tl],
+                initial_view_state=pdk.ViewState(latitude=1.55, longitude=101.40, zoom=9),
+                map_style="road", tooltip={"text": "{nama}: {info}"}))
+            st.caption("Harusnya muncul teks seperti `Tes A: satu` saat kursor di atas titik merah.")
         if _DRAW_ROAD and _seg_flat:
             if _GEOM_FAIL:
                 st.warning(f"🛣️ {_seg_flat} dari {_seg_road + _seg_flat} segmen rute digambar **garis lurus** "
