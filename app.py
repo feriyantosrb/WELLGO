@@ -2223,15 +2223,29 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         # Urgensi dasar berdasarkan kalender asli
         pool["urgency"] = (pool["max_date"] - day).dt.days.fillna(0)
         if _NODEFER_HICAT and _URG_MODE != "tier":
-            # NW/AWS & REG A yang window-nya buka di periode tapi deadline-nya jatuh SETELAH akhir
-            # periode: jangan ditunda ke periode depan. Perlakukan seolah jatuh tempo akhir periode
-            # supaya urgensinya naik dan ikut berebut slot sekarang (dieksekusi periode ini).
+            # Sumur yang window-nya buka di periode tapi deadline-nya jatuh SETELAH akhir periode:
+            # jangan ditunda ke periode depan. _pe = akhir periode.
             _pe = pd.Timestamp(days[-1])
-            _hicat = (pool["tipe"].isin(["NW", "AWS"])
-                      | pool["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False))
-            _nd = _hicat & pool["max_date"].notna() & (pool["max_date"] > _pe)
-            if _nd.any():
-                pool.loc[_nd, "urgency"] = 0.0 if _NODEFER_H0 else float((_pe - day).days)
+            _late = pool["max_date"].notna() & (pool["max_date"] > _pe)
+            if _NODEFER_H0:
+                # KUAT: semua NW/AWS & REG A → H-0 (urgensi 0) sejak hari pertama.
+                _hicat = (pool["tipe"].isin(["NW", "AWS"])
+                          | pool["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False))
+                pool.loc[_hicat & _late, "urgency"] = 0.0
+            else:
+                # SEDANG (per sub-kategori + BOPD):
+                #   AWS1, NW1              → H-0 (urgensi 0).
+                #   AWS2, NW2, NW3 BOPD>=100 → jatuh tempo akhir periode (tak boleh ditunda).
+                #   selain itu (BOPD<100/kosong, generik, REG A) → biarkan perilaku normal (boleh ditunda).
+                _cu = pool["category"].astype(str).str.upper()
+                _nwn = _cu.str.extract(r"NEW WELL\s*([123])")[0]
+                _awn = _cu.str.extract(r"AWS\s*([12])")[0]
+                _bopd = (pd.to_numeric(pool["bopd"], errors="coerce") if "bopd" in pool.columns
+                         else pd.Series(np.nan, index=pool.index))
+                _h0 = (_awn == "1") | (_nwn == "1")
+                _nd = ((_awn == "2") | _nwn.isin(["2", "3"])) & (_bopd >= 100)
+                pool.loc[_h0 & _late, "urgency"] = 0.0
+                pool.loc[_nd & _late, "urgency"] = float((_pe - day).days)
         if _URG_MODE == "tier":
             # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
             pool["urgency"] = _tier_urgency_series(
@@ -2737,12 +2751,13 @@ with st.sidebar:
             "NW/AWS & REG A (window buka, deadline lewat periode)",
             ["Mati (biarkan ditunda)", "Sedang (jatuh tempo akhir periode)", "Kuat (H-0 sejak hari pertama)"],
             index=1,
-            help="Untuk sumur NW/AWS & Regular A yang window-nya sudah buka di periode ini tapi deadline-nya "
-                 "jatuh setelah akhir periode. • Mati: biarkan ditunda ke periode depan. • Sedang: perlakukan "
-                 "seolah jatuh tempo akhir periode (bersaing wajar, tidak mengalahkan yang deadline-nya lebih "
-                 "cepat). • Kuat: perlakukan seperti H-0 sejak hari pertama (prioritas paling tinggi, akan "
-                 "menggeser sumur tier rendah yang deadline-nya lebih lambat bila kapasitas ketat). Tidak "
-                 "berlaku di mode urgensi Tier penuh.")
+            help="Untuk sumur yang window-nya sudah buka tapi deadline-nya jatuh setelah akhir periode. "
+                 "• Mati: biarkan ditunda ke periode depan. "
+                 "• Sedang (per sub-kategori + BOPD): AWS1 & NW1 diperlakukan H-0; AWS2, NW2, NW3 hanya bila "
+                 "BOPD ≥ 100 diperlakukan jatuh tempo akhir periode (tak boleh ditunda); selain itu "
+                 "(BOPD < 100 atau kosong, REG A, generik) dibiarkan boleh ditunda. "
+                 "• Kuat: SEMUA NW/AWS & REG A diperlakukan H-0 sejak hari pertama (paling agresif, menggeser "
+                 "tier rendah bila kapasitas ketat). Tidak berlaku di mode urgensi Tier penuh.")
         _NODEFER_HICAT = not _nodefer_lbl.startswith("Mati")
         _NODEFER_H0 = _nodefer_lbl.startswith("Kuat")
 
@@ -2869,6 +2884,10 @@ _ckpt(f"resolve_coords (body, raw={len(raw)})")
 # master spasial di sana, dan pemetaan ini dikunci per (SUB_AREA, FIELD).
 unit_map = load_unit_map(up.getvalue()) if use_unitmap else {}
 raw["allow_units"] = unit_map_allow(raw, unit_map) if unit_map else None
+# Laju minyak (BOPD) per sumur dari kolom yang terdeteksi (BOPD/NET OIL/OIL RATE/OIL). Dipakai
+# aturan anti-tunda Sedang (AWS2/NW2/NW3 hanya bila BOPD>=100) & ditampilkan di tabel miss.
+_oilc_main = find_oil_col(raw)
+raw["bopd"] = pd.to_numeric(raw[_oilc_main], errors="coerce") if _oilc_main else np.nan
 unitmap_unknown = sorted({u for us in unit_map.values() for u in us} - set(ALL_UNITS))
 if use_unitmap and not unit_map:
     st.sidebar.error(f"⚠️ Sheet **{SHEET_MAPUNIT}** tak terbaca (butuh kolom FIELD & UNIT). "
@@ -4611,6 +4630,7 @@ with tab_cart:
                 _pos = _posisi_jadwal(_w, _best[1])
             _near_rows.append({
                 "Well": _w["well"], "Kategori": _fv(_w.get("category")),
+                "BOPD": round(float(_w["bopd"]), 1) if pd.notna(_w.get("bopd")) else "-",
                 "Deadline": pd.to_datetime(_w.get("max_date")).strftime("%Y-%m-%d") if pd.notna(_w.get("max_date")) else "-",
                 "Urgensi (H-)": int(_w["urgency"]) if pd.notna(_w.get("urgency")) else "-",
                 "Unit Terdekat": _u, "Hari": _di, "Posisi": _pos, "Jarak (km)": _dist, "Status": _stat})
