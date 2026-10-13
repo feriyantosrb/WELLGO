@@ -4694,6 +4694,83 @@ with tab_cart:
                                file_name="miss_deadline_unit_terdekat.xlsx", key="dl_miss_near",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # ── 🔀 Mapping unit untuk pengalihan: unit berhak + nganggur per sumur miss ──
+        with st.expander(f"🔀 Mapping unit untuk pengalihan ({len(missed)} sumur miss)", expanded=False):
+            _busy = {}
+            _rtp_m = {}
+            for _, _r in scheduled_all.iterrows():
+                _k = (_r["plan_unit"], int(_r["day_idx"]))
+                _busy[_k] = _busy.get(_k, 0) + 1
+                if bool(_r.get("has_coord", True)) and pd.notna(_r.get("lat")):
+                    _rtp_m.setdefault(_k, []).append((float(_r["lat"]), float(_r["lon"])))
+            _act_rem_m = list(REMOTE_UNITS)[:n_remote]; _act_non_m = list(NONREMOTE_UNITS)[:n_nonremote]
+            _map_rows = []
+            for _, _w in missed.sort_values(["urgency", "max_date"]).iterrows():
+                _area = str(_w.get("area", "")).upper()
+                _allow = _w.get("allow_units")
+                if _allow:
+                    _elig = [u for u in (_act_rem_m + _act_non_m) if u in _allow]; _src = "mapping"
+                else:
+                    _elig = _act_rem_m if _area in REMOTE_AREAS else _act_non_m; _src = "zona"
+                _fu = _w.get("forced_unit")
+                _locked = (_fu if (_fu is not None and not (isinstance(_fu, float) and pd.isna(_fu))
+                                   and str(_fu) != "None") else None)
+                _cd = _cand_days_tol(_w)
+                _idle = []
+                for _u in _elig:
+                    _dd = [str(_di) for _di in _cd if _busy.get((_u, _di), 0) == 0]
+                    if _dd: _idle.append(f"{_u} (H{','.join(_dd)})")
+                _near = None
+                if bool(_w.get("has_coord", True)) and pd.notna(_w.get("lat")):
+                    for _di in _cd:
+                        for _u in _elig:
+                            _pts = _rtp_m.get((_u, _di))
+                            if not _pts: continue
+                            _dd2 = road_min_to_pts(_w["lat"], _w["lon"], _pts)
+                            if _near is None or _dd2 < _near[2]: _near = (_u, _di, _dd2)
+                _map_rows.append({
+                    "Well": _w["well"], "Kategori": _fv(_w.get("category")),
+                    "BOPD": round(float(_w["bopd"]), 1) if pd.notna(_w.get("bopd")) else "-",
+                    "Urgensi (H-)": int(_w["urgency"]) if pd.notna(_w.get("urgency")) else "-",
+                    "Sumber": _src, "Unit Berhak": ", ".join(_elig) if _elig else "-",
+                    "Terkunci (forced)": _locked or "-",
+                    "Unit Nganggur (bisa dialihkan)": "; ".join(_idle) if _idle else "— (semua sibuk)",
+                    "Rute terdekat": (f"{_near[0]}·H{_near[1]} ({round(_near[2], 1)} km)" if _near else "-")})
+            _map_df = pd.DataFrame(_map_rows)
+            st.caption("Untuk tiap sumur miss: unit yang **berhak** (dari Mapping_Unit bila ada, selain itu zona), "
+                       "unit **nganggur** di hari window-nya (kandidat dialihkan tanpa menggusur siapa pun), dan rute "
+                       "existing terdekat. **Terkunci** = forced_unit (GP/fasilitas), tak bisa dialihkan.")
+            st.dataframe(_map_df, use_container_width=True, hide_index=True)
+            _buf_map = BytesIO()
+            with pd.ExcelWriter(_buf_map, engine="openpyxl") as _wm:
+                xl_sheet(_wm, _map_df, "Mapping-Pengalihan", "MapPengalihan")
+            st.download_button("⬇️ Unduh mapping pengalihan (.xlsx)", _buf_map.getvalue(),
+                               file_name="mapping_pengalihan_unit.xlsx", key="dl_map_divert",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # ── 📊 Beban unit per hari + unit nganggur (lihat kapasitas longgar) ──────────
+        with st.expander("📊 Beban unit per hari & unit nganggur", expanded=False):
+            _busy2 = {}
+            for _, _r in scheduled_all.iterrows():
+                _k = (_r["plan_unit"], int(_r["day_idx"]))
+                _busy2[_k] = _busy2.get(_k, 0) + 1
+            _act_all = list(REMOTE_UNITS)[:n_remote] + list(NONREMOTE_UNITS)[:n_nonremote]
+            _load_rows, _idle_rem, _idle_non = [], 0, 0
+            for _di in range(1, horizon + 1):
+                _dg = _di + day_offset
+                _row = {"Hari": f"H{_dg} · {days[_di - 1].strftime('%d %b')}"}
+                for _u in _act_all:
+                    _c = _busy2.get((_u, _dg), 0)
+                    _row[_u] = f"{_c}/{max_wells}" if _c else "–"
+                    if _c == 0:
+                        if _u in REMOTE_UNITS: _idle_rem += 1
+                        else: _idle_non += 1
+                _load_rows.append(_row)
+            _load_df = pd.DataFrame(_load_rows)
+            st.caption(f"Isi tiap unit per hari (– = nganggur, bisa dialihkan). Total unit-hari nganggur dalam periode: "
+                       f"**Remote {_idle_rem}**, **Non-Remote {_idle_non}**. Non-Remote tak boleh menggarap area Remote.")
+            st.dataframe(_load_df, use_container_width=True, hide_index=True)
+
         # ── 🔎 Diagnosis: KENAPA tiap sumur miss (read-only, tak mengubah rute) ───────
         # Untuk tiap sumur miss: hari eligible-nya, berapa slot unit kosong di hari-hari itu,
         # unit-hari kosong TERDEKAT + jaraknya (0 km = unit benar-benar kosong, bisa buka rute
