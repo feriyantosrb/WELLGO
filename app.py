@@ -5884,7 +5884,28 @@ with tab_compare:
                 
                 man_valid = man_df[man_df["LAT"].notna() & man_df["LON"].notna()].copy()
                 _man_nocoord = sorted(set(man_df["WELL"]) - set(man_valid["WELL"]))
-                
+
+                # Jarak jalan nyata utk sisi Manual: cache jalan hanya dimuat untuk koordinat
+                # kandidat periode ini, jadi pasangan sumur history yang bukan kandidat tadinya
+                # jatuh ke haversine×detour. Di sini muat jarak jalan untuk koordinat history yang
+                # dibandingkan lalu gabungkan ke _ROAD_KM, supaya route_distance sisi Manual ikut
+                # jalan nyata. Dijalankan sekali per set koordinat (dijaga sig di session_state).
+                if _USE_ROAD and len(man_valid):
+                    _mcoords = [(float(la), float(lo)) for la, lo in zip(man_valid["LAT"], man_valid["LON"])
+                                if pd.notna(la) and pd.notna(lo)]
+                    if _mcoords:
+                        _msig = hash(frozenset(_rk(la, lo) for la, lo in _mcoords))
+                        if st.session_state.get("_cmp_road_sig") != _msig:
+                            try:
+                                _extra = load_road_dist(need=_mcoords)
+                                _added = {k: v for k, v in _extra.items() if k not in _ROAD_KM}
+                                if _added:
+                                    _ROAD_KM.update(_added)
+                                    _route_cache_store().clear()   # buang hasil TSP lama (mgkn haversine)
+                            except Exception:
+                                pass
+                            st.session_state["_cmp_road_sig"] = _msig
+
                 # 2. Kalkulasi Jarak Manual
                 manual_km = 0.0
                 for (date, unit), group in man_valid.groupby(["SCHEDULE DATE", "UNIT"]):
