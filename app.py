@@ -1701,7 +1701,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 if (_URG_MODE != "tier") and nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
                 elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
-                elif u == 0: score += 50000
+                elif u == 0: score += 100000
                 elif u == 1: score += 10000
                 elif u == 2: score += 5000
                 elif u <= 4: score += 1000
