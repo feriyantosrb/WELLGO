@@ -269,6 +269,19 @@ def kat_label(cat, tipe="", rtag=""):
     rt = str(rtag).upper().strip()
     return f"{lab} · {rt}" if rt in ("PRQ", "ORQ") else lab
 
+def tier_label(cat):
+    """Label tier kategori: NW1/NW2/NW3, AS1/AS2 (AWS), A/B/C/D (Regular), selain itu '-'.
+    Dipakai seragam di tampilan Jadwal Operasional & ekspor."""
+    c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+    m = re.search(r"NEW WELL\s*([123])", c)
+    if m: return f"NW{m.group(1)}"
+    if "NEW WELL" in c: return "NW"
+    m = re.search(r"AWS\s*([12])", c)
+    if m: return f"AS{m.group(1)}"
+    if "AWS" in c: return "AS"
+    m = re.search(r"REGULAR\s*([ABCD])\b", c)
+    return m.group(1) if m else "-"
+
 def classify_status(stat):
     s = str(stat).strip().upper().replace("-", " ").replace("_", " ")
     s = " ".join(s.split())
@@ -4134,7 +4147,7 @@ with tab_sched:
                         is_gas = st_type == "GP"
                         well_disp = f"{w['well']} <b style='color:#E6B23A;font-size:10px;'>[GAS]</b>" if is_gas else w["well"]
                         
-                        wells_list.append((well_disp, cat, f"{min_d} ➔ {max_d}", f"{dur_val}m"))
+                        wells_list.append((well_disp, cat, f"{tier_label(w.get('category'))} · {min_d} ➔ {max_d}", f"{dur_val}m"))
                     
                     ui.unit_card(unit, subarea, km=dist, minutes=est_min, pct=pct, wells=wells_list)
 
@@ -4167,7 +4180,7 @@ with tab_sched:
                         is_gas = st_type == "GP"
                         well_disp = f"{w['well']} <b style='color:#E6B23A;font-size:10px;'>[GAS]</b>" if is_gas else w["well"]
                         
-                        wells_list.append((well_disp, cat, f"{min_d} ➔ {max_d}", f"{dur_val}m"))
+                        wells_list.append((well_disp, cat, f"{tier_label(w.get('category'))} · {min_d} ➔ {max_d}", f"{dur_val}m"))
                     
                     ui.unit_card(unit, subarea, km=dist, minutes=est_min, pct=pct, wells=wells_list)
             
@@ -5782,7 +5795,7 @@ with tab_export:
     ex1, ex2 = st.columns(2)
     out_w = BytesIO()
     with pd.ExcelWriter(out_w, engine="openpyxl") as w:
-        xl_sheet(w, _jadwal, "Jadwal_Mingguan")
+        xl_sheet(w, _jadwal, "Jadwal_Mingguan", "JadwalMingguan")
         xl_sheet(w, _rute_df, "Rute_Mingguan", "RuteMingguan")
         if len(missed): xl_sheet(w, missed[["well", "unit", "subarea", "category", "dur", "urgency", "max_date"]].rename(columns={"dur": "durasi_test_menit", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
         if len(missed_outside): xl_sheet(w, missed_outside[["well", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
@@ -5800,7 +5813,7 @@ with tab_export:
                     & (_od["max_date"].isna() | (_od["max_date"] >= view_day)))
             _od = _od[_cov]
         with pd.ExcelWriter(out_d, engine="openpyxl") as w:
-            xl_sheet(w, disp[exp_cols].rename(columns=ren).sort_values(["grup", "urgency"]), "Jadwal_Harian")
+            xl_sheet(w, disp[exp_cols].rename(columns=ren).sort_values(["grup", "urgency"]), "Jadwal_Harian", "JadwalHarian")
             xl_sheet(w, unit_summary(disp, speed), "Ringkasan_Unit")
             if len(_od): xl_sheet(w, _od[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFFHarian")
         ex2.download_button(f"⬇️ Unduh Rute Harian {view_day.date()} (.xlsx)", out_d.getvalue(), file_name=f"jadwal_harian_{view_day.date()}.xlsx", mime=XLSX_MIME, type="primary")
