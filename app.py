@@ -5947,8 +5947,101 @@ with tab_compare:
                            + (f" {len(_man_nocoord)} sumur history tanpa koordinat dikecualikan: "
                               + ", ".join(_man_nocoord[:10]) + (" …" if len(_man_nocoord) > 10 else "")
                               if _man_nocoord else ""))
+
+                # ── Ekspor Komparasi (.xlsx) + link Google Maps per rute ────────────
+                with st.expander("⬇️ Ekspor Komparasi (.xlsx) — ringkasan, rute per unit-hari + link peta, per-sumur", expanded=False):
+                    def _cmp_link(_la, _lo):
+                        _la = np.asarray(_la, dtype=float); _lo = np.asarray(_lo, dtype=float)
+                        _m = np.isfinite(_la) & np.isfinite(_lo)
+                        _la, _lo = _la[_m], _lo[_m]
+                        if len(_la) == 0: return ""
+                        _ord, _ = optimize_route(_la, _lo)
+                        _pts = [f"{_la[i]:.6f},{_lo[i]:.6f}" for i in _ord]
+                        if len(_pts) == 1: return f"https://www.google.com/maps/search/?api=1&query={_pts[0]}"
+                        return "https://www.google.com/maps/dir/" + "/".join(_pts)
+
+                    def _cmp_seq(_sub, _wc, _lc, _nc):
+                        _s = _sub.reset_index(drop=True)
+                        _la = pd.to_numeric(_s[_lc], errors="coerce").values
+                        _lo = pd.to_numeric(_s[_nc], errors="coerce").values
+                        _ord, _ = optimize_route(_la, _lo)
+                        return " → ".join(str(_s.loc[i, _wc]) for i in _ord)
+
+                    _rdd = raw.drop_duplicates("well").set_index("well")
+                    def _tier_of(w):
+                        if w not in _rdd.index: return "-"
+                        if str(_rdd.loc[w].get("tipe", "")) in ("NW", "AWS"): return "NW/AWS"
+                        _c = " ".join(str(_rdd.loc[w].get("category", "")).upper().replace("-", " ").replace("_", " ").split())
+                        _mm = re.search(r"REGULAR\s*([ABCD])\b", _c)
+                        return _mm.group(1) if _mm else "-"
+                    def _bopd_of(w):
+                        _v = _rdd.loc[w].get("bopd") if (w in _rdd.index and "bopd" in _rdd.columns) else np.nan
+                        return round(float(_v), 1) if pd.notna(_v) else None
+
+                    _ring = pd.DataFrame([
+                        {"Metrik": "Periode dibandingkan", "Nilai": ", ".join(comp_sel_labels)},
+                        {"Metrik": "Basis jarak", "Nilai": "Jalan nyata (OSRM)" if _USE_ROAD else "Garis lurus (haversine)"},
+                        {"Metrik": "Total KM Manual", "Nilai": round(manual_km, 1)},
+                        {"Metrik": "Total KM WELLGO", "Nilai": round(wellgo_km, 1)},
+                        {"Metrik": "Sumur berkoordinat (Manual)", "Nilai": man_wells},
+                        {"Metrik": "Sumur berkoordinat (WELLGO)", "Nilai": wellgo_wells},
+                        {"Metrik": "KM/well Manual", "Nilai": round(man_km_well, 2)},
+                        {"Metrik": "KM/well WELLGO", "Nilai": round(wg_km_well, 2)},
+                        {"Metrik": "Selisih KM/well (Manual − WELLGO)", "Nilai": round(delta_km_well, 2)},
+                        {"Metrik": "Hemat %", "Nilai": round(pct_save, 1)},
+                        {"Metrik": "Sumur history tanpa koordinat (dikecualikan)", "Nilai": len(_man_nocoord)},
+                    ])
+
+                    _mr = []
+                    for (dt, u), g in man_valid.groupby(["SCHEDULE DATE", "UNIT"]):
+                        _km = route_distance(g["LAT"].values, g["LON"].values)
+                        _mr.append({"Tanggal": pd.to_datetime(dt).strftime("%Y-%m-%d"), "Unit": u, "Sumur": len(g),
+                                    "KM": round(_km, 1), "KM/Well": round(_km / len(g), 2) if len(g) else 0,
+                                    "Urutan Sumur": _cmp_seq(g, "WELL", "LAT", "LON"),
+                                    "Link Google Maps": _cmp_link(g["LAT"].values, g["LON"].values)})
+                    _mr_df = pd.DataFrame(_mr)
+
+                    _wr = []
+                    for (di, dday, u), g in comp_disp.groupby(["day_idx", "plan_day", "plan_unit"]):
+                        c = g[g["has_coord"].fillna(False)]
+                        _km = route_distance(c["lat"].values, c["lon"].values) if len(c) > 1 else 0.0
+                        _wr.append({"Tanggal": pd.to_datetime(dday).strftime("%Y-%m-%d") if pd.notna(dday) else "-",
+                                    "Unit": u, "Sumur": len(g), "KM": round(_km, 1),
+                                    "KM/Well": round(_km / len(c), 2) if len(c) else 0,
+                                    "Urutan Sumur": _cmp_seq(c, "well", "lat", "lon") if len(c) else "",
+                                    "Link Google Maps": _cmp_link(c["lat"].values, c["lon"].values) if len(c) else ""})
+                    _wr_df = pd.DataFrame(_wr)
+
+                    _man_map, _wg_map = {}, {}
+                    for _, r in man_valid.iterrows():
+                        _man_map.setdefault(r["WELL"], []).append(f'{r["UNIT"]}@{pd.to_datetime(r["SCHEDULE DATE"]).strftime("%m/%d")}')
+                    for _, r in comp_disp.iterrows():
+                        _dd = pd.to_datetime(r.get("plan_day")).strftime("%m/%d") if pd.notna(r.get("plan_day")) else "-"
+                        _wg_map.setdefault(r["well"], []).append(f'{r.get("plan_unit")}@{_dd}')
+                    _ps = []
+                    for w in sorted(set(_man_map) | set(_wg_map)):
+                        _inm, _inw = w in _man_map, w in _wg_map
+                        _ps.append({"Well": w, "Tier": _tier_of(w), "BOPD": _bopd_of(w),
+                                    "Manual (unit@tgl)": ", ".join(sorted(set(_man_map.get(w, [])))) or "-",
+                                    "WELLGO (unit@tgl)": ", ".join(sorted(set(_wg_map.get(w, [])))) or "-",
+                                    "Status": "Keduanya" if (_inm and _inw) else ("Hanya Manual" if _inm else "Hanya WELLGO")})
+                    _ps_df = pd.DataFrame(_ps)
+
+                    _buf_cmp = BytesIO()
+                    with pd.ExcelWriter(_buf_cmp, engine="openpyxl") as _wc:
+                        xl_sheet(_wc, _ring, "Ringkasan", "Ringkasan")
+                        xl_sheet(_wc, _mr_df, "Rute Manual", "RuteManual")
+                        xl_sheet(_wc, _wr_df, "Rute WELLGO", "RuteWELLGO")
+                        xl_sheet(_wc, _ps_df, "Per-Sumur", "PerSumur")
+                    _cmp_fn = f"komparasi_{comp_sel_labels[0]}_{comp_sel_labels[-1]}.xlsx" if comp_sel_labels else "komparasi.xlsx"
+                    st.download_button("⬇️ Unduh Komparasi + Link Peta (.xlsx)", _buf_cmp.getvalue(),
+                                       file_name=_cmp_fn.replace("/", "-"), key="dl_compare",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    st.caption("Kolom **Link Google Maps** di sheet Rute Manual & Rute WELLGO bisa diklik/disalin "
+                               "untuk membuka rute tiap unit-hari langsung di Google Maps (urutan = TSP peta).")
+
                 st.markdown("<br>", unsafe_allow_html=True)
-                
+
                 comp_search_q = st.text_input("🔎 Pencarian Cepat Nama Sumur (Peta Komparasi)", placeholder="Contoh: BO083", key="comp_search").strip().upper()
                 comp_search_terms = [t for t in comp_search_q.replace(",", " ").split() if t]
                 
