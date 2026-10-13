@@ -5716,10 +5716,74 @@ with tab_export:
     _off_ren = {"unit": "unit_asli", "dur": "durasi_test_menit", "kat_full": "kategori",
                 "min_date": "earliest", "max_date": "deadline", "status": "status_sumur"}
 
+    # ── Sheet Jadwal_Mingguan (kolom ringkas) & Rute_Mingguan (per unit-hari + link peta) ──
+    def _tipe_lbl(cat):
+        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+        m = re.search(r"NEW WELL\s*([123])", c)
+        if m: return f"NW{m.group(1)}"
+        if "NEW WELL" in c: return "NW"
+        m = re.search(r"AWS\s*([12])", c)
+        if m: return f"AS{m.group(1)}"
+        if "AWS" in c: return "AS"
+        return "RTN"
+
+    def _tier_lbl2(cat, tipe=None):
+        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+        m = re.search(r"NEW WELL\s*([123])", c)
+        if m: return f"NW{m.group(1)}"
+        if "NEW WELL" in c: return "NW"
+        m = re.search(r"AWS\s*([12])", c)
+        if m: return f"AS{m.group(1)}"
+        if "AWS" in c: return "AS"
+        m = re.search(r"REGULAR\s*([ABCD])\b", c)
+        return m.group(1) if m else "-"
+
+    _jm = scheduled_all.sort_values(["day_idx", "plan_unit", "urgency"]) if len(scheduled_all) else scheduled_all
+    _bopd_col = (pd.to_numeric(_jm["bopd"], errors="coerce") if "bopd" in _jm.columns
+                 else pd.Series(np.nan, index=_jm.index))
+    _jadwal = pd.DataFrame({
+        "No": range(1, len(_jm) + 1),
+        "Well": _jm["well"].values if len(_jm) else [],
+        "Unit": _jm["plan_unit"].values if len(_jm) else [],
+        "Sch_Date": (pd.to_datetime(_jm["plan_day"], errors="coerce").dt.strftime("%Y-%m-%d").values if len(_jm) else []),
+        "Tipe": [_tipe_lbl(c) for c in _jm["category"]] if len(_jm) else [],
+        "Durasi Test": pd.to_numeric(_jm["dur"], errors="coerce").values if len(_jm) else [],
+        "Tier": [_tier_lbl2(c, t) for c, t in zip(_jm["category"], _jm["tipe"])] if len(_jm) else [],
+        "BOPD": [round(float(v), 1) if pd.notna(v) else None for v in _bopd_col] if len(_jm) else [],
+        "Timing": _jm["timing"].values if ("timing" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
+        "Early_late": _jm["timing_label"].values if ("timing_label" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
+    })
+
+    _rt_rows = []
+    if len(scheduled_all):
+        for (_di, _dday, _u), _g in scheduled_all.groupby(["day_idx", "plan_day", "plan_unit"]):
+            _c = _g[_g["has_coord"].fillna(False)] if "has_coord" in _g.columns else _g
+            _km = route_distance(_c["lat"].values, _c["lon"].values) if len(_c) > 1 else 0.0
+            if len(_c):
+                _cc = _c.reset_index(drop=True)
+                _la = pd.to_numeric(_cc["lat"], errors="coerce").values
+                _lo = pd.to_numeric(_cc["lon"], errors="coerce").values
+                _ordr, _ = optimize_route(_la, _lo)
+                _pts = [f"{_la[i]:.6f},{_lo[i]:.6f}" for i in _ordr]
+                _seq = " → ".join(str(_cc.loc[i, "well"]) for i in _ordr)
+                _link = ("" if not _pts else
+                         (f"https://www.google.com/maps/search/?api=1&query={_pts[0]}" if len(_pts) == 1
+                          else "https://www.google.com/maps/dir/" + "/".join(_pts)))
+            else:
+                _seq, _link = "", ""
+            _rt_rows.append({"Tanggal": pd.to_datetime(_dday).strftime("%Y-%m-%d") if pd.notna(_dday) else "-",
+                             "Unit": _u, "Sumur": len(_g), "KM": round(_km, 1),
+                             "KM/Well": round(_km / len(_c), 2) if len(_c) else 0,
+                             "Urutan Sumur": _seq, "Link Google Maps": _link})
+    _rute_df = pd.DataFrame(_rt_rows, columns=["Tanggal", "Unit", "Sumur", "KM", "KM/Well", "Urutan Sumur", "Link Google Maps"])
+    if len(_rute_df):
+        _rute_df = _rute_df.sort_values(["Tanggal", "Unit"])
+
     ex1, ex2 = st.columns(2)
     out_w = BytesIO()
     with pd.ExcelWriter(out_w, engine="openpyxl") as w:
-        xl_sheet(w, scheduled_all[exp_cols].rename(columns=ren).sort_values(["hari", "grup", "urgency"]), "Jadwal_Mingguan")
+        xl_sheet(w, _jadwal, "Jadwal_Mingguan")
+        xl_sheet(w, _rute_df, "Rute_Mingguan", "RuteMingguan")
         if len(missed): xl_sheet(w, missed[["well", "unit", "subarea", "category", "dur", "urgency", "max_date"]].rename(columns={"dur": "durasi_test_menit", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
         if len(missed_outside): xl_sheet(w, missed_outside[["well", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
         if len(missed_carry): xl_sheet(w, missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
