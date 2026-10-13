@@ -5864,11 +5864,23 @@ with tab_export:
     _jm = scheduled_all.sort_values(["day_idx", "plan_unit", "urgency"]) if len(scheduled_all) else scheduled_all
     _bopd_col = (pd.to_numeric(_jm["bopd"], errors="coerce") if "bopd" in _jm.columns
                  else pd.Series(np.nan, index=_jm.index))
+    # unit_name asli dari Excel kandidat (fasilitas TS spesifik mis. Bangko_TS_A, atau nama unit MWT)
+    # + klasifikasi kandidat TS/MWT.
+    _una = (_jm["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in _jm.columns
+            else pd.Series("", index=_jm.index))
+    _is_ts_v = (_jm["is_ts"].fillna(False) if "is_ts" in _jm.columns
+                else _una.str.upper().str.contains("TS", na=False))
     _jadwal = pd.DataFrame({
         "No": range(1, len(_jm) + 1),
         "Well": _jm["well"].values if len(_jm) else [],
         "Unit": _jm["plan_unit"].values if len(_jm) else [],
+        "Kandidat": ["TS" if t else "MWT" for t in _is_ts_v.values],
+        "Unit_Name": _una.values,
         "Sch_Date": (pd.to_datetime(_jm["plan_day"], errors="coerce").dt.strftime("%Y-%m-%d").values if len(_jm) else []),
+        "Min_Date": (pd.to_datetime(_jm["min_date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-").values
+                     if ("min_date" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
+        "Max_Date": (pd.to_datetime(_jm["max_date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-").values
+                     if ("max_date" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
         "Tipe": [_tipe_lbl(c) for c in _jm["category"]] if len(_jm) else [],
         "Durasi Test": pd.to_numeric(_jm["dur"], errors="coerce").values if len(_jm) else [],
         "Tier": [_tier_lbl2(c, t) for c, t in zip(_jm["category"], _jm["tipe"])] if len(_jm) else [],
