@@ -857,6 +857,15 @@ _NODEFER_HICAT = True
 _NODEFER_H0 = False      # True = perlakukan sebagai H-0 (urgensi 0) sejak hari pertama (agresif);
                          # False = perlakukan jatuh tempo akhir periode (sedang).
 
+# ── Pull-forward dalam periode ─────────────────────────────────────────────
+# Sumur pull-forward-eligible (default: hanya sumur keras Reg A/NW/AWS/BOPD>=100) boleh diserap
+# _grow ke rute yang sedang terbentuk hari ini walau BELUM urgent, asalkan masih dalam elastic_limit.
+# Murni penyerapan (absorption) ke rute existing: tidak mengubah pemilihan seed, jadi tak bisa membuka
+# rute jauh/monster untuk sumur terisolasi. Efek baru terasa bila elastic_limit > 5 km (di bawah itu
+# semua sumur dekat sudah terserap lewat gerbang d_min<=5). Di-set dari sidebar; tidak berlaku di "tier".
+_PULLFWD = False
+_PULLFWD_HARDONLY = True
+
 def _tier_urgency_series(cat, tipe, rtag):
     """Nilai urgensi berbasis tier (makin kecil makin prioritas) supaya memetakan ke skor field
     yang sudah ada secara berjenjang: NW/AWS & PRQ/ORQ = -1 (→100000), REG A=0 (→50000),
@@ -1549,6 +1558,19 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
         tier_arr = np.array([_row_tier(t, r, c) for t, r, c in zip(df["tipe"], _rtg0, df["category"])], dtype=int)
     else:
         tier_arr = np.full(len(df), 5, dtype=int)
+    # Pull-forward: sumur yang boleh diserap _grow ke rute existing walau belum urgent (dalam
+    # elastic_limit). Default hanya sumur keras; tak mengubah seed, jadi tak membuka rute jauh.
+    if _PULLFWD and _URG_MODE != "tier":
+        if _PULLFWD_HARDONLY:
+            _bopd_pf = (pd.to_numeric(df["bopd"], errors="coerce") if "bopd" in df.columns
+                        else pd.Series(np.nan, index=df.index))
+            pullfwd_arr = (nwaws_arr
+                           | df["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False).values
+                           | (_bopd_pf >= 100).values)
+        else:
+            pullfwd_arr = np.ones(len(df), dtype=bool)
+    else:
+        pullfwd_arr = np.zeros(len(df), dtype=bool)
     speed = max(float(speed), 1.0)
 
     _EL_BASE = elastic_limit
@@ -1572,7 +1594,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 d_min = min_dists[i_cand]; d_max = max_dists[i_cand]; urg = urg_arr[cand_idx]
                 is_same_fld = (target_fld is not None and field_arr[cand_idx] == target_fld)
                 if d_max > elastic_limit: continue
-                if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and urg <= 2):
+                if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and (urg <= 2 or pullfwd_arr[cand_idx])):
                     c_score = d_min
                     if is_same_fld: c_score -= 50
                     if urg <= 2: c_score -= 20
@@ -2773,6 +2795,17 @@ with st.sidebar:
                  "tier rendah bila kapasitas ketat). Tidak berlaku di mode urgensi Tier penuh.")
         _NODEFER_HICAT = not _nodefer_lbl.startswith("Mati")
         _NODEFER_H0 = _nodefer_lbl.startswith("Kuat")
+
+        _PULLFWD = st.checkbox("Pull-forward dalam periode", value=False,
+            help="Saat sebuah unit sudah membuat rute hari ini, sumur keras yang berada dalam elastic_limit "
+                 "ikut diserap walau belum urgent (tarik maju selagi unit lewat), mengisi sisa kapasitas rute. "
+                 "Murni penyerapan ke rute yang sudah terbentuk: tidak mengubah pemilihan seed, jadi tak membuka "
+                 "rute jauh/monster untuk sumur terisolasi. Efek baru terasa bila elastic_limit > 5 km. "
+                 "Menolong sumur 'dekat tapi slack' yang biasanya tertunda. Tidak berlaku di mode urgensi Tier penuh.")
+        if _PULLFWD:
+            _PULLFWD_HARDONLY = st.checkbox("Hanya sumur keras (Reg A / NW / AWS / BOPD ≥ 100)", value=True,
+                help="Batasi pull-forward ke sumur prioritas saja, supaya kapasitas tidak terkuras menarik "
+                     "maju Reg C/D. Matikan untuk menarik maju semua kategori.")
 
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
