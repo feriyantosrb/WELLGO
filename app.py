@@ -5286,6 +5286,56 @@ with tab_cart:
             st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
 
     st.divider()
+    # ── ➕ Tambah Add Manual ke unit: sisipkan sumur backlog ke unit-hari pilihan ──
+    # Dipakai SETELAH preemption/rescue/re-optimasi untuk menambah sumur backlog Add Manual
+    # ke unit tertentu secara manual (lewat manual_assign). Zona tetap dihormati.
+    ui.section("➕ Tambah Add Manual ke unit", eyebrow="Sisipkan sumur backlog Add Manual ke unit-hari pilihan (jalankan setelah preemption/rescue)")
+    _am_src = (raw[raw["is_addmanual"].fillna(False)].drop_duplicates("well")
+               if "is_addmanual" in raw.columns else raw.iloc[0:0])
+    if not len(_am_src):
+        st.caption("Tidak ada sumur Add Manual (test_category Add Manual) pada data periode ini.")
+    else:
+        _sched_now_am = set(scheduled_all["well"]) if len(scheduled_all) else set()
+        _am_zone = {r["well"]: ("remote" if str(r.get("area", "")).upper() in REMOTE_AREAS else "non-remote")
+                    for _, r in _am_src.iterrows()}
+        _am_avail = [w for w in _am_src["well"].tolist() if w not in _sched_now_am]
+        _am_added = st.session_state.get("addman_manual_wells", [])
+        st.caption(f"**{len(_am_avail)}** sumur Add Manual belum terjadwal (dari {len(_am_src)} total). Pilih sumur, "
+                   "unit tujuan, dan hari. Zona dihormati: sumur Remote hanya ke unit Remote, begitu sebaliknya.")
+        _amc1, _amc2, _amc3 = st.columns([2, 1, 1])
+        _am_pick = _amc1.multiselect("Sumur Add Manual", _am_avail,
+                                     format_func=lambda w: f"{w} ({_am_zone.get(w, '-')})", key="addman_pick")
+        _am_unit = _amc2.selectbox("Unit tujuan", ALL_UNITS, key="addman_unit")
+        _pdate_am = {d: days[d - 1 - day_offset] for d in day_nums}
+        _am_day = _amc3.selectbox("Hari", day_nums,
+                                  format_func=lambda d: f"H{d} · {_pdate_am[d].strftime('%d %b')}", key="addman_day")
+        _amb1, _amb2 = st.columns(2)
+        _do_addman = _amb1.button("➕ Tambahkan ke unit", type="primary", disabled=(not _am_pick), key="btn_addman")
+        _do_addman_cancel = _amb2.button("↩️ Batal Tambah", disabled=(not _am_added), key="btn_addman_cancel")
+        if _do_addman_cancel:
+            _as = dict(st.session_state.get("manual_assign", {}))
+            for _w in _am_added: _as.pop(_w, None)
+            st.session_state["manual_assign"] = _as
+            st.session_state["addman_manual_wells"] = []
+            st.rerun()
+        if _do_addman and _am_pick:
+            _uzone = "remote" if _am_unit in REMOTE_UNITS else "non-remote"
+            _ok = [w for w in _am_pick if _am_zone.get(w) == _uzone]
+            _skip = [w for w in _am_pick if _am_zone.get(w) != _uzone]
+            _as = dict(st.session_state.get("manual_assign", {}))
+            for _w in _ok: _as[_w] = {"unit": _am_unit, "day_idx": int(_am_day)}
+            st.session_state["manual_assign"] = _as
+            st.session_state["addman_manual_wells"] = sorted(set(_am_added) | set(_ok))
+            if _skip:
+                st.warning(f"{len(_skip)} sumur dilewati karena beda zona dengan unit {_am_unit} ({_uzone}): "
+                           + ", ".join(_skip))
+            st.rerun()
+        if _am_added:
+            _in = [w for w in _am_added if w in _sched_now_am]
+            st.success(f"✅ {len(_in)} dari {len(_am_added)} sumur Add Manual tersisipkan ke jadwal. Yang belum muncul: "
+                       "unit-harinya penuh atau tertolak aturan saat optimasi dijalankan ulang.")
+
+    st.divider()
     ui.section("Matriks Ketersediaan Kapasitas", eyebrow="Visualisasi load per unit harian")
 
     # Meter per (unit, hari): panjang bar = cnt/max_wells, label x/y selalu tampil.
@@ -5831,10 +5881,22 @@ with tab_export:
     # pending/executed di SCH. off_wells (dipakai KPI dashboard) hanya memuat OFF yang lolos gate
     # kandidat, sehingga sumur OFF eligible yang ter-exclude (mis. PENDING di SCH_Database) tidak
     # ikut terekspor. Yang sudah executed (benar-benar dites) tetap dikecualikan.
-    _off_export = raw[(raw["status"] == "OFF")
+    def _annot_cand(df):
+        """Tambah kolom Kandidat (TS/MWT) & Unit_Name (unit_name asli Excel kandidat)."""
+        if not len(df): return df
+        df = df.copy()
+        _u = (df["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in df.columns
+              else pd.Series("", index=df.index))
+        _t = (df["is_ts"].fillna(False) if "is_ts" in df.columns
+              else _u.str.upper().str.contains("TS", na=False))
+        df["Kandidat"] = ["TS" if x else "MWT" for x in _t.values]
+        df["Unit_Name"] = _u.values
+        return df
+
+    _off_export = _annot_cand(raw[(raw["status"] == "OFF")
                       & (raw["min_date"] <= batch_hi) & (raw["max_date"] >= batch_lo)
-                      & (~raw["well"].isin(executed))].copy()
-    _off_cols = [c for c in ["well", "unit", "subarea", "field", "category", "kat_full",
+                      & (~raw["well"].isin(executed))].copy())
+    _off_cols = [c for c in ["well", "unit", "Kandidat", "Unit_Name", "subarea", "field", "category", "kat_full",
                              "dur", "status", "min_date", "max_date"] if c in _off_export.columns]
     _off_ren = {"unit": "unit_asli", "dur": "durasi_test_menit", "kat_full": "kategori",
                 "min_date": "earliest", "max_date": "deadline", "status": "status_sumur"}
@@ -5919,8 +5981,8 @@ with tab_export:
     with pd.ExcelWriter(out_w, engine="openpyxl") as w:
         xl_sheet(w, _jadwal, "Jadwal_Mingguan", "JadwalMingguan")
         xl_sheet(w, _rute_df, "Rute_Mingguan", "RuteMingguan")
-        if len(missed): xl_sheet(w, missed[["well", "unit", "subarea", "category", "dur", "urgency", "max_date"]].rename(columns={"dur": "durasi_test_menit", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
-        if len(missed_outside): xl_sheet(w, missed_outside[["well", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
+        if len(missed): xl_sheet(w, _annot_cand(missed)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "urgency", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
+        if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
         if len(missed_carry): xl_sheet(w, missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
         if len(_off_export): xl_sheet(w, _off_export[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFF")
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
