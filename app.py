@@ -5292,8 +5292,11 @@ with tab_cart:
     # (dalam batas detour) lalu membuka unit kosong bila tak ada rute dekat. Zona & mapping
     # dihormati. Bukan assign manual satu-satu.
     ui.section("🚑 Rescue Add Manual", eyebrow="Auto-isi sumur backlog Add Manual ke unit longgar/kosong (jalankan setelah preemption/rescue)")
-    _am_src = (raw[raw["is_addmanual"].fillna(False)].drop_duplicates("well")
-               if "is_addmanual" in raw.columns else raw.iloc[0:0])
+    # Ambil dari week_df (bukan raw): hanya sumur yang ADA di week_df yang bisa ditempatkan lewat
+    # manual_assign. Backlog Add Manual (window di luar periode) tetap ikut karena disisipkan ke
+    # week_df sebagai unscheduled, jadi tombol ini memang bisa menambahkannya otomatis ke unit.
+    _am_src = (week_df[week_df["is_addmanual"].fillna(False)].drop_duplicates("well")
+               if "is_addmanual" in week_df.columns else week_df.iloc[0:0])
     if not len(_am_src):
         st.caption("Tidak ada sumur Add Manual (test_category Add Manual) pada data periode ini.")
     else:
