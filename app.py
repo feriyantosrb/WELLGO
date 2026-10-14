@@ -5286,54 +5286,88 @@ with tab_cart:
             st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
 
     st.divider()
-    # ── ➕ Tambah Add Manual ke unit: sisipkan sumur backlog ke unit-hari pilihan ──
-    # Dipakai SETELAH preemption/rescue/re-optimasi untuk menambah sumur backlog Add Manual
-    # ke unit tertentu secara manual (lewat manual_assign). Zona tetap dihormati.
-    ui.section("➕ Tambah Add Manual ke unit", eyebrow="Sisipkan sumur backlog Add Manual ke unit-hari pilihan (jalankan setelah preemption/rescue)")
+    # ── 🚑 Rescue Add Manual: auto-isi sumur backlog ke kapasitas longgar (termasuk unit kosong) ──
+    # Satu klik: tiap sumur Add Manual yang belum terjadwal diisi otomatis ke unit-hari yang
+    # MASIH punya ruang (room = max_wells − isi), utamakan menempel ke rute existing terdekat
+    # (dalam batas detour) lalu membuka unit kosong bila tak ada rute dekat. Zona & mapping
+    # dihormati. Bukan assign manual satu-satu.
+    ui.section("🚑 Rescue Add Manual", eyebrow="Auto-isi sumur backlog Add Manual ke unit longgar/kosong (jalankan setelah preemption/rescue)")
     _am_src = (raw[raw["is_addmanual"].fillna(False)].drop_duplicates("well")
                if "is_addmanual" in raw.columns else raw.iloc[0:0])
     if not len(_am_src):
         st.caption("Tidak ada sumur Add Manual (test_category Add Manual) pada data periode ini.")
     else:
         _sched_now_am = set(scheduled_all["well"]) if len(scheduled_all) else set()
-        _am_zone = {r["well"]: ("remote" if str(r.get("area", "")).upper() in REMOTE_AREAS else "non-remote")
-                    for _, r in _am_src.iterrows()}
-        _am_avail = [w for w in _am_src["well"].tolist() if w not in _sched_now_am]
-        _am_added = st.session_state.get("addman_manual_wells", [])
-        st.caption(f"**{len(_am_avail)}** sumur Add Manual belum terjadwal (dari {len(_am_src)} total). Pilih sumur, "
-                   "unit tujuan, dan hari. Zona dihormati: sumur Remote hanya ke unit Remote, begitu sebaliknya.")
-        _amc1, _amc2, _amc3 = st.columns([2, 1, 1])
-        _am_pick = _amc1.multiselect("Sumur Add Manual", _am_avail,
-                                     format_func=lambda w: f"{w} ({_am_zone.get(w, '-')})", key="addman_pick")
-        _am_unit = _amc2.selectbox("Unit tujuan", ALL_UNITS, key="addman_unit")
-        _pdate_am = {d: days[d - 1 - day_offset] for d in day_nums}
-        _am_day = _amc3.selectbox("Hari", day_nums,
-                                  format_func=lambda d: f"H{d} · {_pdate_am[d].strftime('%d %b')}", key="addman_day")
+        _am_avail_df = _am_src[~_am_src["well"].isin(_sched_now_am)].copy()
+        _am_added = st.session_state.get("addman_added_wells", [])
+        _am_cap = st.slider("Batas jarak tempel ke rute existing (km) — lebih jauh buka unit kosong", 2, 50, 7, key="addman_cap")
+        st.caption(f"**{len(_am_avail_df)}** sumur Add Manual belum terjadwal (dari {len(_am_src)} total). Tombol di bawah "
+                   "mengisinya otomatis ke unit-hari yang masih punya ruang: tempel ke rute terdekat dalam batas, "
+                   "selain itu buka unit kosong. Zona & mapping dihormati.")
         _amb1, _amb2 = st.columns(2)
-        _do_addman = _amb1.button("➕ Tambahkan ke unit", type="primary", disabled=(not _am_pick), key="btn_addman")
-        _do_addman_cancel = _amb2.button("↩️ Batal Tambah", disabled=(not _am_added), key="btn_addman_cancel")
+        _do_addman = _amb1.button("🚑 Jalankan Rescue Add Manual", type="primary",
+                                  disabled=(not len(_am_avail_df)), key="btn_addman")
+        _do_addman_cancel = _amb2.button("↩️ Batal", disabled=(not _am_added), key="btn_addman_cancel")
         if _do_addman_cancel:
             _as = dict(st.session_state.get("manual_assign", {}))
             for _w in _am_added: _as.pop(_w, None)
             st.session_state["manual_assign"] = _as
-            st.session_state["addman_manual_wells"] = []
+            st.session_state["addman_added_wells"] = []
             st.rerun()
-        if _do_addman and _am_pick:
-            _uzone = "remote" if _am_unit in REMOTE_UNITS else "non-remote"
-            _ok = [w for w in _am_pick if _am_zone.get(w) == _uzone]
-            _skip = [w for w in _am_pick if _am_zone.get(w) != _uzone]
+        if _do_addman and len(_am_avail_df):
+            _act_rem_am = list(REMOTE_UNITS)[:n_remote]; _act_non_am = list(NONREMOTE_UNITS)[:n_nonremote]
+            _room, _rtp = {}, {}
+            for _, _r in scheduled_all.iterrows():
+                _k = (_r["plan_unit"], int(_r["day_idx"]))
+                _room[_k] = _room.get(_k, max_wells) - 1
+                if bool(_r.get("has_coord", True)) and pd.notna(_r.get("lat")):
+                    _rtp.setdefault(_k, []).append((float(_r["lat"]), float(_r["lon"])))
+            def _room_of(_k):
+                return _room.get(_k, max_wells)
             _as = dict(st.session_state.get("manual_assign", {}))
-            for _w in _ok: _as[_w] = {"unit": _am_unit, "day_idx": int(_am_day)}
+            _placed, _open_new = [], 0
+            # sumur ber-BOPD lebih besar didahulukan ambil slot
+            _bo = pd.to_numeric(_am_avail_df["bopd"], errors="coerce") if "bopd" in _am_avail_df.columns else None
+            if _bo is not None: _am_avail_df = _am_avail_df.assign(_bo=_bo.fillna(-1)).sort_values("_bo", ascending=False)
+            for _, _w in _am_avail_df.iterrows():
+                _wn = _w["well"]
+                _allow = _w.get("allow_units")
+                if _allow:
+                    _elig = [u for u in (_act_rem_am + _act_non_am) if u in _allow]
+                else:
+                    _elig = _act_rem_am if str(_w.get("area", "")).upper() in REMOTE_AREAS else _act_non_am
+                _has_c = bool(_w.get("has_coord", True)) and pd.notna(_w.get("lat"))
+                _best = None  # (is_empty, dist, unit, day)
+                for _d in day_nums:
+                    for _u in _elig:
+                        _k = (_u, _d)
+                        if _room_of(_k) <= 0: continue
+                        _pts = _rtp.get(_k)
+                        if _pts:
+                            _dist = road_min_to_pts(_w["lat"], _w["lon"], _pts) if _has_c else 0.0
+                            if _has_c and _dist > _am_cap: continue
+                            _cand = (0, _dist, _u, _d)
+                        else:
+                            _cand = (1, 0.0, _u, _d)
+                        if _best is None or _cand[:2] < _best[:2]:
+                            _best = _cand
+                if _best is None: continue
+                _iemp, _, _bu, _bd = _best
+                _as[_wn] = {"unit": _bu, "day_idx": int(_bd)}
+                _room[(_bu, _bd)] = _room_of((_bu, _bd)) - 1
+                if _has_c:
+                    _rtp.setdefault((_bu, _bd), []).append((float(_w["lat"]), float(_w["lon"])))
+                if _iemp: _open_new += 1
+                _placed.append(_wn)
             st.session_state["manual_assign"] = _as
-            st.session_state["addman_manual_wells"] = sorted(set(_am_added) | set(_ok))
-            if _skip:
-                st.warning(f"{len(_skip)} sumur dilewati karena beda zona dengan unit {_am_unit} ({_uzone}): "
-                           + ", ".join(_skip))
+            st.session_state["addman_added_wells"] = _placed
+            st.session_state["addman_open_new"] = _open_new
             st.rerun()
         if _am_added:
             _in = [w for w in _am_added if w in _sched_now_am]
-            st.success(f"✅ {len(_in)} dari {len(_am_added)} sumur Add Manual tersisipkan ke jadwal. Yang belum muncul: "
-                       "unit-harinya penuh atau tertolak aturan saat optimasi dijalankan ulang.")
+            _on = st.session_state.get("addman_open_new", 0)
+            st.success(f"✅ {len(_in)} dari {len(_am_added)} sumur Add Manual tersisipkan "
+                       f"({_on} di antaranya membuka unit kosong). Yang belum muncul: semua unit-hari di zonanya penuh.")
 
     st.divider()
     ui.section("Matriks Ketersediaan Kapasitas", eyebrow="Visualisasi load per unit harian")
