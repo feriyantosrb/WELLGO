@@ -3119,6 +3119,7 @@ if "last_wt" in raw.columns:
             _p = pd.Timestamp(_lw2)
             _last_test[_w2] = max(_last_test[_w2], _p) if _w2 in _last_test else _p
 _minmap = dict(zip(raw["well"], raw["min_date"]))
+_maxmap = dict(zip(raw["well"], raw["max_date"]))
 
 _ncmp_wells = (set(raw.loc[raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP"), "well"])
                if "sch_status" in raw.columns else set())
@@ -3127,13 +3128,20 @@ def comp_masih_berlaku(w):
     """True bila COMP-nya masih menghitung utk window sekarang.
     • SCH STATUS = NCMP → tegas TIDAK selesai. Ini bukan ketidaktahuan: percobaan
       terakhirnya gagal, jadi jangan jatuh ke fallback "pertahankan lama".
+    • Kriteria: COMP berlaku bila tes terakhir berada DI DALAM rentang window [min, max].
+      Tes terakhir di luar window (sebelum min ATAU sesudah max) → COMP tak berlaku,
+      sumur dikembalikan jadi kandidat.
     • Tanpa bukti tanggal sama sekali → tak bisa dinilai, pertahankan perilaku lama."""
     if w in _ncmp_wells:
         return False
-    md, lt = _minmap.get(w), _last_test.get(w)
-    if lt is None or pd.isna(md):
+    md, xd, lt = _minmap.get(w), _maxmap.get(w), _last_test.get(w)
+    if lt is None or (pd.isna(md) and pd.isna(xd)):
         return True
-    return lt >= md
+    if pd.notna(md) and lt < md:
+        return False
+    if pd.notna(xd) and lt > xd:
+        return False
+    return True
 
 _comp_col_raw, _aws_done_raw = set(comp_col), set(aws_done)
 comp_col = {w for w in comp_col if comp_masih_berlaku(w)}
@@ -3145,6 +3153,27 @@ executed = (executed_log | comp_col | manual_comp | aws_done) - set(aws_active.k
 # aws_done SENGAJA tidak ikut di sini: itu AWS yang kelar lintas-periode (cukup utk exclude jadwal,
 # tapi jangan inflate Status Realisasi periode ini). AWS yg COMP di periode ini tetap kebawa via executed_log.
 comp_disp_set = (executed_log | comp_col | manual_comp) - set(aws_active.keys())
+
+# COMP TERSIRAT: sumur yang BELUM ditandai COMP (tak ada di executed) tapi tes terakhirnya
+# (riwayat/last_wt, TIDAK di-period-scope) jatuh DI DALAM window [min, max]-nya → kewajiban tes
+# window ini sudah terpenuhi, jadi jangan dijadwalkan lagi walau kolom SCH STATUS belum COMP.
+# Kasus: dites tepat sebelum periode mulai, mis. DL 15 Okt, dites 14 Okt, periode 15-21 Okt.
+def _tes_dalam_window(w):
+    if w in _ncmp_wells:
+        return False
+    md, xd, lt = _minmap.get(w), _maxmap.get(w), _last_test.get(w)
+    if lt is None or (pd.isna(md) and pd.isna(xd)):
+        return False
+    if pd.notna(md) and lt < md:
+        return False
+    if pd.notna(xd) and lt > xd:
+        return False
+    return True
+comp_implied = {w for w in set(raw["well"])
+                if w not in executed and w not in aws_active and _tes_dalam_window(w)}
+if comp_implied:
+    executed |= comp_implied
+    comp_disp_set |= comp_implied
 
 # PENDING: jadwal sudah ada tapi STATUS belum diisi → disisihkan, jangan dijadwalkan ulang
 pending_col = set(raw.loc[raw["sch_status"].isin(["PENDING", "PEND"]), "well"])
@@ -3623,9 +3652,15 @@ if scope_note:
 
 if comp_expired:
     st.info(f"♻️ **{len(comp_expired)} sumur dikembalikan jadi kandidat** — ditandai COMP oleh kolom "
-            f"SCH STATUS / riwayat, tapi tes terakhirnya MENDAHULUI pembukaan window periode ini, "
-            f"jadi harus dites lagi. Contoh: {', '.join(sorted(comp_expired)[:8])}"
+            f"SCH STATUS / riwayat, tapi tes terakhirnya berada DI LUAR rentang window (min-max)-nya "
+            f"(sebelum min atau sesudah max), jadi harus dites lagi. Contoh: {', '.join(sorted(comp_expired)[:8])}"
             + (" …" if len(comp_expired) > 8 else ""))
+
+if comp_implied:
+    st.info(f"✅ **{len(comp_implied)} sumur dianggap sudah dites (COMP tersirat)** — kolom SCH STATUS belum "
+            f"COMP, tapi tes terakhirnya (riwayat/last_wt) jatuh DI DALAM window-nya, jadi tidak dijadwalkan "
+            f"lagi. Kasus umum: dites tepat sebelum periode mulai. Contoh: {', '.join(sorted(comp_implied)[:8])}"
+            + (" …" if len(comp_implied) > 8 else ""))
 
 st.caption(f"🔌 **WELLS OFF ({len(off_wells)})** = sumur OFF yang jadi kandidat & di-skip **di siklus ini**. "
            f"Total semua sumur OFF di master data: **{len(master_off_wells)}** — lihat daftar lengkapnya di tab "
