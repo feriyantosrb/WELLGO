@@ -2807,6 +2807,26 @@ with st.sidebar:
                 help="Batasi pull-forward ke sumur prioritas saja, supaya kapasitas tidak terkuras menarik "
                      "maju Reg C/D. Matikan untuk menarik maju semua kategori.")
 
+        if st.button("🚀 Optimasi Otomatis (4 tahap)", type="primary", use_container_width=True, key="btn_auto_pipe",
+                     help="Jalankan berurutan otomatis: 1) optimasi default, 2) Preemption, 3) Rescue + "
+                          "Re-optimasi, 4) Rescue Miss-Deadline. Banner progres tampil tiap tahap. Hasil rescue "
+                          "sebelumnya (dari 4 tahap) direset; assign manual Anda sendiri dipertahankan."):
+            _ma0 = dict(st.session_state.get("manual_assign", {}))
+            for _lk in ("preempt_wells", "repair_wells", "rescued_wells"):
+                for _ww in (st.session_state.get(_lk) or []):
+                    _ma0.pop(_ww, None)
+            _un0 = set(st.session_state.get("manual_unassign", []) or [])
+            for _ww in (st.session_state.get("preempt_bumped") or []):
+                _un0.discard(_ww)
+            st.session_state["manual_assign"] = _ma0
+            st.session_state["manual_unassign"] = list(_un0)
+            for _lk in ("preempt_wells", "preempt_bumped", "preempt_ran", "repair_wells", "repair_assign_keys",
+                        "repair_moves", "repair_ran", "rescued_wells", "rescue_added_km", "rescue_skip_far",
+                        "rescue_late_early"):
+                st.session_state.pop(_lk, None)
+            st.session_state["auto_pipe"] = 1
+            st.rerun()
+
         regroup_prox = st.checkbox("Grouping ulang per hari berdasarkan kedekatan sumur", value=True,
             help="Berlaku untuk mode Pooled & Mapping Unit. Setelah aturan deadline menentukan sumur "
                  "mana digarap hari apa dan pakai berapa unit, keanggotaan tiap klaster disusun ULANG "
@@ -3382,6 +3402,24 @@ if regroup_prox and mode == "pooled":
     _ckpt("regroup_by_proximity")
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
+
+# ── Pipeline optimasi otomatis (4 tahap): banner progres + maju antar tahap ──
+# auto_pipe: 1=optimasi default, 2=preemption, 3=rescue+re-optimasi, 4=rescue miss-deadline,
+# 5=selesai. Tahap 2/3/4 dijalankan oleh blok masing-masing di tab Cart Manual (lihat _auto).
+_auto = st.session_state.get("auto_pipe", 0)
+if _auto:
+    _AL = {1: "Tahap 1/4 · Optimasi default", 2: "Tahap 2/4 · Preemption Prioritas",
+           3: "Tahap 3/4 · Rescue + Re-optimasi", 4: "Tahap 4/4 · Rescue Miss-Deadline"}
+    if _auto >= 5:
+        st.success("✅ Optimasi otomatis 4 tahap selesai.")
+        st.session_state["auto_pipe"] = 0
+        _auto = 0
+    else:
+        st.progress(min(_auto, 4) / 4.0,
+                    text=f"⏳ Optimasi otomatis berjalan… {_AL.get(_auto, '')} — mohon tunggu, jangan tutup/ubah halaman.")
+        if _auto == 1:
+            st.session_state["auto_pipe"] = 2
+            st.rerun()
 
 # Muat geometri jalan HANYA untuk sumur terjadwal (yang akan digambar di peta), disaring dari
 # Parquet+SQLite. Dilakukan di sini (bukan di sidebar) supaya dict kecil & tak menahan ratusan
@@ -4917,7 +4955,8 @@ with tab_cart:
         st.session_state["rescued_wells"] = []
         st.rerun()
 
-    if _do_rescue and len(missed):
+    if (_do_rescue or _auto == 4) and len(missed):
+        if _auto == 4: st.session_state["auto_pipe"] = 5
         # titik rute & jumlah per (unit, hari) dari jadwal saat ini
         _route_pts, _counts = {}, {}
         for _, _r in scheduled_all.iterrows():
@@ -4970,6 +5009,9 @@ with tab_cart:
         st.session_state["rescue_added_km"] = round(_added_km, 1)
         st.session_state["rescue_skip_far"] = _skip_far
         st.session_state["rescue_late_early"] = (_n_late, _n_early)
+        st.rerun()
+    elif _auto == 4:
+        st.session_state["auto_pipe"] = 5   # tak ada sumur miss → selesai
         st.rerun()
 
     _resc = st.session_state.get("rescued_wells", [])
@@ -5032,7 +5074,8 @@ with tab_cart:
         st.session_state["preempt_ran"] = False
         st.rerun()
 
-    if _do_preempt and len(_hard):
+    if (_do_preempt or _auto == 2) and len(_hard):
+        if _auto == 2: st.session_state["auto_pipe"] = 3
         def _val(tp, rt, mx):
             tier = 0 if (str(tp) in ("NW", "AWS") or str(rt).upper() in ("PRQ", "ORQ")) else 1
             return (tier, pd.Timestamp(mx) if pd.notna(mx) else pd.Timestamp.max)
@@ -5120,6 +5163,9 @@ with tab_cart:
         st.session_state["preempt_bumped"] = _bumped
         st.session_state["preempt_ran"] = True
         st.rerun()
+    elif _auto == 2:
+        st.session_state["auto_pipe"] = 3   # tak ada kandidat preemption → lanjut tahap 3
+        st.rerun()
 
     _pw = st.session_state.get("preempt_wells", [])
     if not _pw and st.session_state.get("preempt_ran"):
@@ -5170,7 +5216,8 @@ with tab_cart:
         st.session_state["repair_ran"] = False
         st.rerun()
 
-    if _do_repair and len(missed):
+    if (_do_repair or _auto == 3) and len(missed):
+        if _auto == 3: st.session_state["auto_pipe"] = 4
         def _rtier(tp, rt, cat):
             if str(tp) in ("NW", "AWS"): return 0
             if str(rt).upper() in ("PRQ", "ORQ"): return 0
@@ -5267,6 +5314,9 @@ with tab_cart:
         st.session_state["repair_assign_keys"] = _rescued
         st.session_state["repair_moves"] = _moves
         st.session_state["repair_ran"] = True
+        st.rerun()
+    elif _auto == 3:
+        st.session_state["auto_pipe"] = 4   # tak ada sumur miss untuk re-optimasi → lanjut tahap 4
         st.rerun()
 
     _rpw = st.session_state.get("repair_wells", [])
