@@ -2268,19 +2268,20 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
                           | pool["category"].astype(str).str.upper().str.contains(r"REGULAR\s*A\b", regex=True, na=False))
                 pool.loc[_hicat & _late, "urgency"] = 0.0
             else:
-                # SEDANG (per sub-kategori + BOPD):
-                #   AWS1, NW1              → H-0 (urgensi 0).
-                #   AWS2, NW2, NW3 BOPD>=100 → jatuh tempo akhir periode (tak boleh ditunda).
-                #   selain itu (BOPD<100/kosong, generik, REG A) → biarkan perilaku normal (boleh ditunda).
+                # SEDANG:
+                #   AWS1, NW1                         → H-0 (urgensi 0).
+                #   SEMUA NW/AWS lain + REGULAR A     → jatuh tempo akhir periode (tak boleh ditunda).
+                #   selain itu (REG B/C/D, generik)   → perilaku normal (boleh ditunda).
+                # Catatan: BOPD tak lagi jadi syarat; dulu hanya AWS2/NW2/NW3 BOPD>=100 yang dilindungi,
+                # kini seluruh NW/AWS (termasuk tanpa nomor) dan REGULAR A dilindungi.
                 _cu = pool["category"].astype(str).str.upper()
                 _nwn = _cu.str.extract(r"NEW WELL\s*([123])")[0]
                 _awn = _cu.str.extract(r"AWS\s*([12])")[0]
-                _bopd = (pd.to_numeric(pool["bopd"], errors="coerce") if "bopd" in pool.columns
-                         else pd.Series(np.nan, index=pool.index))
                 _h0 = (_awn == "1") | (_nwn == "1")
-                _nd = ((_awn == "2") | _nwn.isin(["2", "3"])) & (_bopd >= 100)
+                _is_nwaws_p = pool["tipe"].isin(["NW", "AWS"])
+                _is_rega_p = _cu.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
                 pool.loc[_h0 & _late, "urgency"] = 0.0
-                pool.loc[_nd & _late, "urgency"] = float((_pe - day).days)
+                pool.loc[(_is_nwaws_p | _is_rega_p) & ~_h0 & _late, "urgency"] = float((_pe - day).days)
         if _URG_MODE == "tier":
             # Mode eksperimen: urgensi = tier kategori (NW/AWS>A>B>C>D>RTN), abaikan H-deadline.
             pool["urgency"] = _tier_urgency_series(
@@ -2788,9 +2789,8 @@ with st.sidebar:
             index=1,
             help="Untuk sumur yang window-nya sudah buka tapi deadline-nya jatuh setelah akhir periode. "
                  "• Mati: biarkan ditunda ke periode depan. "
-                 "• Sedang (per sub-kategori + BOPD): AWS1 & NW1 diperlakukan H-0; AWS2, NW2, NW3 hanya bila "
-                 "BOPD ≥ 100 diperlakukan jatuh tempo akhir periode (tak boleh ditunda); selain itu "
-                 "(BOPD < 100 atau kosong, REG A, generik) dibiarkan boleh ditunda. "
+                 "• Sedang: AWS1 & NW1 diperlakukan H-0; SEMUA NW/AWS lain (termasuk tanpa nomor) & REGULAR A "
+                 "diperlakukan jatuh tempo akhir periode (tak boleh ditunda); REG B/C/D & generik boleh ditunda. "
                  "• Kuat: SEMUA NW/AWS & REG A diperlakukan H-0 sejak hari pertama (paling agresif, menggeser "
                  "tier rendah bila kapasitas ketat). Tidak berlaku di mode urgensi Tier penuh.")
         _NODEFER_HICAT = not _nodefer_lbl.startswith("Mati")
