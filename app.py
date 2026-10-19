@@ -2807,10 +2807,11 @@ with st.sidebar:
                 help="Batasi pull-forward ke sumur prioritas saja, supaya kapasitas tidak terkuras menarik "
                      "maju Reg C/D. Matikan untuk menarik maju semua kategori.")
 
-        if st.button("🚀 Optimasi Otomatis (4 tahap)", type="primary", use_container_width=True, key="btn_auto_pipe",
+        _auto_submit = st.form_submit_button("🚀 Optimasi Otomatis (4 tahap)", type="secondary", use_container_width=True,
                      help="Jalankan berurutan otomatis: 1) optimasi default, 2) Preemption, 3) Rescue + "
                           "Re-optimasi, 4) Rescue Miss-Deadline. Banner progres tampil tiap tahap. Hasil rescue "
-                          "sebelumnya (dari 4 tahap) direset; assign manual Anda sendiri dipertahankan."):
+                          "sebelumnya (dari 4 tahap) direset; assign manual Anda sendiri dipertahankan.")
+        if _auto_submit:
             _ma0 = dict(st.session_state.get("manual_assign", {}))
             for _lk in ("preempt_wells", "repair_wells", "rescued_wells"):
                 for _ww in (st.session_state.get(_lk) or []):
