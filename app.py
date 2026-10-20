@@ -6000,13 +6000,56 @@ with tab_sch:
         # Pending yang TERDETEKSI di SCH tapi tidak ada di pool kandidat
         # (area di-exclude, ter-filter MPAS, atau tidak terdaftar di sheet Kandidat)
         if pending_nodata:
+            # Putar ulang TAHAP DEMI TAHAP filter raw yang sebenarnya pada snapshot penuh
+            # (raw_all_periods) untuk menunjuk tahap persis yang membuang sumur.
+            _raw_now = set(raw["well"]) if len(raw) else set()
+            def _why_nopool(w):
+                sub = raw_all_periods[raw_all_periods["well"] == w]
+                if not len(sub):
+                    return "Tidak terdaftar di sheet Kandidat"
+                # Tahap 1: filter Rentang Periode (Compiled Schedule)
+                if HAS_PERIODS and sel_periode is not None and "_rperiode" in sub.columns:
+                    _bk = sub["is_breakin"].fillna(False) if "is_breakin" in sub.columns else pd.Series(False, index=sub.index)
+                    s1 = sub[(sub["_rperiode"] == sel_periode) | _bk]
+                    if not len(s1):
+                        _ps = ", ".join(sorted(sub["_rperiode"].dropna().astype(str).unique())) or "-"
+                        return f"Baris jadwal di Rentang Periode lain ({_ps})"
+                    sub = s1
+                # Tahap 2: exclude area
+                if excl_areas:
+                    s2 = sub[~sub["area"].isin(excl_areas)]
+                    if not len(s2):
+                        return f"Area di-exclude ({sub['area'].iloc[0]})"
+                    sub = s2
+                # Tahap 3: MPAS-only (plannable = MPAS/unit tak dikenal & MWT tidak down, atau TS down)
+                if mpas_only:
+                    _ists = sub["is_ts"].fillna(False) if "is_ts" in sub.columns else pd.Series(False, index=sub.index)
+                    _un = sub["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in sub.columns else pd.Series("", index=sub.index)
+                    _down = (_ists & sub["area"].isin(ts_unavail)) | _un.isin({str(x).strip() for x in ts_unit_down})
+                    _ismp = sub["is_mpas"].fillna(False) if "is_mpas" in sub.columns else pd.Series(False, index=sub.index)
+                    _unk = sub["unit_unknown"].fillna(False) if "unit_unknown" in sub.columns else pd.Series(False, index=sub.index)
+                    plannable = ((_ismp | _unk) & ~sub["area"].isin(mwt_unavail)) | _down
+                    s3 = sub[plannable]
+                    if not len(s3):
+                        _r0 = sub.iloc[0]
+                        if bool(_r0.get("is_ts", False)):
+                            return f"TS ({str(_r0.get('unit_name_ts', '')).strip() or 'TS'}) bukan fasilitas down → tersaring MPAS-only"
+                        return "Tersaring MPAS-only (unit bukan MPAS / tak dikenal, atau MWT down)"
+                    sub = s3
+                # Lolos ketiga filter raw. Kalau TETAP tak ada di raw final, penyebabnya di luar
+                # filter ini: unit ter-override Status_Sumur (is_mpas berubah) atau nama well beda.
+                if w in _raw_now:
+                    return "Ada di kandidat periode ini — kemungkinan nama well di SCH beda dari Kandidat, atau sudah COMP/tersirat"
+                return "Lolos replay filter tapi tak ada di raw final — cek unit ter-override Status_Sumur (is_mpas) / nama well beda / duplikat"
             nd = pd.DataFrame({"Well": pending_nodata})
             nd["Tgl Jadwal Test"] = nd["Well"].map(pending_sched).fillna("-")
+            nd["Alasan"] = nd["Well"].map(_why_nopool)
             with st.expander(f"⚠️ {len(pending_nodata)} sumur PENDING di SCH tapi tidak ada di pool kandidat"):
-                st.caption("Punya schedule_date_test + STATUS kosong di SCH_Database, tapi tidak masuk pool kandidat "
-                           "(area di-exclude mis. LIBO, ter-filter MPAS-only, atau tidak terdaftar di sheet Kandidat). "
-                           "Tetap disisihkan dari penjadwalan.")
-                st.dataframe(nd.sort_values(["Tgl Jadwal Test", "Well"]), use_container_width=True, hide_index=True)
+                st.caption("Punya schedule_date_test + STATUS kosong di SCH_Database, tapi tidak masuk pool kandidat. "
+                           "Kolom **Alasan** menunjukkan sebab tiap sumur: baris jadwalnya bertanda **Rentang Periode "
+                           "lain** (Compiled Schedule), area di-exclude (mis. LIBO), TS bukan fasilitas down (tersaring "
+                           "MPAS-only), window di luar periode, atau tidak terdaftar di sheet Kandidat. Tetap disisihkan.")
+                st.dataframe(nd.sort_values(["Alasan", "Well"]), use_container_width=True, hide_index=True)
 
     st.divider()
     ui.section("🔎 Review Eligible vs SCH_Database", eyebrow="xlookup status & tanggal terakhir — tandai COMP manual")
