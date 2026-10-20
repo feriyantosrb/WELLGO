@@ -3121,6 +3121,11 @@ if "last_wt" in raw.columns:
 _minmap = dict(zip(raw["well"], raw["min_date"]))
 _maxmap = dict(zip(raw["well"], raw["max_date"]))
 
+def last_test_str(w):
+    """Tanggal tes COMP/executed TERAKHIR sumur dari SCH Database (execution_log) + last_wt, '-' bila tak ada."""
+    _d = _last_test.get(w)
+    return pd.Timestamp(_d).strftime("%Y-%m-%d") if pd.notna(_d) else "-"
+
 _ncmp_wells = (set(raw.loc[raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP"), "well"])
                if "sch_status" in raw.columns else set())
 
@@ -5751,7 +5756,10 @@ with tab_matrix:
     
     if len(missed):
         ui.section("Daftar Pure-Miss Deadline (Kapasitas Penuh)", eyebrow="Butuh aksi manual/tambah shift")
-        st.dataframe(missed[["well", "unit", "subarea", "category", "urgency", "max_date"]].rename(columns={"max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"), use_container_width=True, hide_index=True)
+        _pm = missed[["well", "unit", "subarea", "category", "urgency", "min_date", "max_date"]].copy()
+        _pm["tes_terakhir_sch"] = _pm["well"].map(last_test_str)
+        st.dataframe(_pm.rename(columns={"min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"),
+                     use_container_width=True, hide_index=True)
 
         with st.expander("🔎 Review Miss Deadline vs SCH_Database — tandai COMP manual", expanded=False):
             _comp_review_panel(missed, key="rev_miss")
@@ -5775,10 +5783,11 @@ with tab_matrix:
                    "sudah dijadwal ulang di sepanjang sisa periode walau deadline-nya lewat, dan sampai akhir "
                    "periode tetap tak dapat slot. **Tidak dihitung sebagai Miss Deadline** karena penyebabnya "
                    "bukan kuota kru — perlu tindak lanjut fasilitas/akses/status sumur lebih dulu.")
+        _nc = missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "min_date", "max_date"]].copy()
+        _nc["tes_terakhir_sch"] = _nc["well"].map(last_test_str)
         st.dataframe(
-            missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "min_date", "max_date"]]
-            .rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "min_date": "earliest",
-                             "max_date": "deadline", "unit": "unit_asli"})
+            _nc.rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "min_date": "earliest",
+                                "max_date": "deadline", "unit": "unit_asli"})
             .sort_values(["kode", "deadline"]),
             use_container_width=True, hide_index=True)
 
@@ -6005,7 +6014,7 @@ with tab_export:
     # kandidat, sehingga sumur OFF eligible yang ter-exclude (mis. PENDING di SCH_Database) tidak
     # ikut terekspor. Yang sudah executed (benar-benar dites) tetap dikecualikan.
     def _annot_cand(df):
-        """Tambah kolom Kandidat (TS/MWT) & Unit_Name (unit_name asli Excel kandidat)."""
+        """Tambah kolom Kandidat (TS/MWT), Unit_Name (unit_name asli Excel), dan Tes_Terakhir_SCH."""
         if not len(df): return df
         df = df.copy()
         _u = (df["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in df.columns
@@ -6014,13 +6023,14 @@ with tab_export:
               else _u.str.upper().str.contains("TS", na=False))
         df["Kandidat"] = ["TS" if x else "MWT" for x in _t.values]
         df["Unit_Name"] = _u.values
+        df["Tes_Terakhir_SCH"] = df["well"].map(last_test_str)
         return df
 
     _off_export = _annot_cand(raw[(raw["status"] == "OFF")
                       & (raw["min_date"] <= batch_hi) & (raw["max_date"] >= batch_lo)
                       & (~raw["well"].isin(executed))].copy())
     _off_cols = [c for c in ["well", "unit", "Kandidat", "Unit_Name", "subarea", "field", "category", "kat_full",
-                             "dur", "status", "min_date", "max_date"] if c in _off_export.columns]
+                             "dur", "status", "min_date", "max_date", "Tes_Terakhir_SCH"] if c in _off_export.columns]
     _off_ren = {"unit": "unit_asli", "dur": "durasi_test_menit", "kat_full": "kategori",
                 "min_date": "earliest", "max_date": "deadline", "status": "status_sumur"}
 
@@ -6104,9 +6114,9 @@ with tab_export:
     with pd.ExcelWriter(out_w, engine="openpyxl") as w:
         xl_sheet(w, _jadwal, "Jadwal_Mingguan", "JadwalMingguan")
         xl_sheet(w, _rute_df, "Rute_Mingguan", "RuteMingguan")
-        if len(missed): xl_sheet(w, _annot_cand(missed)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "urgency", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
-        if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
-        if len(missed_carry): xl_sheet(w, missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
+        if len(missed): xl_sheet(w, _annot_cand(missed)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "urgency", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
+        if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
+        if len(missed_carry): xl_sheet(w, _annot_cand(missed_carry)[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
         if len(_off_export): xl_sheet(w, _off_export[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFF")
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
 
