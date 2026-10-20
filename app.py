@@ -2458,11 +2458,13 @@ with st.sidebar:
     with col_sh2: sheet_spasial = st.text_input("Sheet Spasial", "Data_Spasial")
     sheet_breakin = st.text_input("Sheet Break-In (NW/AWS/Req sisipan)", "BreakIn",
                                   help="Sumur sisipan tengah jadwal. Kosongkan jika tidak dipakai.")
-    sheet_wtr = st.text_input("Sheet WTR (Well Test Report)", "WTR",
-                              help="Opsional. Database hasil tes (kolom WELL + TEST DATE). Dipakai sebagai "
-                                   "sumber tambahan deteksi COMP bila SCH Database belum terupdate. Kosongkan jika tak dipakai.")
+    up_wtr = st.file_uploader("Upload WTR Database (opsional)", type=["xlsx", "xlsm"],
+                              help="File Excel TERSENDIRI berisi Well Test Report (hasil tes). Dipakai sebagai "
+                                   "sumber tambahan deteksi COMP bila SCH Database belum terupdate.")
+    sheet_wtr = st.text_input("Sheet WTR", "Database",
+                              help="Nama sheet di file WTR Database (kolom WELL + TEST DATE).")
     use_wtr = st.checkbox("Pakai WTR Database untuk deteksi COMP", value=True,
-                          help="Jika aktif, TEST DATE terbaru per sumur dari sheet WTR ikut jadi 'tes terakhir', "
+                          help="Jika aktif, TEST DATE terbaru per sumur dari WTR Database ikut jadi 'tes terakhir', "
                                "sehingga sumur yang sudah dites (ada di WTR) dalam window-nya dianggap COMP walau "
                                "SCH Database belum update.")
 
@@ -3176,7 +3178,7 @@ if "last_wt" in raw.columns:
 # WTR (Well Test Report): tiap baris = tes selesai. TEST DATE terbaru per sumur ikut jadi
 # 'tes terakhir' (max), jadi sumur yang sudah dites di WTR dalam window-nya terdeteksi COMP
 # walau SCH Database belum update. Opsional (toggle sidebar).
-_wtr_last = load_wtr_last(up.getvalue(), sheet_wtr) if use_wtr else {}
+_wtr_last = load_wtr_last(up_wtr.getvalue(), sheet_wtr) if (use_wtr and up_wtr is not None) else {}
 for _w3, _d3 in _wtr_last.items():
     _p3 = pd.Timestamp(_d3)
     if pd.notna(_p3):
