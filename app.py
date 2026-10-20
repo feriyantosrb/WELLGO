@@ -213,6 +213,31 @@ def sch_latest(wells):
     lab = {"executed": "COMP", "ncmp": "NCMP", "pending": "PENDING"}
     return {r.well: (r.plan_date, lab.get(r.status, str(r.status).upper())) for r in latest.itertuples()}
 
+def sch_hist_latest(wells):
+    """Baris SCH Database (execution_log) TERBARU per well dari SELURUH riwayat (TIDAK di-period-scope).
+    Return {well: (Timestamp, status_label, comment)} dgn status COMP/NCMP/PENDING. Tanggal diparse
+    sebagai date (bukan string) supaya 10/14 benar lebih baru dari 9/17."""
+    con = db_connect()
+    try:
+        df = pd.read_sql("SELECT well_name AS well, status, comment, plan_date FROM execution_log "
+                         "WHERE status IN ('executed','ncmp','pending')", con)
+    except Exception:
+        df = pd.DataFrame(columns=["well", "status", "comment", "plan_date"])
+    con.close()
+    wset = set(map(str, wells))
+    if not len(df):
+        return {}
+    df = df[df["well"].isin(wset)].copy()
+    df["dt"] = pd.to_datetime(df["plan_date"], errors="coerce")
+    df = df[df["dt"].notna()]
+    if not len(df):
+        return {}
+    lab = {"executed": "COMP", "ncmp": "NCMP", "pending": "PENDING"}
+    out = {}
+    for r in df.loc[df.groupby("well")["dt"].idxmax()].itertuples():
+        out[r.well] = (r.dt, lab.get(r.status, str(r.status).upper()), str(r.comment or ""))
+    return out
+
 def norm_unit(u):
     u = str(u).strip().upper()
     m = re.fullmatch(r"MP_?(\d+)", u)
@@ -3126,6 +3151,14 @@ def last_test_str(w):
     _d = _last_test.get(w)
     return pd.Timestamp(_d).strftime("%Y-%m-%d") if pd.notna(_d) else "-"
 
+# Baris SCH Database TERBARU per well (riwayat penuh) — termasuk NCMP/PENDING, untuk kolom tampilan
+# "tes terakhir" yang mencerminkan baris SCH Database apa adanya (mis. 2026-10-14 (NCMP)).
+_sch_last = sch_hist_latest(set(raw["well"]))
+
+def last_sch_str(w):
+    v = _sch_last.get(w)
+    return f"{v[0].strftime('%Y-%m-%d')} ({v[1]})" if v else "-"
+
 _ncmp_wells = (set(raw.loc[raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP"), "well"])
                if "sch_status" in raw.columns else set())
 
@@ -3244,6 +3277,17 @@ else:
     _addman_pool = elig.iloc[0:0].copy()
 expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["ncmp_expired"]
 ncmp_replan, nocoord, off_wells = _E["ncmp_replan"], _E["nocoord"], _E["off_wells"]
+
+# Reklasifikasi carry dari riwayat SCH penuh: sumur yang baris SCH Database TERBARU-nya NCMP
+# ber-hambatan (FACI/ROAD/WOFF) — walau tanggalnya DI LUAR periode & kolom SCH Excel belum NCMP —
+# diperlakukan sebagai NCMP-carry, bukan Pure-Miss. Menutup kasus mis. PN058 (NCMP FACI 14 Okt
+# di luar periode 15-21). Hanya memengaruhi pelaporan (missed_carry), bukan optimasi yang sudah jalan.
+_in_raw_set = set(raw["well"])
+for _w, (_dt, _stt, _cmt) in _sch_last.items():
+    if _stt == "NCMP" and _w in _in_raw_set and _w not in ncmp_carry:
+        _cc = carry_code(_cmt)
+        if _cc:
+            ncmp_carry[_w] = _cc
 pending_nodata, pending_wells = _E["pending_nodata"], _E["pending_wells"]
 replan_df, woff_wells = _E["replan_df"], _E["woff_wells"]
 
@@ -5757,7 +5801,7 @@ with tab_matrix:
     if len(missed):
         ui.section("Daftar Pure-Miss Deadline (Kapasitas Penuh)", eyebrow="Butuh aksi manual/tambah shift")
         _pm = missed[["well", "unit", "subarea", "category", "urgency", "min_date", "max_date"]].copy()
-        _pm["tes_terakhir_sch"] = _pm["well"].map(last_test_str)
+        _pm["tes_terakhir_sch"] = _pm["well"].map(last_sch_str)
         st.dataframe(_pm.rename(columns={"min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"),
                      use_container_width=True, hide_index=True)
 
@@ -5784,7 +5828,7 @@ with tab_matrix:
                    "periode tetap tak dapat slot. **Tidak dihitung sebagai Miss Deadline** karena penyebabnya "
                    "bukan kuota kru — perlu tindak lanjut fasilitas/akses/status sumur lebih dulu.")
         _nc = missed_carry[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "min_date", "max_date"]].copy()
-        _nc["tes_terakhir_sch"] = _nc["well"].map(last_test_str)
+        _nc["tes_terakhir_sch"] = _nc["well"].map(last_sch_str)
         st.dataframe(
             _nc.rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "min_date": "earliest",
                                 "max_date": "deadline", "unit": "unit_asli"})
@@ -6023,7 +6067,7 @@ with tab_export:
               else _u.str.upper().str.contains("TS", na=False))
         df["Kandidat"] = ["TS" if x else "MWT" for x in _t.values]
         df["Unit_Name"] = _u.values
-        df["Tes_Terakhir_SCH"] = df["well"].map(last_test_str)
+        df["Tes_Terakhir_SCH"] = df["well"].map(last_sch_str)
         return df
 
     _off_export = _annot_cand(raw[(raw["status"] == "OFF")
