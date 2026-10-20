@@ -108,7 +108,7 @@ def init_db():
         plan_date TEXT, well_name TEXT, unit TEXT, status TEXT, reason TEXT, updated_at TEXT,
         PRIMARY KEY(plan_date, well_name))""")
     existing = {r[1] for r in con.execute("PRAGMA table_info(execution_log)").fetchall()}
-    for col in ("unit", "status", "reason", "updated_at", "comment"):
+    for col in ("unit", "status", "reason", "updated_at", "comment", "note_resc"):
         if col not in existing:
             con.execute(f"ALTER TABLE execution_log ADD COLUMN {col} TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS coord_cache(
@@ -219,10 +219,10 @@ def sch_hist_latest(wells):
     sebagai date (bukan string) supaya 10/14 benar lebih baru dari 9/17."""
     con = db_connect()
     try:
-        df = pd.read_sql("SELECT well_name AS well, status, comment, plan_date FROM execution_log "
+        df = pd.read_sql("SELECT well_name AS well, status, comment, note_resc, plan_date FROM execution_log "
                          "WHERE status IN ('executed','ncmp','pending')", con)
     except Exception:
-        df = pd.DataFrame(columns=["well", "status", "comment", "plan_date"])
+        df = pd.DataFrame(columns=["well", "status", "comment", "note_resc", "plan_date"])
     con.close()
     wset = set(map(str, wells))
     if not len(df):
@@ -235,7 +235,8 @@ def sch_hist_latest(wells):
     lab = {"executed": "COMP", "ncmp": "NCMP", "pending": "PENDING"}
     out = {}
     for r in df.loc[df.groupby("well")["dt"].idxmax()].itertuples():
-        out[r.well] = (r.dt, lab.get(r.status, str(r.status).upper()), str(r.comment or ""))
+        out[r.well] = (r.dt, lab.get(r.status, str(r.status).upper()),
+                       str(r.comment or ""), str(getattr(r, "note_resc", "") or ""))
     return out
 
 def norm_unit(u):
@@ -333,7 +334,7 @@ def carry_code(comment):
 def carry_label(code):
     return f"Not Complete (NCMP) {code}-Miss Deadline" if code else NCMP_CARRY_LABEL
 
-SCHDB_COLS = ["well", "unit", "date", "raw_stat", "stat", "reason", "comment"]
+SCHDB_COLS = ["well", "unit", "date", "raw_stat", "stat", "reason", "comment", "note_resc"]
 
 def read_schdb(file_bytes):
     """Baca satu file SCHDatabase jadi tabel ternormalisasi. MURNI parsing — tak menyentuh
@@ -366,6 +367,8 @@ def read_schdb(file_bytes):
     # jadi disimpan terpisah. File lama tanpa REASON tetap jatuh ke kolom comment.
     cc = cols.get("COMMENT IF NOT COMPLETE")
     cr = cols.get("REASON") or cc
+    # NOTE RESC = catatan penjadwalan ulang (free-text), mis. "spool test tinggi". Case asli dijaga.
+    cn = cols.get("NOTE RESC") or cols.get("NOTE_RESC") or cols.get("NOTERESC")
     if not (cw and cs and cd):
         return pd.DataFrame(columns=SCHDB_COLS)
     w = pd.DataFrame({
@@ -375,6 +378,7 @@ def read_schdb(file_bytes):
         "unit": df[cu].map(norm_unit) if cu else "",
         "reason": (df[cr].astype(str).str.strip().str.upper().replace({"NAN": ""}) if cr else ""),
         "comment": (df[cc].astype(str).str.strip().str.upper().replace({"NAN": ""}) if cc else ""),
+        "note_resc": (df[cn].astype(str).str.strip().replace({"nan": "", "NaN": "", "NAN": ""}) if cn else ""),
     })
     w["stat"] = w["raw_stat"].map(classify_status)
     return w
@@ -427,12 +431,13 @@ def import_compncmp(file_list):
         w = w[valid & (w["stat"] != "")].copy()
         w["plan_date"] = w["date"].dt.date.astype(str)
         w["log_status"] = np.where(w["stat"] == "COMP", "executed", "ncmp")
+        _nr = w["note_resc"] if "note_resc" in w.columns else pd.Series([""] * len(w), index=w.index)
         rows = list(zip(w["plan_date"], w["well"], w["unit"], w["log_status"], w["reason"],
-                        w["comment"], [now] * len(w)))
-        con.executemany("""INSERT INTO execution_log(plan_date,well_name,unit,status,reason,comment,updated_at)
-            VALUES(?,?,?,?,?,?,?) ON CONFLICT(plan_date,well_name) DO UPDATE SET
+                        w["comment"], _nr, [now] * len(w)))
+        con.executemany("""INSERT INTO execution_log(plan_date,well_name,unit,status,reason,comment,note_resc,updated_at)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(plan_date,well_name) DO UPDATE SET
             unit=excluded.unit, status=excluded.status, reason=excluded.reason,
-            comment=excluded.comment, updated_at=excluded.updated_at""", rows)
+            comment=excluded.comment, note_resc=excluded.note_resc, updated_at=excluded.updated_at""", rows)
         n_comp += int((w["stat"] == "COMP").sum())
         nc = w[w["stat"] == "NCMP"]
         n_ncmp += len(nc)
@@ -3199,6 +3204,14 @@ def last_sch_str(w):
     v = _sch_last.get(w)
     return f"{v[0].strftime('%Y-%m-%d')} ({v[1]})" if v else "-"
 
+def resc_note_str(w):
+    """Catatan RESC (NOTE RESC) dari baris SCH Database terbaru; fallback ke COMMENT; '-' bila kosong."""
+    v = _sch_last.get(w)
+    if not v:
+        return "-"
+    _note = (v[3] if len(v) > 3 else "") or (v[2] if len(v) > 2 else "")
+    return _note if str(_note).strip() else "-"
+
 _ncmp_wells = (set(raw.loc[raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP"), "well"])
                if "sch_status" in raw.columns else set())
 
@@ -3323,7 +3336,8 @@ ncmp_replan, nocoord, off_wells = _E["ncmp_replan"], _E["nocoord"], _E["off_well
 # diperlakukan sebagai NCMP-carry, bukan Pure-Miss. Menutup kasus mis. PN058 (NCMP FACI 14 Okt
 # di luar periode 15-21). Hanya memengaruhi pelaporan (missed_carry), bukan optimasi yang sudah jalan.
 _in_raw_set = set(raw["well"])
-for _w, (_dt, _stt, _cmt) in _sch_last.items():
+for _w, _v in _sch_last.items():
+    _stt, _cmt = _v[1], _v[2]
     if _stt == "NCMP" and _w in _in_raw_set and _w not in ncmp_carry:
         _cc = carry_code(_cmt)
         if _cc:
@@ -5842,8 +5856,11 @@ with tab_matrix:
         ui.section("Daftar Pure-Miss Deadline (Kapasitas Penuh)", eyebrow="Butuh aksi manual/tambah shift")
         _pm = missed[["well", "unit", "subarea", "category", "urgency", "min_date", "max_date"]].copy()
         _pm["tes_terakhir_sch"] = _pm["well"].map(last_sch_str)
+        _pm["catatan_resc"] = _pm["well"].map(resc_note_str)
         st.dataframe(_pm.rename(columns={"min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}).sort_values("urgency"),
                      use_container_width=True, hide_index=True)
+        st.caption("Kolom **catatan_resc** = NOTE RESC (atau COMMENT IF NOT COMPLETE) dari baris SCH Database "
+                   "terbaru sumur. Sumur NCMP ber-RESC (bukan hambatan FACI/ROAD/WOFF) memang jatuh ke sini.")
 
         with st.expander("🔎 Review Miss Deadline vs SCH_Database — tandai COMP manual", expanded=False):
             _comp_review_panel(missed, key="rev_miss")
