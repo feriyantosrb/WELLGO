@@ -516,6 +516,29 @@ def unit_map_allow(df, umap):
     return [by_field.get(f) for f in fld]
 
 @st.cache_data(show_spinner=False)
+def load_wtr_last(file_bytes, sheet):
+    """Return {well: Timestamp} = TEST DATE terakhir per sumur dari sheet WTR (Well Test Report).
+    Tiap baris WTR = satu tes yang sudah dilakukan (ada laporannya)."""
+    if not sheet or not str(sheet).strip():
+        return {}
+    try:
+        df = _read_excel(BytesIO(file_bytes), sheet_name=str(sheet).strip())
+    except Exception:
+        return {}
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    cw = next((c for c in ("WELL", "WELL NAME", "WELL_NAME", "WELLNAME") if c in df.columns), None)
+    cd = next((c for c in ("TEST DATE", "TEST_DATE", "TESTDATE", "TGL TEST", "TANGGAL TEST") if c in df.columns), None)
+    if not (cw and cd):
+        return {}
+    out = df[[cw, cd]].copy()
+    out["_dt"] = pd.to_datetime(out[cd], errors="coerce")
+    out = out[out["_dt"].notna()]
+    if not len(out):
+        return {}
+    out[cw] = out[cw].astype(str).str.strip()
+    return out.groupby(cw)["_dt"].max().to_dict()
+
+@st.cache_data(show_spinner=False)
 def load_spatial_data(file_bytes, sheet):
     try:
         df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
@@ -2435,6 +2458,13 @@ with st.sidebar:
     with col_sh2: sheet_spasial = st.text_input("Sheet Spasial", "Data_Spasial")
     sheet_breakin = st.text_input("Sheet Break-In (NW/AWS/Req sisipan)", "BreakIn",
                                   help="Sumur sisipan tengah jadwal. Kosongkan jika tidak dipakai.")
+    sheet_wtr = st.text_input("Sheet WTR (Well Test Report)", "WTR",
+                              help="Opsional. Database hasil tes (kolom WELL + TEST DATE). Dipakai sebagai "
+                                   "sumber tambahan deteksi COMP bila SCH Database belum terupdate. Kosongkan jika tak dipakai.")
+    use_wtr = st.checkbox("Pakai WTR Database untuk deteksi COMP", value=True,
+                          help="Jika aktif, TEST DATE terbaru per sumur dari sheet WTR ikut jadi 'tes terakhir', "
+                               "sehingga sumur yang sudah dites (ada di WTR) dalam window-nya dianggap COMP walau "
+                               "SCH Database belum update.")
 
     mpas_only = st.checkbox("Hanya Unit Tes (MPAS), exclude TS", value=True)
 
@@ -3143,6 +3173,14 @@ if "last_wt" in raw.columns:
         if pd.notna(_lw2) and not _bad:
             _p = pd.Timestamp(_lw2)
             _last_test[_w2] = max(_last_test[_w2], _p) if _w2 in _last_test else _p
+# WTR (Well Test Report): tiap baris = tes selesai. TEST DATE terbaru per sumur ikut jadi
+# 'tes terakhir' (max), jadi sumur yang sudah dites di WTR dalam window-nya terdeteksi COMP
+# walau SCH Database belum update. Opsional (toggle sidebar).
+_wtr_last = load_wtr_last(up.getvalue(), sheet_wtr) if use_wtr else {}
+for _w3, _d3 in _wtr_last.items():
+    _p3 = pd.Timestamp(_d3)
+    if pd.notna(_p3):
+        _last_test[_w3] = max(_last_test[_w3], _p3) if _w3 in _last_test else _p3
 _minmap = dict(zip(raw["well"], raw["min_date"]))
 _maxmap = dict(zip(raw["well"], raw["max_date"]))
 
