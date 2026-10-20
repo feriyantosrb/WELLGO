@@ -683,10 +683,13 @@ def load_candidates(file_bytes, sheet):
     fm = df["forced_unit"].notna()
     df.loc[fm, "unit"] = df.loc[fm, "forced_unit"]
 
-    df["is_mpas"] = df["unit"].astype(str).str.upper().str.startswith("MPAS")
-    uu = df["unit"].astype(str).str.upper()
-    df["is_ts"] = uu.str.contains("TS", na=False) & ~df["is_mpas"]
-    df["unit_unknown"] = uu.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", ""]) | df["unit"].isna()
+    # Klasifikasi MPAS/TS/unknown dari unit EFEKTIF = last_unit_name hasil overlay sheet Status_Sumur
+    # (sudah dinormalkan di baris df["unit"]=norm_unit_name di atas, jadi "MP535"→"MPAS_535"). Status_Sumur
+    # adalah acuan: last_unit_name MPAS_xxx → MPAS, fasilitas *_TS → TS.
+    _u_cls = df["unit"].astype(str).str.upper().str.strip()
+    df["is_mpas"] = _u_cls.str.startswith("MPAS")
+    df["is_ts"] = _u_cls.str.contains("TS", na=False) & ~df["is_mpas"]
+    df["unit_unknown"] = _u_cls.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", "NONE", ""]) | df["unit"].isna()
 
     NWAWS = {"NEW WELL 1", "NEW WELL 2", "NEW WELL 3", "AWS1", "AWS2"}
     cat_u = df["category"].astype(str).str.upper().str.strip()
