@@ -3520,7 +3520,9 @@ if man:
         week_df.loc[m, "plan_day"] = days[max(0, min(len(days) - 1, di - 1 - day_offset))]  # di relatif periode
         week_df.loc[m, "manual"] = True
 
-man_un = st.session_state.get("manual_unassign", [])
+# manual_assign MENANG atas manual_unassign: sumur yang di-assign ulang (mis. lewat Rescue setelah
+# Preemption mengeluarkannya) jangan di-unassign lagi, supaya penempatan barunya bertahan.
+man_un = [w for w in st.session_state.get("manual_unassign", []) if w not in man]
 if man_un:
     m_un = week_df["well"].isin(man_un)
     week_df.loc[m_un, "scheduled"] = False
