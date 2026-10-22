@@ -2893,9 +2893,10 @@ with st.sidebar:
                 help="Batasi pull-forward ke sumur prioritas saja, supaya kapasitas tidak terkuras menarik "
                      "maju Reg C/D. Matikan untuk menarik maju semua kategori.")
 
-        _auto_submit = st.form_submit_button("🚀 Optimasi Tahap Lanjut (6 tahap)", type="secondary", use_container_width=True,
+        _auto_submit = st.form_submit_button("🚀 Optimasi Tahap Lanjut (7 tahap)", type="secondary", use_container_width=True,
                      help="Jalankan berurutan otomatis: 1) optimasi default, 2) Preemption, 3) Rescue + "
-                          "Re-optimasi, 4) Rescue Miss-Deadline, 5) Rescue Add Manual, 6) Grouping ulang "
+                          "Re-optimasi, 4) Rescue Miss-Deadline, 5) Rescue Add Manual, 6) Backfill Kapasitas "
+                          "(isi kursi sisa dgn sumur tertunda terdekat, boleh early), 7) Grouping ulang "
                           "kedekatan. Banner progres tampil tiap tahap. Hasil rescue sebelumnya direset; "
                           "assign manual Anda sendiri dipertahankan.")
         if _auto_submit:
@@ -2910,7 +2911,8 @@ with st.sidebar:
             st.session_state["manual_unassign"] = list(_un0)
             for _lk in ("preempt_wells", "preempt_bumped", "preempt_ran", "repair_wells", "repair_assign_keys",
                         "repair_moves", "repair_ran", "rescued_wells", "rescue_added_km", "rescue_skip_far",
-                        "rescue_late_early", "addman_added_wells", "addman_open_new"):
+                        "rescue_late_early", "addman_added_wells", "addman_open_new",
+                        "backfill_wells", "backfill_detail"):
                 st.session_state.pop(_lk, None)
             st.session_state["auto_pipe"] = 1
             st.rerun()
@@ -3559,34 +3561,35 @@ if man_un:
 _regroup_info = None
 if regroup_prox and mode == "pooled":
     _auto_placed = set()
-    for _mk in ("rescued_wells", "repair_wells", "preempt_wells", "addman_added_wells"):
+    for _mk in ("rescued_wells", "repair_wells", "preempt_wells", "addman_added_wells", "backfill_wells"):
         _auto_placed |= set(st.session_state.get(_mk, []) or [])
     week_df, _regroup_info = regroup_by_proximity(week_df, max_wells, extra_movable=_auto_placed)
     _ckpt("regroup_by_proximity")
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
-# ── Pipeline optimasi otomatis (6 tahap): banner progres + maju antar tahap ──
+# ── Pipeline optimasi otomatis (7 tahap): banner progres + maju antar tahap ──
 # auto_pipe: 1=optimasi default, 2=preemption, 3=rescue+re-optimasi, 4=rescue miss-deadline,
-# 5=rescue add manual, 6=grouping ulang kedekatan, 7=selesai. Tahap 2/3/4/5 dijalankan oleh blok
-# masing-masing di tab Cart Manual; tahap 6 (regroup) sudah berjalan di atas (lihat _auto).
+# 5=rescue add manual, 6=backfill kapasitas, 7=grouping ulang kedekatan, 8=selesai. Tahap 2..6
+# dijalankan oleh blok masing-masing di tab Cart Manual; tahap 7 (regroup) berjalan di atas (lihat _auto).
 _auto = st.session_state.get("auto_pipe", 0)
 if _auto:
-    _AL = {1: "Tahap 1/6 · Optimasi default", 2: "Tahap 2/6 · Preemption Prioritas",
-           3: "Tahap 3/6 · Rescue + Re-optimasi", 4: "Tahap 4/6 · Rescue Miss-Deadline",
-           5: "Tahap 5/6 · Rescue Add Manual", 6: "Tahap 6/6 · 🧲 Grouping ulang kedekatan"}
-    if _auto >= 7:
-        st.success("✅ Optimasi tahap lanjut (6 tahap) selesai.")
+    _AL = {1: "Tahap 1/7 · Optimasi default", 2: "Tahap 2/7 · Preemption Prioritas",
+           3: "Tahap 3/7 · Rescue + Re-optimasi", 4: "Tahap 4/7 · Rescue Miss-Deadline",
+           5: "Tahap 5/7 · Rescue Add Manual", 6: "Tahap 6/7 · 🪄 Backfill Kapasitas",
+           7: "Tahap 7/7 · 🧲 Grouping ulang kedekatan"}
+    if _auto >= 8:
+        st.success("✅ Optimasi tahap lanjut (7 tahap) selesai.")
         st.session_state["auto_pipe"] = 0
         _auto = 0
     else:
-        st.progress(min(_auto, 6) / 6.0,
+        st.progress(min(_auto, 7) / 7.0,
                     text=f"⏳ Optimasi otomatis berjalan… {_AL.get(_auto, '')} — mohon tunggu, jangan tutup/ubah halaman.")
         if _auto == 1:
             st.session_state["auto_pipe"] = 2
             st.rerun()
-        elif _auto == 6:   # regroup sudah dijalankan di atas pada pass ini → tandai selesai
-            st.session_state["auto_pipe"] = 7
+        elif _auto == 7:   # regroup sudah dijalankan di atas pada pass ini → tandai selesai
+            st.session_state["auto_pipe"] = 8
             st.rerun()
 
 # Muat geometri jalan HANYA untuk sumur terjadwal (yang akan digambar di peta), disaring dari
@@ -5368,9 +5371,99 @@ with tab_cart:
             st.success(f"✅ {len(_in)} dari {len(_am_added)} sumur Add Manual tersisipkan "
                        f"({_on} di antaranya membuka unit kosong). Yang belum muncul: semua unit-hari di zonanya penuh.")
 
-    # Stage-5 auto-pipe: tak ada sumur Add Manual tersisa / tak ada yang bisa ditempatkan → selesai.
+    # Stage-5 auto-pipe: tak ada sumur Add Manual tersisa / tak ada yang bisa ditempatkan → lanjut backfill.
     if _auto == 5 and st.session_state.get("auto_pipe", 0) == 5:
         st.session_state["auto_pipe"] = 6
+        st.rerun()
+
+    # ── 🪄 Backfill Kapasitas: isi kursi sisa trip AKTIF dgn sumur tertunda terdekat (early OK) ──
+    # Setelah Add Manual, masih ada unit-hari yang trip-nya jalan tapi belum penuh (mis. 1/6).
+    # Tahap ini menarik KANDIDAT YANG TERTUNDA (belum terjadwal) yang paling dekat ke rute trip itu
+    # untuk mengisi kursi kosong — boleh lebih awal dari window-nya (early) asalkan tercatat di log.
+    # Hanya mengisi trip yang SUDAH aktif (≥1 sumur); tidak membuka unit-hari baru.
+    st.divider()
+    ui.section("🪄 Backfill Kapasitas", eyebrow="Isi kursi sisa trip aktif dgn sumur tertunda terdekat (boleh early, tercatat)")
+    _bf_sched = set(scheduled_all["well"]) if len(scheduled_all) else set()
+    _bf_un = set(st.session_state.get("manual_unassign", []) or [])
+    _bf_added = st.session_state.get("backfill_wells", [])
+    _bf_pool = week_df.drop_duplicates("well").copy()
+    _bf_pool = _bf_pool[(~_bf_pool["well"].isin(_bf_sched | _bf_un))
+                        & _bf_pool["has_coord"].fillna(True) & _bf_pool["lat"].notna()]
+    if woff_set: _bf_pool = _bf_pool[~_bf_pool["well"].isin(woff_set)]
+    # Kursi sisa HANYA pada trip aktif (punya titik rute). Map day_idx→tanggal utk tandai early.
+    _bf_room, _bf_rtp, _bf_daydate = {}, {}, {}
+    for _, _r in scheduled_all.iterrows():
+        _k = (_r["plan_unit"], int(_r["day_idx"]))
+        _bf_room[_k] = _bf_room.get(_k, max_wells) - 1
+        _bf_daydate.setdefault(int(_r["day_idx"]), _r.get("plan_day"))
+        if bool(_r.get("has_coord", True)) and pd.notna(_r.get("lat")):
+            _bf_rtp.setdefault(_k, []).append((float(_r["lat"]), float(_r["lon"])))
+    _bf_seats = sum(max(0, v) for k, v in _bf_room.items() if k in _bf_rtp)
+    _bf_cap = st.slider("Batas jarak tarik ke rute trip (km)", 2, 50, 10, key="backfill_cap")
+    st.caption(f"**{len(_bf_pool)}** sumur tertunda (belum terjadwal, berkoordinat) · **{_bf_seats}** kursi "
+               "sisa pada trip aktif. Tombol menarik sumur terdekat ke tiap kursi (≤ batas), boleh lebih awal "
+               "dari window-nya (tercatat di log). Unit-hari kosong tidak dibuka. Zona & mapping dihormati.")
+    _bfc1, _bfc2 = st.columns(2)
+    _do_backfill = _bfc1.button("🪄 Jalankan Backfill Kapasitas", type="primary",
+                                disabled=(not len(_bf_pool) or _bf_seats <= 0), key="btn_backfill")
+    _do_bf_cancel = _bfc2.button("↩️ Batal", disabled=(not _bf_added), key="btn_backfill_cancel")
+    if _do_bf_cancel:
+        _as = dict(st.session_state.get("manual_assign", {}))
+        for _w in _bf_added: _as.pop(_w, None)
+        st.session_state["manual_assign"] = _as
+        st.session_state["backfill_wells"] = []
+        st.session_state.pop("backfill_detail", None)
+        st.rerun()
+    if (_do_backfill or _auto == 6) and len(_bf_pool) and _bf_seats > 0:
+        _act_rem_bf = list(REMOTE_UNITS)[:n_remote]; _act_non_bf = list(NONREMOTE_UNITS)[:n_nonremote]
+        _mind = _bf_pool.set_index("well")["min_date"].to_dict() if "min_date" in _bf_pool.columns else {}
+        # Pasangan (jarak, well, unit, hari) HANYA ke kursi trip aktif yg eligible → isi terdekat dulu.
+        _pairs = []
+        for _, _w in _bf_pool.iterrows():
+            _wn = _w["well"]; _wlat = float(_w["lat"]); _wlon = float(_w["lon"])
+            _allow = _w.get("allow_units")
+            if _allow:
+                _elig = [u for u in (_act_rem_bf + _act_non_bf) if u in _allow]
+            else:
+                _elig = _act_rem_bf if str(_w.get("area", "")).upper() in REMOTE_AREAS else _act_non_bf
+            for _k, _pts in _bf_rtp.items():
+                _u, _d = _k
+                if _u not in _elig or _bf_room.get(_k, 0) <= 0: continue
+                _dist = road_min_to_pts(_wlat, _wlon, _pts)
+                if _dist <= _bf_cap:
+                    _pairs.append((_dist, _wn, _u, int(_d), _wlat, _wlon))
+        _pairs.sort(key=lambda t: t[0])
+        _as = dict(st.session_state.get("manual_assign", {}))
+        _placed, _detail, _taken = [], [], set()
+        for _dist, _wn, _u, _d, _wlat, _wlon in _pairs:
+            if _wn in _taken or _bf_room.get((_u, _d), 0) <= 0: continue
+            _as[_wn] = {"unit": _u, "day_idx": int(_d)}
+            _bf_room[(_u, _d)] -= 1
+            _bf_rtp[(_u, _d)].append((_wlat, _wlon))
+            _taken.add(_wn); _placed.append(_wn)
+            _ddate = _bf_daydate.get(_d); _mn = _mind.get(_wn)
+            _early = bool(pd.notna(_mn) and pd.notna(_ddate) and pd.Timestamp(_mn) > pd.Timestamp(_ddate))
+            _detail.append({"Well": _wn, "Unit": _u, "Hari": f"Hari {_d}",
+                            "Tanggal": (pd.Timestamp(_ddate).strftime("%Y-%m-%d") if pd.notna(_ddate) else "-"),
+                            "Window Min": (pd.Timestamp(_mn).strftime("%Y-%m-%d") if pd.notna(_mn) else "-"),
+                            "Early": "ya" if _early else "-", "Jarak (km)": round(_dist, 2)})
+        st.session_state["manual_assign"] = _as
+        st.session_state["backfill_wells"] = _placed
+        st.session_state["backfill_detail"] = _detail
+        if _auto == 6: st.session_state["auto_pipe"] = 7
+        st.rerun()
+    if _bf_added:
+        _in = [w for w in _bf_added if w in _bf_sched]
+        _det = st.session_state.get("backfill_detail", [])
+        _ne = sum(1 for d in _det if d.get("Early") == "ya")
+        st.success(f"✅ {len(_in)} dari {len(_bf_added)} sumur tertunda ditarik mengisi kursi sisa "
+                   f"({_ne} di antaranya dijadwalkan lebih awal / early). Rincian di tabel bawah.")
+        if _det:
+            st.dataframe(pd.DataFrame(_det), use_container_width=True, hide_index=True)
+
+    # Stage-6 auto-pipe: tak ada kursi/sumur untuk backfill → lanjut ke grouping ulang (tahap 7).
+    if _auto == 6 and st.session_state.get("auto_pipe", 0) == 6:
+        st.session_state["auto_pipe"] = 7
         st.rerun()
 
     st.divider()
