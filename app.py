@@ -2912,7 +2912,7 @@ with st.sidebar:
             for _lk in ("preempt_wells", "preempt_bumped", "preempt_ran", "repair_wells", "repair_assign_keys",
                         "repair_moves", "repair_ran", "rescued_wells", "rescue_added_km", "rescue_skip_far",
                         "rescue_late_early", "addman_added_wells", "addman_open_new",
-                        "backfill_wells", "backfill_detail"):
+                        "backfill_wells", "backfill_detail", "backfill_open_new"):
                 st.session_state.pop(_lk, None)
             st.session_state["auto_pipe"] = 1
             st.rerun()
@@ -5390,7 +5390,7 @@ with tab_cart:
     _bf_pool = _bf_pool[(~_bf_pool["well"].isin(_bf_sched | _bf_un))
                         & _bf_pool["has_coord"].fillna(True) & _bf_pool["lat"].notna()]
     if woff_set: _bf_pool = _bf_pool[~_bf_pool["well"].isin(woff_set)]
-    # Kursi sisa HANYA pada trip aktif (punya titik rute). Map day_idx→tanggal utk tandai early.
+    # Kursi sisa pada trip aktif + unit-hari kosong (boleh dibuka). Map day_idx→tanggal utk tandai early.
     _bf_room, _bf_rtp, _bf_daydate = {}, {}, {}
     for _, _r in scheduled_all.iterrows():
         _k = (_r["plan_unit"], int(_r["day_idx"]))
@@ -5398,66 +5398,86 @@ with tab_cart:
         _bf_daydate.setdefault(int(_r["day_idx"]), _r.get("plan_day"))
         if bool(_r.get("has_coord", True)) and pd.notna(_r.get("lat")):
             _bf_rtp.setdefault(_k, []).append((float(_r["lat"]), float(_r["lon"])))
+    for _d in day_nums:   # lengkapi tanggal utk unit-hari yg mungkin dibuka (belum ada di jadwal)
+        if int(_d) not in _bf_daydate:
+            _i = int(_d) - 1 - day_offset
+            _bf_daydate[int(_d)] = days[_i] if 0 <= _i < len(days) else None
     _bf_seats = sum(max(0, v) for k, v in _bf_room.items() if k in _bf_rtp)
-    _bf_cap = st.slider("Batas jarak tarik ke rute trip (km)", 2, 50, 10, key="backfill_cap")
+    _bf_cap = st.slider("Batas jarak tarik ke rute trip (km)", 2, 50, 7, key="backfill_cap")
     st.caption(f"**{len(_bf_pool)}** sumur tertunda (belum terjadwal, berkoordinat) · **{_bf_seats}** kursi "
-               "sisa pada trip aktif. Tombol menarik sumur terdekat ke tiap kursi (≤ batas), boleh lebih awal "
-               "dari window-nya (tercatat di log). Unit-hari kosong tidak dibuka. Zona & mapping dihormati.")
+               "sisa pada trip aktif. Tombol menarik sumur terdekat ke rute trip (≤ batas); bila tak ada trip "
+               "dekat, unit-hari kosong boleh dibuka. Boleh lebih awal dari window-nya (tercatat di log). "
+               "Zona & mapping dihormati.")
     _bfc1, _bfc2 = st.columns(2)
     _do_backfill = _bfc1.button("🪄 Jalankan Backfill Kapasitas", type="primary",
-                                disabled=(not len(_bf_pool) or _bf_seats <= 0), key="btn_backfill")
+                                disabled=(not len(_bf_pool)), key="btn_backfill")
     _do_bf_cancel = _bfc2.button("↩️ Batal", disabled=(not _bf_added), key="btn_backfill_cancel")
     if _do_bf_cancel:
         _as = dict(st.session_state.get("manual_assign", {}))
         for _w in _bf_added: _as.pop(_w, None)
         st.session_state["manual_assign"] = _as
         st.session_state["backfill_wells"] = []
-        st.session_state.pop("backfill_detail", None)
+        for _bk in ("backfill_detail", "backfill_open_new"):
+            st.session_state.pop(_bk, None)
         st.rerun()
-    if (_do_backfill or _auto == 6) and len(_bf_pool) and _bf_seats > 0:
+    if (_do_backfill or _auto == 6) and len(_bf_pool):
         _act_rem_bf = list(REMOTE_UNITS)[:n_remote]; _act_non_bf = list(NONREMOTE_UNITS)[:n_nonremote]
         _mind = _bf_pool.set_index("well")["min_date"].to_dict() if "min_date" in _bf_pool.columns else {}
-        # Pasangan (jarak, well, unit, hari) HANYA ke kursi trip aktif yg eligible → isi terdekat dulu.
-        _pairs = []
-        for _, _w in _bf_pool.iterrows():
+        def _room_of(_k): return _bf_room.get(_k, max_wells)
+        # urut: paling mendesak dulu (urgency kecil = deadline dekat), lalu BOPD besar
+        _sort_df = _bf_pool.copy()
+        _sort_df["_urg"] = pd.to_numeric(_sort_df.get("urgency"), errors="coerce").fillna(10**9)
+        _sort_df["_bo"] = pd.to_numeric(_sort_df.get("bopd"), errors="coerce").fillna(-1)
+        _sort_df = _sort_df.sort_values(["_urg", "_bo"], ascending=[True, False])
+        _as = dict(st.session_state.get("manual_assign", {}))
+        _placed, _detail, _open_new = [], [], 0
+        for _, _w in _sort_df.iterrows():
             _wn = _w["well"]; _wlat = float(_w["lat"]); _wlon = float(_w["lon"])
             _allow = _w.get("allow_units")
             if _allow:
                 _elig = [u for u in (_act_rem_bf + _act_non_bf) if u in _allow]
             else:
                 _elig = _act_rem_bf if str(_w.get("area", "")).upper() in REMOTE_AREAS else _act_non_bf
-            for _k, _pts in _bf_rtp.items():
-                _u, _d = _k
-                if _u not in _elig or _bf_room.get(_k, 0) <= 0: continue
-                _dist = road_min_to_pts(_wlat, _wlon, _pts)
-                if _dist <= _bf_cap:
-                    _pairs.append((_dist, _wn, _u, int(_d), _wlat, _wlon))
-        _pairs.sort(key=lambda t: t[0])
-        _as = dict(st.session_state.get("manual_assign", {}))
-        _placed, _detail, _taken = [], [], set()
-        for _dist, _wn, _u, _d, _wlat, _wlon in _pairs:
-            if _wn in _taken or _bf_room.get((_u, _d), 0) <= 0: continue
-            _as[_wn] = {"unit": _u, "day_idx": int(_d)}
-            _bf_room[(_u, _d)] -= 1
-            _bf_rtp[(_u, _d)].append((_wlat, _wlon))
-            _taken.add(_wn); _placed.append(_wn)
-            _ddate = _bf_daydate.get(_d); _mn = _mind.get(_wn)
+            _best = None  # (is_empty, dist, unit, day) — trip aktif terdekat diutamakan, lalu buka unit kosong
+            for _d in day_nums:
+                for _u in _elig:
+                    _k = (_u, int(_d))
+                    if _room_of(_k) <= 0: continue
+                    _pts = _bf_rtp.get(_k)
+                    if _pts:
+                        _dist = road_min_to_pts(_wlat, _wlon, _pts)
+                        if _dist > _bf_cap: continue
+                        _cand = (0, _dist, _u, int(_d))
+                    else:
+                        _cand = (1, 0.0, _u, int(_d))   # unit-hari kosong → boleh dibuka
+                    if _best is None or _cand[:2] < _best[:2]:
+                        _best = _cand
+            if _best is None: continue
+            _iemp, _dd, _bu, _bd = _best
+            _as[_wn] = {"unit": _bu, "day_idx": int(_bd)}
+            _bf_room[(_bu, _bd)] = _room_of((_bu, _bd)) - 1
+            _bf_rtp.setdefault((_bu, _bd), []).append((_wlat, _wlon))
+            _open_new += _iemp; _placed.append(_wn)
+            _ddate = _bf_daydate.get(_bd); _mn = _mind.get(_wn)
             _early = bool(pd.notna(_mn) and pd.notna(_ddate) and pd.Timestamp(_mn) > pd.Timestamp(_ddate))
-            _detail.append({"Well": _wn, "Unit": _u, "Hari": f"Hari {_d}",
+            _detail.append({"Well": _wn, "Unit": _bu, "Hari": f"Hari {_bd}",
                             "Tanggal": (pd.Timestamp(_ddate).strftime("%Y-%m-%d") if pd.notna(_ddate) else "-"),
                             "Window Min": (pd.Timestamp(_mn).strftime("%Y-%m-%d") if pd.notna(_mn) else "-"),
-                            "Early": "ya" if _early else "-", "Jarak (km)": round(_dist, 2)})
+                            "Early": "ya" if _early else "-", "Unit Baru": "ya" if _iemp else "-",
+                            "Jarak (km)": round(_dd, 2)})
         st.session_state["manual_assign"] = _as
         st.session_state["backfill_wells"] = _placed
         st.session_state["backfill_detail"] = _detail
+        st.session_state["backfill_open_new"] = _open_new
         if _auto == 6: st.session_state["auto_pipe"] = 7
         st.rerun()
     if _bf_added:
         _in = [w for w in _bf_added if w in _bf_sched]
         _det = st.session_state.get("backfill_detail", [])
         _ne = sum(1 for d in _det if d.get("Early") == "ya")
-        st.success(f"✅ {len(_in)} dari {len(_bf_added)} sumur tertunda ditarik mengisi kursi sisa "
-                   f"({_ne} di antaranya dijadwalkan lebih awal / early). Rincian di tabel bawah.")
+        _on = st.session_state.get("backfill_open_new", 0)
+        st.success(f"✅ {len(_in)} dari {len(_bf_added)} sumur tertunda ditarik mengisi kapasitas "
+                   f"({_ne} dijadwalkan lebih awal/early, {_on} membuka unit-hari baru). Rincian di tabel bawah.")
         if _det:
             st.dataframe(pd.DataFrame(_det), use_container_width=True, hide_index=True)
 
