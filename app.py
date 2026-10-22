@@ -1861,10 +1861,16 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
 # Fungsi ini menyusun ULANG keanggotaan itu murni dari kedekatan geografis, TANPA
 # mengubah hari, jumlah unit, maupun daftar sumur yang terjadwal — jadi kepatuhan
 # deadline hasil run sebelumnya tetap utuh, yang berubah hanya siapa berangkat bersama siapa.
-def regroup_by_proximity(wk, max_wells, iters=8):
+def regroup_by_proximity(wk, max_wells, iters=8, cap_slack=1, extra_movable=None):
     """Return (week_df_baru, info). Bekerja per (hari, zona); klaster yang tak bisa
-    disusun ulang tanpa melanggar batasan dibiarkan apa adanya."""
+    disusun ulang tanpa melanggar batasan dibiarkan apa adanya.
+    cap_slack: kelonggaran kapasitas SAAT regroup saja (default +1 → satu unit boleh
+    sampai max_wells+1). Berguna supaya sumur yang paling dekat ke unit yang kebetulan
+    sudah penuh tetap bisa ikut unit itu, menghindari rute saling menyilang antar unit.
+    Gerbang anti-boros tetap menolak perubahan yang menambah total km, jadi slack hanya
+    dipakai bila benar-benar merapatkan rute."""
     wk = wk.copy()
+    cap = int(max_wells) + max(0, int(cap_slack))
     info = {"grup": 0, "pindah": 0, "km_awal": 0.0, "km_akhir": 0.0, "gagal": 0, "tak_untung": 0}
     if not len(wk) or "plan_unit" not in wk.columns:
         return wk, info
@@ -1873,6 +1879,10 @@ def regroup_by_proximity(wk, max_wells, iters=8):
     lon = pd.to_numeric(wk.get("lon"), errors="coerce")
     coord_ok = lat.notna() & lon.notna()
     manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
+    # Sumur hasil auto-rescue/addman ditandai manual=True, tapi boleh ikut disusun ulang supaya
+    # tidak mengunci rute menyilang. Assign manual MURNI oleh user (tak masuk daftar ini) tetap beku.
+    _mov = set(extra_movable or ())
+    _well_s = wk["well"] if "well" in wk.columns else pd.Series(index=wk.index, dtype=str)
     urg = pd.to_numeric(wk.get("urgency"), errors="coerce").fillna(0)
 
     def boleh(i, u):
@@ -1904,7 +1914,7 @@ def regroup_by_proximity(wk, max_wells, iters=8):
         awal = {u: [i for i in idxs if wk.at[i, "plan_unit"] == u] for u in units}
         _km_awal_blok = sum(km_of(v) for v in awal.values())
         info["km_awal"] += _km_awal_blok
-        bebas = [i for i in idxs if coord_ok[i] and not manual[i]]
+        bebas = [i for i in idxs if coord_ok[i] and (not manual[i] or _well_s.get(i) in _mov)]
         _bebas_set = set(bebas)
         # Apakah susunan ASLI sudah sah? (tiap sumur bebas ada di unit yang boleh).
         # Kalau TIDAK sah (mis. forced_unit/mapping dilanggar), penyusunan ulang WAJIB
@@ -1924,7 +1934,7 @@ def regroup_by_proximity(wk, max_wells, iters=8):
                 pusat[u] = (lat.loc[ok].mean(), lon.loc[ok].mean()) if ok else (np.nan, np.nan)
 
             baru = {u: list(tetap[u]) for u in units}
-            sisa = {u: int(max_wells) - len(baru[u]) for u in units}
+            sisa = {u: cap - len(baru[u]) for u in units}
             belum = set(bebas)
 
             # (a) sumur paling terkekang lebih dulu. Sumur ber-forced_unit atau ber-mapping
@@ -2568,10 +2578,12 @@ with st.sidebar:
     if _fc1.button(f"Paksa ON semua ({len(_nwaws_all)})", disabled=(not _nwaws_all),
                    use_container_width=True, key="sb_force_all"):
         st.session_state["force_on_nwaws"] = _nwaws_all
+        st.session_state["force_on_ms"] = list(_nwaws_all)   # samakan state multiselect tab → tak ter-reset balik OFF
         st.rerun()
     if _fc2.button("Reset", disabled=(not st.session_state.get("force_on_nwaws")),
                    use_container_width=True, key="sb_force_reset"):
         st.session_state["force_on_nwaws"] = []
+        st.session_state["force_on_ms"] = []
         st.rerun()
     st.caption("Paksa semua sumur NW/AWS berstatus OFF agar masuk eligible. Pilih per sumur "
                "ada di tab Prioritas & Status Khusus.")
@@ -2881,10 +2893,11 @@ with st.sidebar:
                 help="Batasi pull-forward ke sumur prioritas saja, supaya kapasitas tidak terkuras menarik "
                      "maju Reg C/D. Matikan untuk menarik maju semua kategori.")
 
-        _auto_submit = st.form_submit_button("🚀 Optimasi Tahap Lanjut (5 tahap)", type="secondary", use_container_width=True,
+        _auto_submit = st.form_submit_button("🚀 Optimasi Tahap Lanjut (6 tahap)", type="secondary", use_container_width=True,
                      help="Jalankan berurutan otomatis: 1) optimasi default, 2) Preemption, 3) Rescue + "
-                          "Re-optimasi, 4) Rescue Miss-Deadline, 5) Rescue Add Manual. Banner progres tampil tiap "
-                          "tahap. Hasil rescue sebelumnya direset; assign manual Anda sendiri dipertahankan.")
+                          "Re-optimasi, 4) Rescue Miss-Deadline, 5) Rescue Add Manual, 6) Grouping ulang "
+                          "kedekatan. Banner progres tampil tiap tahap. Hasil rescue sebelumnya direset; "
+                          "assign manual Anda sendiri dipertahankan.")
         if _auto_submit:
             _ma0 = dict(st.session_state.get("manual_assign", {}))
             for _lk in ("preempt_wells", "repair_wells", "rescued_wells"):
@@ -3545,28 +3558,35 @@ if man_un:
 # disusun ulang benar-benar jadwal yang akan dipakai.
 _regroup_info = None
 if regroup_prox and mode == "pooled":
-    week_df, _regroup_info = regroup_by_proximity(week_df, max_wells)
+    _auto_placed = set()
+    for _mk in ("rescued_wells", "repair_wells", "preempt_wells", "addman_added_wells"):
+        _auto_placed |= set(st.session_state.get(_mk, []) or [])
+    week_df, _regroup_info = regroup_by_proximity(week_df, max_wells, extra_movable=_auto_placed)
     _ckpt("regroup_by_proximity")
 
 scheduled_all = week_df[week_df["scheduled"]].copy()
 
-# ── Pipeline optimasi otomatis (4 tahap): banner progres + maju antar tahap ──
+# ── Pipeline optimasi otomatis (6 tahap): banner progres + maju antar tahap ──
 # auto_pipe: 1=optimasi default, 2=preemption, 3=rescue+re-optimasi, 4=rescue miss-deadline,
-# 5=rescue add manual, 6=selesai. Tahap 2/3/4/5 dijalankan oleh blok masing-masing di tab Cart Manual (lihat _auto).
+# 5=rescue add manual, 6=grouping ulang kedekatan, 7=selesai. Tahap 2/3/4/5 dijalankan oleh blok
+# masing-masing di tab Cart Manual; tahap 6 (regroup) sudah berjalan di atas (lihat _auto).
 _auto = st.session_state.get("auto_pipe", 0)
 if _auto:
-    _AL = {1: "Tahap 1/5 · Optimasi default", 2: "Tahap 2/5 · Preemption Prioritas",
-           3: "Tahap 3/5 · Rescue + Re-optimasi", 4: "Tahap 4/5 · Rescue Miss-Deadline",
-           5: "Tahap 5/5 · Rescue Add Manual"}
-    if _auto >= 6:
-        st.success("✅ Optimasi tahap lanjut (5 tahap) selesai.")
+    _AL = {1: "Tahap 1/6 · Optimasi default", 2: "Tahap 2/6 · Preemption Prioritas",
+           3: "Tahap 3/6 · Rescue + Re-optimasi", 4: "Tahap 4/6 · Rescue Miss-Deadline",
+           5: "Tahap 5/6 · Rescue Add Manual", 6: "Tahap 6/6 · 🧲 Grouping ulang kedekatan"}
+    if _auto >= 7:
+        st.success("✅ Optimasi tahap lanjut (6 tahap) selesai.")
         st.session_state["auto_pipe"] = 0
         _auto = 0
     else:
-        st.progress(min(_auto, 5) / 5.0,
+        st.progress(min(_auto, 6) / 6.0,
                     text=f"⏳ Optimasi otomatis berjalan… {_AL.get(_auto, '')} — mohon tunggu, jangan tutup/ubah halaman.")
         if _auto == 1:
             st.session_state["auto_pipe"] = 2
+            st.rerun()
+        elif _auto == 6:   # regroup sudah dijalankan di atas pada pass ini → tandai selesai
+            st.session_state["auto_pipe"] = 7
             st.rerun()
 
 # Muat geometri jalan HANYA untuk sumur terjadwal (yang akan digambar di peta), disaring dari
@@ -6138,13 +6158,19 @@ with tab_priority:
         st.caption("Status ON/OFF di Excel kemungkinan **belum terupdate**. Pilih sumur **NW/AWS** yang sebenarnya "
                    "sudah ON agar di-override jadi eligible & dijadwalkan untuk siklus ini "
                    "(tetap tunduk pada window min–max-nya).")
-        _lbl = {f"{r['well']}  —  {r['tipe']} ({_fv(r['category'])}) / {_fv(r['field'])}": r['well']
+        _fmt = {r['well']: f"{r['well']}  —  {r['tipe']} ({_fv(r['category'])}) / {_fv(r['field'])}"
                 for _, r in nwaws_off_pool.sort_values(["tipe", "well"]).iterrows()}
-        _cur = [l for l, w in _lbl.items() if w in force_on]
-        _pick = st.multiselect("Sumur NW/AWS OFF → paksa ON:", list(_lbl.keys()), default=_cur, key="force_on_ms")
-        _picked = [_lbl[l] for l in _pick]
+        _names = list(_fmt.keys())
+        # Opsi = nama sumur (bukan label), jadi state widget == force_on_nwaws. Tombol sidebar
+        # menulis key "force_on_ms" juga, sehingga pilihan tidak ter-reset balik ke OFF oleh
+        # widget yang menyimpan state lama. Disaring ke opsi valid supaya tak crash saat data ganti.
+        _seed = (st.session_state["force_on_ms"] if "force_on_ms" in st.session_state
+                 else [w for w in _names if w in force_on])
+        st.session_state["force_on_ms"] = [w for w in _seed if w in _names]
+        _picked = st.multiselect("Sumur NW/AWS OFF → paksa ON:", _names,
+                                 format_func=lambda w: _fmt.get(w, w), key="force_on_ms")
         if set(_picked) != force_on:
-            st.session_state["force_on_nwaws"] = _picked
+            st.session_state["force_on_nwaws"] = list(_picked)
             st.rerun()
         if force_on:
             st.caption(f"✅ **{len(force_on)}** sumur NW/AWS dipaksa ON & masuk eligible: {', '.join(sorted(force_on))}.")
