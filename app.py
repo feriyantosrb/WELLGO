@@ -3193,6 +3193,43 @@ if len(_aws):
         for _c in _dtc:  # concat bisa merusak dtype datetime → paksa balik
             raw[_c] = pd.to_datetime(raw[_c], errors="coerce")
 
+# ── NW tiga-fase: auto-transisi NW1→NW2→NW3 (default nyala, mirror AWS) ──────
+# Sama seperti AWS: bukti fase HANYA dari SIKLUS BERJALAN (tanggal COMP >= POP / min_date),
+# jadi COMP siklus lampau tak menaikkan fase. Tiap COMP di siklus ini menaikkan 1 fase dari
+# fase baseline (label Excel). Window fase lanjut dihitung dari tanggal tes fase SEBELUMNYA
+# (anchor = COMP terbaru siklus ini) +10..+15, ditegaskan lagi oleh blok "Window fase lanjutan".
+# 3 fase tuntas → nw_done (executed). Tak bergantung kolom last_wt Excel (pakai bukti SCH).
+nw_done, nw_active = set(), {}
+_nw = raw[raw["tipe"] == "NW"].drop_duplicates("well")
+if len(_nw):
+    _bcol_n = "base_well" if "base_well" in _nw.columns else "well"
+    _recsN = comp_records(set(_nw[_bcol_n]))
+    _has_pop_n = "pop_date" in raw.columns
+    for _, _w in _nw.iterrows():
+        _wn = _w["well"]; _bwn = _w.get(_bcol_n, _wn)
+        recs = _recsN.get(_bwn, [])
+        _c0 = str(_w.get("category", "")).upper().replace("-", " ").replace("_", " ")
+        _m0 = re.search(r"NEW WELL\s*([123])", _c0)
+        p0 = int(_m0.group(1)) if _m0 else 1               # fase baseline dari label Excel
+        pop = _w["pop_date"] if _has_pop_n else pd.NaT
+        _cyc = (pd.Timestamp(pop).normalize() if pd.notna(pop)
+                else (pd.Timestamp(_w["min_date"]).normalize() if pd.notna(_w.get("min_date")) else None))
+        ds = sorted(pd.Timestamp(d).normalize() for d, _r in recs if pd.notna(d))
+        if _cyc is not None:
+            ds = [d for d in ds if d >= _cyc]
+        n_comp = len(ds)
+        if n_comp == 0:
+            continue                                       # belum ada tes siklus ini → fase/window Excel
+        p = p0 + n_comp
+        if p > 3:
+            nw_done.add(_wn)                               # NW1+NW2+NW3 tuntas → selesai
+        else:
+            nw_active[_wn] = (p, max(ds))                  # naik fase; anchor = tes fase sebelumnya
+    for _wn, (_p, _anch) in nw_active.items():
+        _m = raw["well"] == _wn
+        raw.loc[_m, "category"] = f"NEW WELL {_p}"
+        raw.loc[_m, "last_wt"] = _anch                     # jangkar fase berjalan → window dihitung di blok bawah
+
 # ── Window fase lanjutan dari kolom last_wt_date (tanggal test fase SEBELUMNYA) ──
 # AWS2       : min = last_wt + 5,  max = last_wt + 10   (last_wt = test date AWS1)
 # NEW WELL 2 : min = last_wt + 10, max = last_wt + 15   (last_wt = test date NW1)
@@ -3323,16 +3360,17 @@ def comp_masih_berlaku(w):
         return False
     return True
 
-_comp_col_raw, _aws_done_raw = set(comp_col), set(aws_done)
+_comp_col_raw, _aws_done_raw, _nw_done_raw = set(comp_col), set(aws_done), set(nw_done)
 comp_col = {w for w in comp_col if comp_masih_berlaku(w)}
 aws_done = {w for w in aws_done if comp_masih_berlaku(w)}
-comp_expired = (_comp_col_raw - comp_col) | (_aws_done_raw - aws_done)
+nw_done = {w for w in nw_done if comp_masih_berlaku(w)}
+comp_expired = (_comp_col_raw - comp_col) | (_aws_done_raw - aws_done) | (_nw_done_raw - nw_done)
 
-executed = (executed_log | comp_col | manual_comp | aws_done) - set(aws_active.keys())
+executed = (executed_log | comp_col | manual_comp | aws_done | nw_done) - set(aws_active.keys()) - set(nw_active.keys())
 # COMP utk DASHBOARD = period-scoped (executed_log sudah difilter periode) + kolom SCH + manual.
 # aws_done SENGAJA tidak ikut di sini: itu AWS yang kelar lintas-periode (cukup utk exclude jadwal,
 # tapi jangan inflate Status Realisasi periode ini). AWS yg COMP di periode ini tetap kebawa via executed_log.
-comp_disp_set = (executed_log | comp_col | manual_comp) - set(aws_active.keys())
+comp_disp_set = (executed_log | comp_col | manual_comp) - set(aws_active.keys()) - set(nw_active.keys())
 
 # COMP TERSIRAT: sumur yang BELUM ditandai COMP (tak ada di executed) tapi tes terakhirnya
 # (riwayat/last_wt, TIDAK di-period-scope) jatuh DI DALAM window [min, max]-nya → kewajiban tes
@@ -6267,6 +6305,46 @@ with tab_export:
         st.info("Belum ada rute terjadwal untuk peta HTML.")
 
 with tab_priority:
+    # ── Transisi Fase AWS & NW (auto-deteksi, default nyala) ────────────────
+    ui.section("🔁 Transisi Fase AWS & NW", eyebrow="AWS1→AWS2 & NW1→NW2→NW3 — fase berjalan, window, & bukti COMP")
+    _phw = raw[raw["tipe"].isin(["AWS", "NW"])].drop_duplicates("well") if "tipe" in raw.columns else raw.iloc[0:0]
+    if not len(_phw):
+        st.caption("Tidak ada sumur AWS / NW pada data periode ini.")
+    else:
+        _dfmt = lambda x: pd.Timestamp(x).strftime("%Y-%m-%d") if pd.notna(x) else "-"
+        _bcolp = "base_well" if "base_well" in _phw.columns else "well"
+        _recsP = comp_records(set(_phw[_bcolp]))
+        _has_pop_p = "pop_date" in _phw.columns
+        _prows = []
+        for _, _w in _phw.iterrows():
+            _wn = _w["well"]; _bwn = _w.get(_bcolp, _wn); _tp = _w["tipe"]
+            recs = _recsP.get(_bwn, [])
+            pop = _w.get("pop_date") if _has_pop_p else pd.NaT
+            _cyc = (pd.Timestamp(pop).normalize() if pd.notna(pop)
+                    else (pd.Timestamp(_w["min_date"]).normalize() if pd.notna(_w.get("min_date")) else None))
+            ds = sorted(pd.Timestamp(d).normalize() for d, _r in recs if pd.notna(d))
+            if _cyc is not None:
+                ds = [d for d in ds if d >= _cyc]
+            if _wn in aws_done or _wn in nw_done:
+                _stat = "✅ Selesai (semua fase COMP)"
+            elif _wn in aws_active:
+                _stat = f"🔄 Naik ke {aws_active[_wn][0]}"
+            elif _wn in nw_active:
+                _stat = f"🔄 Naik ke NW{nw_active[_wn][0]}"
+            else:
+                _stat = "⏳ Fase awal (belum ada tes siklus ini)"
+            _prows.append({
+                "Well": _bwn, "Tipe": _tp, "Fase Sekarang": _fv(_w.get("category")), "Status Transisi": _stat,
+                "POP Date": _dfmt(pop), "Tes Terakhir (siklus)": _dfmt(max(ds)) if ds else "-",
+                "COMP siklus": len(ds), "Window Min": _dfmt(_w.get("min_date")), "Window Max": _dfmt(_w.get("max_date")),
+            })
+        st.dataframe(pd.DataFrame(_prows).sort_values(["Tipe", "Well"]), use_container_width=True, hide_index=True)
+        st.caption("Auto-deteksi default nyala. **AWS**: AWS1 (POP+1..+3) → AWS2 (tes AWS1 +5..+10); 1 COMP siklus "
+                   "menaikkan ke AWS2, 2 COMP = selesai. **NW**: tiap COMP siklus menaikkan 1 fase (NW1→NW2→NW3); "
+                   "window NW2/NW3 = tes fase sebelumnya +10..+15, 3 fase = selesai. Bukti COMP dihitung hanya dari "
+                   "siklus berjalan (tanggal tes ≥ POP / awal window).")
+
+    st.divider()
     # ── Sumur Prioritas: NW / AWS / PRQ / ORQ ──────────────────────────────
     ui.section("Sumur Prioritas (NW / AWS / PRQ / ORQ)", eyebrow="Pantau kategori prioritas, fase AWS, & window")
     _rt_raw = raw["req_tag"].fillna("") if "req_tag" in raw.columns else pd.Series("", index=raw.index)
