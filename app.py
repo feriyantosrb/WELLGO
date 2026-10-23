@@ -707,6 +707,9 @@ def load_candidates(file_bytes, sheet):
     ops_req = is_req & rmk.str.contains("OPS", na=False)
     # test_category PRQ selalu PRQ (bukan ORQ) walau remark memuat OPS.
     df["req_tag"] = np.where(cat_prq, "PRQ", np.where(ops_req, "ORQ", np.where(is_req, "PRQ", "")))
+    # SSF (Static/Shut-in survey) dari kolom REMARK (Remark / REMARK for IEMS Req or Spare candidate).
+    # Dipakai utk label "PRQ (SSF)" & menandai sumur ini strict 2-kunjungan.
+    df["is_ssf"] = rmk.str.contains(r"\bSSF\b", regex=True, na=False)
     df["is_addmanual"] = cat_u.str.contains("MANUAL", na=False) & (df["req_tag"] == "") & ~cat_force
     df["is_gp"] = st_.eq("GP")
     df["is_reg_a"] = cat_u.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
@@ -2282,8 +2285,10 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
     # PRQ dari sheet BreakIn WAJIB tunduk min-max (tak boleh early/late). Hanya PRQ dari Compiled
     # Schedule yang boleh di luar window. Jadi PRQ BreakIn TIDAK ikut bypass_reg (yang lahir dari
     # force_week) dan jendelanya dipaksa strict di bawah.
-    if "req_tag" in elig.columns and "is_breakin" in elig.columns:
-        prq_bk = (elig["req_tag"] == "PRQ") & elig["is_breakin"].fillna(False)
+    if "req_tag" in elig.columns and ("is_breakin" in elig.columns or "is_ssf" in elig.columns):
+        _bk_e = elig["is_breakin"].fillna(False) if "is_breakin" in elig.columns else pd.Series(False, index=elig.index)
+        _ssf_e = elig["is_ssf"].fillna(False) if "is_ssf" in elig.columns else pd.Series(False, index=elig.index)
+        prq_bk = (elig["req_tag"] == "PRQ") & (_bk_e | _ssf_e)
     else:
         prq_bk = pd.Series(False, index=elig.index)
 
@@ -3035,6 +3040,29 @@ _ckpt(f"load_coord_cache (rows={len(_cc)})")
 raw = resolve_coords(raw, spatial_db, _cc, field_assign=field_assign)
 _ckpt(f"resolve_coords (body, raw={len(raw)})")
 
+# ── Break-In dua tes (SSF/PRQ 2x): baris nama well sama → tugas terpisah #2, #3… ──
+# User menuliskan sumur yang butuh 2x tes dalam 1 periode sebagai DUA baris nama sama di
+# sheet BreakIn (tiap baris window min-max sendiri, mis. H-1..H+1 tiap tanggal). Seluruh
+# proses WELLGO mengunci per nama well unik (banyak drop_duplicates + manual_assign + peta +
+# export), jadi tanpa penomoran dua baris itu menyatu & hanya satu tes terjadwal. Koordinat
+# sudah menempel di resolve_coords (by nama asli) SEBELUM penomoran ini, jadi #2 tetap berkoordinat.
+# base_well = nama asli (untuk cocokkan COMP/tanggal tes & bisa dipakai tampilan).
+raw["base_well"] = raw["well"]
+_bkm = raw["is_breakin"].fillna(False) if "is_breakin" in raw.columns else pd.Series(False, index=raw.index)
+if "is_ssf" in raw.columns:
+    _bkm = _bkm | raw["is_ssf"].fillna(False)   # SSF 2x tes juga dipecah walau flag break-in tak terset
+if _bkm.any():
+    _seen_bk, _newnm = {}, raw["well"].copy()
+    for _i in raw.index[_bkm]:
+        _wn0 = raw.at[_i, "well"]
+        _seen_bk[_wn0] = _seen_bk.get(_wn0, 0) + 1
+        if _seen_bk[_wn0] >= 2:
+            _newnm.at[_i] = f"{_wn0} #{_seen_bk[_wn0]}"
+    raw["well"] = _newnm
+    _n_ssf = sum(1 for v in _seen_bk.values() if v >= 2)
+    if _n_ssf:
+        _ckpt(f"break-in multi-tes: {_n_ssf} sumur dipecah jadi tugas bernomor")
+
 # ── Mode Mapping Unit ──────────────────────────────────────────────────────
 # Dipasang SETELAH resolve_coords karena lapangan sumur bisa baru terisi dari
 # master spasial di sana, dan pemetaan ini dikunci per (SUB_AREA, FIELD).
@@ -3217,6 +3245,40 @@ for _w3, _d3 in _wtr_last.items():
         _last_test[_w3] = max(_last_test[_w3], _p3) if _w3 in _last_test else _p3
 _minmap = dict(zip(raw["well"], raw["min_date"]))
 _maxmap = dict(zip(raw["well"], raw["max_date"]))
+
+# ── Break-In dua tes: cocokkan tanggal tes ke window TIAP tugas (test-1→window-1, dst) ──
+# Tugas SSF bernomor (#2…) berbagi base_well; log/WTR/last_wt memakai nama asli (base_well),
+# jadi tanpa ini: tugas #2 tak pernah terdeteksi COMP, dan tugas-1 malah kebaca tanggal test-2
+# (di luar window-1) sehingga keliru balik jadi kandidat. Solusi: utk tiap tugas, pakai tanggal
+# tes TERBARU base_well yang tidak melewati max_date tugas itu → test-1 jatuh di window-1, test-2
+# di window-2. Hanya untuk base_well yang punya >=2 tugas break-in.
+if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in raw.columns):
+    _bk_m2 = raw["is_breakin"].fillna(False) if "is_breakin" in raw.columns else pd.Series(False, index=raw.index)
+    if "is_ssf" in raw.columns:
+        _bk_m2 = _bk_m2 | raw["is_ssf"].fillna(False)
+    _bkrows = raw[_bk_m2]
+    _vc_bk = _bkrows["base_well"].value_counts()
+    _ssf_multi = set(_vc_bk[_vc_bk >= 2].index)
+    if _ssf_multi:
+        _base_dates = {}
+        for _b, _rc in comp_records(_ssf_multi).items():
+            _base_dates.setdefault(_b, []).extend(pd.Timestamp(d) for d, _ in _rc if pd.notna(d))
+        _ncmp_bk = (raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP")
+                    if "sch_status" in raw.columns else pd.Series(False, index=raw.index))
+        if "last_wt" in raw.columns:
+            for _bb, _lw, _bad in zip(raw["base_well"], raw["last_wt"], _ncmp_bk):
+                if _bb in _ssf_multi and pd.notna(_lw) and not _bad:
+                    _base_dates.setdefault(_bb, []).append(pd.Timestamp(_lw))
+        for _bb, _dd in _wtr_last.items():
+            if _bb in _ssf_multi and pd.notna(_dd):
+                _base_dates.setdefault(_bb, []).append(pd.Timestamp(_dd))
+        for _i in raw.index[raw["base_well"].isin(_ssf_multi)]:
+            _wk = raw.at[_i, "well"]; _bk = raw.at[_i, "base_well"]; _xd = raw.at[_i, "max_date"]
+            _cands = [d for d in _base_dates.get(_bk, []) if pd.isna(_xd) or d <= pd.Timestamp(_xd)]
+            if _cands:
+                _last_test[_wk] = max(_cands)
+            else:
+                _last_test.pop(_wk, None)
 
 def last_test_str(w):
     """Tanggal tes COMP/executed TERAKHIR sumur dari SCH Database (execution_log) + last_wt, '-' bila tak ada."""
@@ -5390,6 +5452,11 @@ with tab_cart:
     _bf_pool = _bf_pool[(~_bf_pool["well"].isin(_bf_sched | _bf_un))
                         & _bf_pool["has_coord"].fillna(True) & _bf_pool["lat"].notna()]
     if woff_set: _bf_pool = _bf_pool[~_bf_pool["well"].isin(woff_set)]
+    # Sumur PRQ break-in/SSF strict di window-nya (tak boleh ditarik early) → jangan di-backfill.
+    if "req_tag" in _bf_pool.columns:
+        _bk_c = _bf_pool["is_breakin"].fillna(False) if "is_breakin" in _bf_pool.columns else pd.Series(False, index=_bf_pool.index)
+        _ssf_c = _bf_pool["is_ssf"].fillna(False) if "is_ssf" in _bf_pool.columns else pd.Series(False, index=_bf_pool.index)
+        _bf_pool = _bf_pool[~((_bf_pool["req_tag"] == "PRQ") & (_bk_c | _ssf_c))]
     # Kursi sisa pada trip aktif + unit-hari kosong (boleh dibuka). Map day_idx→tanggal utk tandai early.
     _bf_room, _bf_rtp, _bf_daydate = {}, {}, {}
     for _, _r in scheduled_all.iterrows():
@@ -6015,6 +6082,19 @@ with tab_export:
         if "AWS" in c: return "AS"
         return "RTN"
 
+    def _tipe_lbl2(cat, rtag="", ssf=False):
+        c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+        m = re.search(r"NEW WELL\s*([123])", c)
+        if m: return f"NW{m.group(1)}"
+        if "NEW WELL" in c: return "NW"
+        m = re.search(r"AWS\s*([12])", c)
+        if m: return f"AS{m.group(1)}"
+        if "AWS" in c: return "AS"
+        _rt = str(rtag).upper().strip()
+        if _rt == "PRQ": return "PRQ (SSF)" if bool(ssf) else "PRQ"
+        if _rt == "ORQ": return "ORQ"
+        return "RTN"
+
     def _tier_lbl2(cat, tipe=None):
         c = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
         m = re.search(r"NEW WELL\s*([123])", c)
@@ -6046,7 +6126,11 @@ with tab_export:
                      if ("min_date" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
         "Max_Date": (pd.to_datetime(_jm["max_date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-").values
                      if ("max_date" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
-        "Tipe": [_tipe_lbl(c) for c in _jm["category"]] if len(_jm) else [],
+        "Tipe": ([_tipe_lbl2(c, rt, sf) for c, rt, sf in zip(
+                    _jm["category"],
+                    (_jm["req_tag"] if "req_tag" in _jm.columns else [""] * len(_jm)),
+                    (_jm["is_ssf"] if "is_ssf" in _jm.columns else [False] * len(_jm)))]
+                 if len(_jm) else []),
         "Durasi Test": pd.to_numeric(_jm["dur"], errors="coerce").values if len(_jm) else [],
         "Tier": [_tier_lbl2(c, t) for c, t in zip(_jm["category"], _jm["tipe"])] if len(_jm) else [],
         "BOPD": [round(float(v), 1) if pd.notna(v) else None for v in _bopd_col] if len(_jm) else [],
