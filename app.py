@@ -2508,6 +2508,7 @@ with st.sidebar:
     st.divider()
     ui.section("2️⃣ Upload WTR Database")
     up_wtr = st.file_uploader("Upload WTR Database (opsional)", type=["xlsx", "xlsm"],
+                              key=f"wtr_upl_{st.session_state.get('_upl_ver', 0)}",
                               help="File Excel TERSENDIRI berisi Well Test Report (hasil tes). Dipakai sebagai "
                                    "sumber tambahan deteksi COMP bila SCH Database belum terupdate.")
     sheet_wtr = st.text_input("Sheet WTR", "Database",
@@ -2521,7 +2522,8 @@ with st.sidebar:
 
     st.divider()
     ui.section("3️⃣ Upload SCH Database (Status Realisasi)")
-    comp_files = st.file_uploader("Upload file COMP/NCMP harian", type=["xlsx", "xlsm"], accept_multiple_files=True)
+    comp_files = st.file_uploader("Upload file COMP/NCMP harian", type=["xlsx", "xlsm"], accept_multiple_files=True,
+                                  key=f"comp_upl_{st.session_state.get('_upl_ver', 0)}")
     skip_woff = st.checkbox("Skip sumur NCMP yang berstatus OFF", value=True,
         help="Berdasarkan Well Status di master kandidat, bukan kolom COMMENT IF NOT COMPLETE. "
              "Sumur NCMP ber-comment WOFF yang di master masih ON tetap dijadwalkan ulang; "
@@ -2532,17 +2534,20 @@ with st.sidebar:
              "Karena AWS1 belum dites, window AWS2 preview ditaksir relatif window AWS1. Begitu AWS1 di-COMP, "
              "window AWS2 dihitung ulang dari tanggal tes AWS1 (last_wt+5..+10) & alur balik normal (satu baris AWS2).")
 
-    with st.expander("🗑️ Kelola / Hapus SCH_Database"):
-        st.caption("SCH_Database (COMP/NCMP + tanda COMP manual) tersimpan permanen di server sampai dihapus — "
-                   "bukan sekadar cache. Menghapus akan mengosongkan seluruh riwayat, lalu app membangun ulang "
-                   "hanya dari file yang sedang ada di uploader (kosongkan uploader dulu bila ingin benar-benar bersih).")
-        _ok = st.checkbox("Saya paham ini menghapus SEMUA log eksekusi (termasuk tanda COMP manual)", key="_confirm_wipe_sch")
-        if st.button("Hapus SCH_Database sekarang", disabled=not _ok, use_container_width=True):
+    with st.expander("🗑️ Kelola / Hapus SCH Database & WTR Database"):
+        st.caption("SCH Database (COMP/NCMP + tanda COMP manual) tersimpan permanen di server. WTR Database "
+                   "berasal dari file yang di-upload. Menghapus akan: (1) mengosongkan seluruh riwayat SCH "
+                   "Database di server, dan (2) mengosongkan uploader SCH & WTR sehingga keduanya benar-benar "
+                   "bersih (tidak dibangun ulang dari file lama).")
+        _ok = st.checkbox("Saya paham ini menghapus SEMUA log eksekusi SCH (termasuk tanda COMP manual) & melepas file WTR",
+                          key="_confirm_wipe_sch")
+        if st.button("Hapus SCH Database & WTR Database sekarang", disabled=not _ok, use_container_width=True):
             reset_execution_log()
             for _k in ("_compncmp_sig", "_compncmp_summary"):
                 st.session_state.pop(_k, None)
+            st.session_state["_upl_ver"] = st.session_state.get("_upl_ver", 0) + 1   # reset uploader SCH & WTR
             st.cache_data.clear()
-            st.success("SCH_Database dihapus. Data akan dibangun ulang dari file yang sedang di-upload (jika ada).")
+            st.success("SCH Database & WTR Database dihapus. Uploader SCH & WTR dikosongkan; data tidak dibangun ulang dari file lama.")
             st.rerun()
 
 if up is None:
