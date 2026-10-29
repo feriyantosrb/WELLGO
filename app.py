@@ -2081,11 +2081,18 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     # tersaring keluar dan tak pernah terjadwal. Mereka selalu jadi kandidat; penjadwalannya
     # dilakukan di pass pengisi (fill_mode) SETELAH optimasi utama, mengisi sisa kapasitas unit.
     addman_c = _addman_c
+    # Out-of-window (deadline sudah lewat SEBELUM periode, atau window belum buka) → JANGAN dibuang.
+    # Diperlakukan sebagai kandidat DITUNDA: masuk pool dgn urgensi fleksibel (prioritas rendah, isi
+    # celah / bisa ditarik backfill), bukan menyerobot sumur in-periode. Berlaku utk NW/AWS & reguler.
+    _outside_defer = (~in_range
+                      & ((raw["max_date"].notna() & (raw["max_date"] < batch_lo))
+                         | (raw["min_date"].notna() & (raw["min_date"] > batch_hi)))
+                      & ~raw["well"].isin(executed | pending_set))
     comp_wells = raw[raw["well"].isin(comp_disp_set)].copy()
     pending_wells = raw[raw["well"].isin(pending_set)].copy()
     pending_nodata = sorted(pending_set - set(pending_wells["well"]))
-    nwaws_dropped = raw[is_nwaws_c & ~in_range & ~overdue_prio & (~raw["well"].isin(executed))].copy()
-    cand = raw[(in_range | is_ncmp | req_force | overdue_prio | addman_c) & (~raw["well"].isin(executed | pending_set))].copy()
+    nwaws_dropped = raw[is_nwaws_c & ~in_range & ~overdue_prio & ~_outside_defer & (~raw["well"].isin(executed))].copy()
+    cand = raw[(in_range | is_ncmp | req_force | overdue_prio | addman_c | _outside_defer) & (~raw["well"].isin(executed | pending_set))].copy()
 
     cand["np_in_range"] = np_in_range.loc[cand.index]
     cand["max_in_range"] = ((raw["max_date"] >= batch_lo) & (raw["max_date"] <= batch_hi)).loc[cand.index]
@@ -2094,6 +2101,7 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     woff_wells = raw[raw["well"].isin(woff_set)].copy()
     elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set))].copy()
     elig_all["carry_ncmp"] = elig_all["well"].isin(ncmp_replan)
+    elig_all["_defer_outside"] = _outside_defer.reindex(elig_all.index).fillna(False)
 
     elig_all["urgency"] = (elig_all["max_date"] - week_lo).dt.days
     elig_all["urgency"] = elig_all["urgency"].fillna(0)
@@ -2106,7 +2114,8 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     # deadline-nya jatuh di dalam periode. PRQ/ORQ (+NCMP) = mid_prio DIKECUALIKAN (boleh sepanjang periode).
     _slack_e = elig_all["max_date"].notna() & (elig_all["max_date"] > batch_hi)
     elig_all.loc[mid_prio, "urgency"] = elig_all.loc[mid_prio, "urgency"].clip(upper=0)
-    elig_all.loc[nwaws & ~_slack_e, "urgency"] = elig_all.loc[nwaws & ~_slack_e, "urgency"].clip(upper=0) - 10000
+    _nw_boost = nwaws & ~_slack_e & ~elig_all["_defer_outside"].fillna(False)   # NW/AWS out-of-window TIDAK di-boost (ditunda)
+    elig_all.loc[_nw_boost, "urgency"] = elig_all.loc[_nw_boost, "urgency"].clip(upper=0) - 10000
 
     # Sumur REGULER (bukan NW/AWS/PRQ/ORQ/carry-NCMP) yang window min-max-nya di LUAR rentang periode
     # → urgensi FLEKSIBEL: tak wajib dites di awal, boleh kapan saja dalam rentang (isi celah).
@@ -2116,6 +2125,11 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     _flex = (~_prio_u) & elig_all["max_date"].notna() & _win_outside
     _span = max(int((week_hi - week_lo).days), 1)
     elig_all.loc[_flex, "urgency"] = _span
+    # Out-of-window ditunda (termasuk NW/AWS): urgensi fleksibel = prioritas rendah (isi celah),
+    # jangan menyerobot sumur yang window-nya overlap periode ini. mid_prio/addman punya aturan sendiri.
+    _addman_u0 = elig_all["is_addmanual"].fillna(False) if "is_addmanual" in elig_all.columns else pd.Series(False, index=elig_all.index)
+    _defer_flex = elig_all["_defer_outside"].fillna(False) & ~mid_prio & ~_addman_u0
+    elig_all.loc[_defer_flex, "urgency"] = _span
     # Add Manual → urgensi fleksibel (isi celah). Prioritas terendah sesungguhnya diterapkan
     # ulang per-hari di plan_week (ADDMAN_URG), agar tidak menggeser sumur lain.
     _addman_u = elig_all["is_addmanual"].fillna(False) if "is_addmanual" in elig_all.columns else pd.Series(False, index=elig_all.index)
@@ -2516,7 +2530,8 @@ with st.sidebar:
     use_wtr = st.checkbox("Pakai WTR Database untuk deteksi COMP", value=True,
                           help="Jika aktif, TEST DATE terbaru per sumur dari WTR Database ikut jadi 'tes terakhir', "
                                "sehingga sumur yang sudah dites (ada di WTR) dalam window-nya dianggap COMP walau "
-                               "SCH Database belum update.")
+                               "SCH Database belum update. Deteksi 'tes terakhir' HANYA dari SCH Database + WTR "
+                               "(kolom last_wt Excel tidak ikut menentukan COMP).")
 
     mpas_only = st.checkbox("Hanya Unit Tes (MPAS), exclude TS", value=True)
 
@@ -3312,16 +3327,9 @@ for _w2, _rc2 in comp_records(set(raw["well"])).items():
     _dd2 = [pd.Timestamp(d) for d, _ in _rc2 if pd.notna(d)]
     if _dd2:
         _last_test[_w2] = max(_dd2)
-# last_wt = tanggal tes TERAKHIR, yang bisa saja percobaan NCMP (gagal). Itu bukan
-# bukti selesai, jadi baris ber-SCH STATUS NCMP tak boleh menyumbang tanggal.
-# Riwayat execution_log di atas sudah aman: comp_records hanya memuat status='executed'.
-if "last_wt" in raw.columns:
-    _ncmp_row = (raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP")
-                 if "sch_status" in raw.columns else pd.Series(False, index=raw.index))
-    for _w2, _lw2, _bad in zip(raw["well"], raw["last_wt"], _ncmp_row):
-        if pd.notna(_lw2) and not _bad:
-            _p = pd.Timestamp(_lw2)
-            _last_test[_w2] = max(_last_test[_w2], _p) if _w2 in _last_test else _p
+# Deteksi 'tes terakhir' HANYA dari SCH Database (execution_log di atas) + WTR (di bawah).
+# Kolom last_wt Excel SENGAJA tidak ikut: sering belum ter-update, bikin COMP tersirat palsu.
+# (last_wt tetap dipakai utk perhitungan window fase AWS/NW, bukan utk deteksi COMP ini.)
 # WTR (Well Test Report): tiap baris = tes selesai. TEST DATE terbaru per sumur ikut jadi
 # 'tes terakhir' (max), jadi sumur yang sudah dites di WTR dalam window-nya terdeteksi COMP
 # walau SCH Database belum update. Opsional (toggle sidebar).
@@ -3350,12 +3358,6 @@ if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in ra
         _base_dates = {}
         for _b, _rc in comp_records(_ssf_multi).items():
             _base_dates.setdefault(_b, []).extend(pd.Timestamp(d) for d, _ in _rc if pd.notna(d))
-        _ncmp_bk = (raw["sch_status"].astype(str).str.upper().str.strip().eq("NCMP")
-                    if "sch_status" in raw.columns else pd.Series(False, index=raw.index))
-        if "last_wt" in raw.columns:
-            for _bb, _lw, _bad in zip(raw["base_well"], raw["last_wt"], _ncmp_bk):
-                if _bb in _ssf_multi and pd.notna(_lw) and not _bad:
-                    _base_dates.setdefault(_bb, []).append(pd.Timestamp(_lw))
         for _bb, _dd in _wtr_last.items():
             if _bb in _ssf_multi and pd.notna(_dd):
                 _base_dates.setdefault(_bb, []).append(pd.Timestamp(_dd))
@@ -3368,7 +3370,7 @@ if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in ra
                 _last_test.pop(_wk, None)
 
 def last_test_str(w):
-    """Tanggal tes COMP/executed TERAKHIR sumur dari SCH Database (execution_log) + last_wt, '-' bila tak ada."""
+    """Tanggal tes COMP/executed TERAKHIR sumur dari SCH Database (execution_log) + WTR, '-' bila tak ada."""
     _d = _last_test.get(w)
     return pd.Timestamp(_d).strftime("%Y-%m-%d") if pd.notna(_d) else "-"
 
@@ -4106,8 +4108,10 @@ with tab_candidates:
         if w in _miss_w: return "⚠️ Miss Deadline (kuota penuh)"
         if w in _mout_w: return "🗓️ Luar periode (deadline lampau)"
         if w in _elig_w:
-            if pd.notna(r.get("max_date")) and r["max_date"] > batch_hi:
-                return "⏭️ Ditunda (deadline > periode)"
+            _mx, _mn = r.get("max_date"), r.get("min_date")
+            if pd.notna(_mx) and _mx < batch_lo: return "⏭️ Ditunda (deadline lampau)"
+            if pd.notna(_mn) and _mn > batch_hi: return "⏭️ Ditunda (window belum buka)"
+            if pd.notna(_mx) and _mx > batch_hi: return "⏭️ Ditunda (deadline > periode)"
             return "🕓 Antre (tak kebagian)"
         return "➖ Di luar window periode"
 
