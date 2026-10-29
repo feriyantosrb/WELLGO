@@ -559,6 +559,30 @@ def load_spatial_data(file_bytes, sheet):
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
+def load_arah_map(file_bytes, sheet="Mapping_PetaniTS"):
+    """Sheet Mapping_PetaniTS (kolom Arah, Well). Return {arah: set(well UPPER)}.
+    Dipakai memecah filter 'TS Spesifik Down' Petani_TS_C per arah (North/South/#31/…)."""
+    try:
+        df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
+    except Exception:
+        return {}
+    df.columns = [str(c).strip() for c in df.columns]
+    acol = next((c for c in df.columns if str(c).strip().lower() in ("arah", "direction")), None)
+    wcol = next((c for c in df.columns if str(c).strip().lower() in ("well", "wells", "well_name", "sumur")), None)
+    if not acol or not wcol:
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        arah = str(r[acol]).strip()
+        if not arah or arah.lower() == "nan":
+            continue
+        wells = {w.strip().upper() for w in str(r[wcol]).replace(";", ",").split(",")
+                 if w.strip() and w.strip().lower() != "nan"}
+        if wells:
+            out.setdefault(arah, set()).update(wells)
+    return out
+
+@st.cache_data(show_spinner=False)
 def load_candidates(file_bytes, sheet):
     df = _read_excel(BytesIO(file_bytes), sheet_name=sheet)
     df.columns = [str(c).strip() for c in df.columns]
@@ -683,13 +707,13 @@ def load_candidates(file_bytes, sheet):
     fm = df["forced_unit"].notna()
     df.loc[fm, "unit"] = df.loc[fm, "forced_unit"]
 
-    # Klasifikasi MPAS/TS/unknown dari unit EFEKTIF = last_unit_name hasil overlay sheet Status_Sumur
-    # (sudah dinormalkan di baris df["unit"]=norm_unit_name di atas, jadi "MP535"→"MPAS_535"). Status_Sumur
-    # adalah acuan: last_unit_name MPAS_xxx → MPAS, fasilitas *_TS → TS.
-    _u_cls = df["unit"].astype(str).str.upper().str.strip()
+    # Klasifikasi MPAS/TS/unknown dari kolom unit_name sheet Compiled Schedule (unit_name_ts),
+    # BUKAN last_unit_name/Status_Sumur. unit_name MPAS_xxx → MWT (MPAS), fasilitas *_TS → TS
+    # (mis. Petani_TS_C). Dinormalkan dulu ("MP535"→"MPAS_535"); nama TS diteruskan apa adanya.
+    _u_cls = df["unit_name_ts"].map(norm_unit_name).astype(str).str.upper().str.strip()
     df["is_mpas"] = _u_cls.str.startswith("MPAS")
     df["is_ts"] = _u_cls.str.contains("TS", na=False) & ~df["is_mpas"]
-    df["unit_unknown"] = _u_cls.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", "NONE", ""]) | df["unit"].isna()
+    df["unit_unknown"] = _u_cls.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", "NONE", ""]) | (df["unit_name_ts"].astype(str).str.strip() == "")
 
     NWAWS = {"NEW WELL 1", "NEW WELL 2", "NEW WELL 3", "AWS1", "AWS2"}
     cat_u = df["category"].astype(str).str.upper().str.strip()
@@ -2607,15 +2631,32 @@ with st.sidebar:
         _uns = raw["unit_name_ts"] if "unit_name_ts" in raw.columns else pd.Series(dtype=str)
         _ts_units = sorted(v for v in _uns.dropna().astype(str).unique()
                            if "TS" in v.upper() and v.strip() and v.strip().lower() != "nan")
-        ts_unit_down = st.multiselect("TS Spesifik Down (Dialihkan ke MWT)", _ts_units,
-                                      default=[u for u in _ts_units if u == "Bekasap_TS_C"],
-                                      help="Pilih fasilitas TS tertentu (dari kolom unit_name) yang sedang "
-                                           "down. Sumur pada TS ini (reguler & backlog) dialihkan ke MWT. "
-                                           "Jumlah yang dialihkan (khusus periode terpilih) tampil di bawah "
-                                           "setelah optimizer jalan.")
+        # Petani_TS_C bisa dipecah per Arah (sheet Mapping_PetaniTS): tiap arah jadi opsi down tersendiri,
+        # hanya sumur arah terpilih yang dialihkan ke MWT. Fasilitas TS lain tetap satu opsi (seluruhnya).
+        _arah_map = load_arah_map(up.getvalue())
+        _PETANI = "Petani_TS_C"
+        _ts_opts, _opt_meta = [], {}
+        for _u in _ts_units:
+            if _u == _PETANI and _arah_map:
+                continue
+            _ts_opts.append(_u); _opt_meta[_u] = ("fac", _u)
+        if _arah_map:
+            _ts_opts.append(_PETANI); _opt_meta[_PETANI] = ("fac", _PETANI)     # seluruh Petani_TS_C
+            for _ar in _arah_map:
+                _lbl = f"{_PETANI} · {_ar}"
+                _ts_opts.append(_lbl); _opt_meta[_lbl] = ("arah", _ar)
+        _ts_sel = st.multiselect("TS Spesifik Down (Dialihkan ke MWT)", _ts_opts,
+                                 default=[o for o in _ts_opts if o == "Bekasap_TS_C"],
+                                 help="Pilih fasilitas TS yang sedang down. Sumur pada TS ini (reguler & "
+                                      "backlog) dialihkan ke MWT. Petani_TS_C bisa dipilih per arah "
+                                      "(North/South/#31/#16/Single Line) dari sheet Mapping_PetaniTS, "
+                                      "atau seluruhnya. Jumlah dialihkan tampil di bawah setelah optimizer jalan.")
+        ts_unit_down = [_opt_meta[s][1] for s in _ts_sel if _opt_meta.get(s, ("fac", s))[0] == "fac"]
+        _petani_arah_down = [_opt_meta[s][1] for s in _ts_sel if _opt_meta.get(s, ("", ""))[0] == "arah"]
+        petani_down_wells = set().union(*[_arah_map[a] for a in _petani_arah_down]) if _petani_arah_down else set()
         mwt_unavail = st.multiselect("Area Fleet MWT Down (Dialihkan ke TS)", all_areas)
     else:
-        ts_unavail, ts_unit_down, mwt_unavail = [], [], []
+        ts_unavail, ts_unit_down, mwt_unavail, petani_down_wells = [], [], [], set()
     
     st.divider()
     ui.section("🛣️ (opsional) Jarak Jalan Nyata OSRM")
@@ -3017,13 +3058,17 @@ if excl_areas: raw = raw[~raw["area"].isin(excl_areas)].copy()
 def _ts_down_mask(df):
     unc = df["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in df.columns else pd.Series("", index=df.index)
     sel = {str(x).strip() for x in ts_unit_down}
-    return (df["is_ts"] & df["area"].isin(ts_unavail)) | unc.isin(sel)
+    m = (df["is_ts"] & df["area"].isin(ts_unavail)) | unc.isin(sel)
+    # Petani_TS_C per arah: hanya sumur pada arah terpilih (sheet Mapping_PetaniTS) yang dialihkan.
+    if petani_down_wells:
+        m = m | df["well"].astype(str).str.upper().str.strip().isin(petani_down_wells)
+    return m
 
 ts_redirected = raw[_ts_down_mask(raw)].copy()
 mwt_redirected = raw[raw["is_mpas"] & raw["area"].isin(mwt_unavail)].copy()
 ts_wells = raw[raw["is_ts"] & ~_ts_down_mask(raw)].copy()
 # Umpan balik akurat PER PERIODE terpilih (raw sudah difilter periode di atas), bukan seluruh data.
-if len(ts_unit_down) or len(ts_unavail):
+if len(ts_unit_down) or len(ts_unavail) or petani_down_wells:
     _am_r = ts_redirected["is_addmanual"].fillna(False) if "is_addmanual" in ts_redirected.columns else pd.Series(False, index=ts_redirected.index)
     st.sidebar.caption(f"↪️ {len(ts_redirected)} sumur TS dialihkan ke MWT untuk periode ini "
                        f"({int(_am_r.sum())} di antaranya backlog Add Manual).")
