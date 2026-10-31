@@ -97,6 +97,8 @@ REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
 NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
 ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi slot sisa, jangan geser yang lain)
+INERTIA_SLACK_DAYS = 5   # kontinuitas area: hanya sumur dgn slack deadline >= ini yang boleh ditunda demi tetap di area
+INERTIA_PENALTY    = 4   # tambahan "hari" urgensi utk sumur low-urgency yang JAUH dari footprint fleet kemarin
 KEEP_THIN_URG = 2        # REG dengan urgensi <= ini (H-2/kurang) dianggap "deadline mepet": tripnya tak
                          # dibatalkan walau tipis (<min_wells), supaya tak lenyap jadi miss. NW/AWS & PRQ/ORQ
                          # selalu dikecualikan tanpa melihat urgensi (lihat pembatalan trip tipis di plan()).
@@ -2294,7 +2296,7 @@ def bench_manual(hist, per_lo, per_hi, coord_map, pool):
 
 def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed,
               use_urg, use_dur, early_days=0, elastic_limit=5.0, unit_blackout=None, prebooked=None, day_offset=0,
-              min_wells=1, anchors=None, plan_fn=None, fill_mode=False):
+              min_wells=1, anchors=None, plan_fn=None, fill_mode=False, inertia_km=0.0):
     # plan_fn = mesin penjadwal per-hari (default heuristik plan()).
     # fill_mode = pass pengisi (mis. Add Manual backlog): jendela min-max per-hari DILONGGARKAN
     #   supaya sumur backlog boleh mengisi sisa kapasitas di hari mana pun (tetap tunduk kapasitas,
@@ -2342,6 +2344,7 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
     _early_row = pd.Series(early_td, index=elig.index)
     _early_row[_is_reg_a] = pd.Timedelta(0)
 
+    _prev_pts = []   # centroid per-unit footprint HARI KEMARIN (utk inersia kontinuitas area)
     for i, day in enumerate(days, start=1):
         win_reg = (elig["min_date"] - _early_row <= day)
         win_nw = (elig["min_date"] <= day) & (elig["max_date"] >= day)
@@ -2415,6 +2418,21 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
 
         pool.loc[is_addman.loc[pidx], "urgency"] = ADDMAN_URG
 
+        # ── Kontinuitas area antar hari (inersia): tunda sumur urgensi-rendah (Reg B/C/D/RTN) yang
+        #    JAUH (jarak jalan) dari footprint fleet kemarin, supaya unit tak lompat ke area jauh lalu
+        #    balik lagi. PENALTI-SAJA (tak pernah mempromosikan), slack-gated & kategori-gated → Reg A/
+        #    NW/AWS/PRQ dan deadline mendesak tak pernah ditunda.
+        if inertia_km > 0 and _prev_pts and not fill_mode:
+            _cu_p = pool["category"].astype(str).str.upper()
+            _defer_ok = ((pool["urgency"] >= INERTIA_SLACK_DAYS) & ~nw & ~is_prq_orq
+                         & ~is_addman.loc[pidx]
+                         & ~_cu_p.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
+                         & pool["lat"].notna() & pool["lon"].notna())
+            for _ix in pool.index[_defer_ok]:
+                _dd = road_min_to_pts(pool.at[_ix, "lat"], pool.at[_ix, "lon"], _prev_pts)
+                if _dd is not None and _dd > inertia_km:
+                    pool.at[_ix, "urgency"] += INERTIA_PENALTY
+
         day_key = pd.Timestamp(day).strftime("%Y-%m-%d")
         blocked = unit_blackout.get(day_key, set()) if unit_blackout else set()
         if blocked and "forced_unit" in pool.columns:
@@ -2445,6 +2463,15 @@ def plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, s
         if "is_seed" in sd.columns:
             elig.loc[sidx, "is_seed"] = elig.loc[sidx, "well"].map(dict(zip(sd["well"], sd["is_seed"]))).fillna(False)
         rem.loc[sidx] = False
+
+        # Footprint HARI INI (jadi acuan inersia hari besok): centroid per unit, termasuk prebooked prio.
+        if inertia_km > 0:
+            _fp = sd[["plan_unit", "lat", "lon"]].copy() if {"plan_unit", "lat", "lon"}.issubset(sd.columns) else sd.iloc[0:0]
+            if pb_day is not None and {"plan_unit", "lat", "lon"}.issubset(pb_day.columns):
+                _fp = pd.concat([_fp, pb_day[["plan_unit", "lat", "lon"]]], ignore_index=True)
+            _fp = _fp.dropna(subset=["lat", "lon"])
+            _prev_pts = ([(float(g["lat"].mean()), float(g["lon"].mean())) for _, g in _fp.groupby("plan_unit")]
+                         if len(_fp) else [])
 
     elig["urgency"] = (elig["max_date"] - days[0]).dt.days
     return elig
@@ -2913,6 +2940,16 @@ with st.sidebar:
         n_nonremote = st.slider("Unit Area Non-Remote (Bekasap)", 1, 4, 4)
         
         elastic_limit = st.slider("Batas Persebaran Rute (Elastic Limit km)", 5, 50, 5, 1, help="Mencegah efek 'chaining' di mana armada merangkai jarak dekat tapi ujung ke ujungnya terlalu jauh.")
+
+        area_cont = st.checkbox("Kontinuitas area antar hari (hindari lompatan)", value=True,
+            help="Mumpung fleet di suatu area hari ini, besok dahulukan sumur di area itu / yang dekat, "
+                 "supaya unit tak lompat ke area jauh lalu balik lagi (boros). Mekanisme: sumur urgensi "
+                 "RENDAH (Reg B/C/D/RTN) yang jarak jalannya jauh dari footprint fleet kemarin DITUNDA "
+                 "(diprioritaskan belakangan). Soft: deadline tetap menang; Reg A/NW/AWS/PRQ & sumur yang "
+                 f"slack-nya < {INERTIA_SLACK_DAYS} hari TIDAK pernah ditunda.")
+        area_cont_km = st.slider("Radius kontinuitas (km jalan)", 5, 40, 15, disabled=not area_cont,
+            help="Sumur low-urgency yang jarak JALAN-nya melebihi radius ini dari area kerja fleet kemarin "
+                 "akan ditunda, agar rute antar hari tetap berdekatan.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -3615,12 +3652,12 @@ if len(elig):
             wk_prio = wk_prio[wk_prio["scheduled"].fillna(False) | ~wk_prio["well"].isin(_promoted_wells)].copy()
         reg_elig = elig[(~_base_prio) & ~elig["well"].isin(_sched1)].copy()
         if len(reg_elig):
-            wk_reg = plan_week(reg_elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, prebooked=pb if len(pb) else None, day_offset=day_offset)
+            wk_reg = plan_week(reg_elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, prebooked=pb if len(pb) else None, day_offset=day_offset, inertia_km=(area_cont_km if area_cont else 0))
         else:
             wk_reg = reg_elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
         week_df = pd.concat([wk_prio, wk_reg], ignore_index=True)
     else:
-        week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, day_offset=day_offset)
+        week_df = plan_week(elig, days, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_urg, use_dur, early_days, elastic_limit, unit_blackout=unit_blackout_by_day, min_wells=min_wells, anchors=route_anchors, day_offset=day_offset, inertia_km=(area_cont_km if area_cont else 0))
 else:
     week_df = elig.assign(scheduled=False, plan_unit=None, plan_day=pd.NaT, day_idx=0)
 
@@ -6075,6 +6112,42 @@ with tab_diagnostics:
         piv_an.columns = [pd.Timestamp(_h2d[c]).strftime("%Y-%m-%d") for c in piv_an.columns]
         piv_an["Total Jarak (km)"] = piv_an.sum(axis=1)
         st.dataframe(piv_an.round(1), use_container_width=True)
+
+        # ── Jarak antar-hari per unit: ukur lompatan centroid D→D+1 (zigzag) ───
+        ui.section("🧲 Jarak Antar-Hari per Unit", eyebrow="Lompatan centroid hari-ke-hari (ukuran zigzag; makin kecil makin menetap)")
+        _cent = (scheduled_all[scheduled_all["has_coord"].fillna(False)]
+                 .groupby(["plan_unit", "day_idx"]).agg(lat=("lat", "mean"), lon=("lon", "mean")).reset_index()
+                 if len(scheduled_all) else pd.DataFrame(columns=["plan_unit", "day_idx", "lat", "lon"]))
+        _hop_rows, _hop_detail = [], []
+        for _u, _g in _cent.groupby("plan_unit"):
+            _g = _g.sort_values("day_idx")
+            _dys = _g["day_idx"].tolist(); _la = _g["lat"].tolist(); _lo = _g["lon"].tolist()
+            _hops = []
+            for _k in range(1, len(_g)):
+                _d = road_min_to_pts(_la[_k - 1], _lo[_k - 1], [(_la[_k], _lo[_k])])
+                _d = float(_d) if _d is not None else 0.0
+                _hops.append(_d)
+                _hop_detail.append({"Unit": _u, "Transisi": f"H{int(_dys[_k - 1])}→H{int(_dys[_k])}", "KM antar-hari": round(_d, 1)})
+            if _hops:
+                _hop_rows.append({"Unit": _u, "Hari aktif": len(_g), "Lompatan": len(_hops),
+                                  "Total KM antar-hari": round(sum(_hops), 1),
+                                  "Rata-rata/lompatan": round(sum(_hops) / len(_hops), 1),
+                                  "Lompatan terjauh": round(max(_hops), 1)})
+        if _hop_rows:
+            _hopdf = pd.DataFrame(_hop_rows).sort_values("Total KM antar-hari", ascending=False)
+            _fleet_tot = float(_hopdf["Total KM antar-hari"].sum())
+            st.caption(f"Total lompatan antar-hari seluruh fleet: **{_fleet_tot:.1f} km**. Per unit = jumlah jarak "
+                       "JALAN centroid hari-ke-hari (H1→H2 + H2→H3 + …). Makin kecil = unit makin menetap di "
+                       "area yang sama antar hari (zigzag rendah). Naikkan/kecilkan via 'Kontinuitas area antar hari'.")
+            _ca, _cb = st.columns([1.3, 1])
+            with _ca:
+                st.dataframe(_hopdf, use_container_width=True, hide_index=True)
+            with _cb:
+                st.bar_chart(_hopdf.set_index("Unit")["Total KM antar-hari"])
+            with st.expander("Rincian per transisi hari"):
+                st.dataframe(pd.DataFrame(_hop_detail), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Belum ada unit dengan ≥2 hari aktif untuk dihitung jarak antar-harinya.")
 
         # ── Dashboard KM / WELL (efisiensi jarak per sumur) ────────────────
         ui.section("Efisiensi Jarak per Sumur (KM/WELL)", eyebrow="Rasio jarak tempuh terhadap jumlah sumur")
