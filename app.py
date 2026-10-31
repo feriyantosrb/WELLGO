@@ -5935,6 +5935,41 @@ with tab_cart:
             st.caption("Catatan: ini diagnostik (belum memindahkan apa pun). Kalau banyak '➡️ Bisa dioper', "
                        "berarti pass Konsolidasi Trip Tipis layak dibuat untuk benar-benar mengopernya & membebaskan unit.")
 
+            # ── Peluang MENGISI trip tipis dari sumur TERTUNDA (belum terjadwal) di sekitar ──
+            # Menjawab: apakah memang tak ada sumur di sekitar, atau ada tapi ketahan window/kapasitas.
+            st.markdown("**↪️ Sumur tertunda (belum terjadwal) di sekitar tiap trip tipis**")
+            _left = (week_df[(~week_df["scheduled"].fillna(False)) & week_df["has_coord"].fillna(False)
+                             & week_df["lat"].notna()].drop_duplicates("well")
+                     if len(week_df) else week_df.iloc[0:0])
+            _fill_rows = []
+            for (_u, _d) in _thin_cells:
+                _C = _cell_cent.get((_u, int(_d))); _dt = _d2date.get(int(_d))
+                if _C is None or pd.isna(_C[0]): continue
+                _uz = _uzone(_u); _near = []
+                for _, _lw in _left.iterrows():
+                    _lz = str(_lw.get("zone", "")) or ("remote" if str(_lw.get("area", "")).upper() in REMOTE_AREAS else "non-remote")
+                    if _lz != _uz: continue
+                    _al = _lw.get("allow_units")
+                    if isinstance(_al, (list, tuple)) and len(_al) and _u not in _al: continue
+                    _dd = road_min_to_pts(float(_lw["lat"]), float(_lw["lon"]), [(_C[0], _C[1])])
+                    if _dd is None or _dd > float(area_cont_km): continue
+                    _near.append((round(float(_dd), 1), _lw["well"], _in_win(_dt, _lw.get("min_date"), _lw.get("max_date"))))
+                _near.sort()
+                _n_iw = sum(1 for _, _, iw in _near if iw)
+                _lbl = (", ".join(f"{w} ({d}km{'✓' if iw else '~'})" for d, w, iw in _near[:6]) + ("…" if len(_near) > 6 else "")) if _near else "—"
+                _fill_rows.append({"Unit-Hari": f"{_u} · H{_d} ({_cellcnt[(_u, int(_d))]}/{max_wells})",
+                                   "Kursi sisa": int(max_wells - _cellcnt[(_u, int(_d))]),
+                                   "Tertunda di sekitar": len(_near), "yg dlm window (✓)": _n_iw,
+                                   "Kandidat terdekat (≤ radius)": _lbl})
+            if _fill_rows:
+                _fdf = pd.DataFrame(_fill_rows)
+                _tot_fill = int((_fdf["yg dlm window (✓)"] > 0).sum())
+                st.caption(f"Radius {area_cont_km:.0f} km, se-zona. **{_tot_fill}** dari {len(_thin_cells)} trip tipis punya "
+                           "sumur tertunda **dalam window (✓)** di sekitarnya — itu yang bisa ditarik mengisi trip secara "
+                           "on-time (kalau belum, kemungkinan radius Backfill lebih kecil atau kapasitas). '~' = ada di "
+                           "sekitar tapi di luar window (hanya bisa early/late). '0' = memang tak ada sumur tertunda di sekitar.")
+                st.dataframe(_fdf, use_container_width=True, hide_index=True)
+
     st.divider()
 
     # ── Break-In & Sumur Tanpa Koordinat — assign manual dgn tinjau field ───
