@@ -2030,6 +2030,90 @@ def regroup_by_proximity(wk, max_wells, iters=8, cap_slack=1, extra_movable=None
                 wk.at[min(anggota[u], key=lambda i: urg[i]), "is_seed"] = True
     return wk, info
 
+def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
+    """Pass penghalus antar hari (Approach C): kurangi lompatan centroid hari-ke-hari per unit dgn
+    menggeser sumur DEFERRABLE (Reg B/C/D/RTN, bukan manual) ke hari LAIN pada unit yang SAMA.
+    Syarat ketat: (a) hari tujuan unit itu AKTIF & masih ada kapasitas, (b) tanggal tujuan dalam
+    window [min,max] sumur (tetap on-time), (c) sumur dekat (<= radius) ke cluster hari tujuan,
+    (d) total jarak antar-hari unit BERKURANG. Reg A/NW/AWS/PRQ/manual tak pernah digeser (deadline
+    menang). Tak membuka trip baru (hanya ke hari yang sudah aktif). Return (wk_baru, info)."""
+    info = {"moved": 0, "km_awal": 0.0, "km_akhir": 0.0}
+    if radius_km <= 0 or not len(wk) or "plan_unit" not in wk.columns or "day_idx" not in wk.columns:
+        return wk, info
+    wk = wk.copy()
+    sched = wk["scheduled"].fillna(False) if "scheduled" in wk.columns else pd.Series(False, index=wk.index)
+    lat = pd.to_numeric(wk.get("lat"), errors="coerce")
+    lon = pd.to_numeric(wk.get("lon"), errors="coerce")
+    coord_ok = lat.notna() & lon.notna()
+    cat = wk["category"].astype(str).str.upper() if "category" in wk.columns else pd.Series("", index=wk.index)
+    tipe = wk["tipe"].astype(str) if "tipe" in wk.columns else pd.Series("", index=wk.index)
+    rtag = wk["req_tag"].astype(str).str.upper() if "req_tag" in wk.columns else pd.Series("", index=wk.index)
+    manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
+    rega = cat.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
+    hard = tipe.isin(["NW", "AWS"]) | rtag.isin(["PRQ", "ORQ"]) | rega | manual
+
+    def _cent(idxs):
+        oks = [i for i in idxs if coord_ok[i]]
+        return (float(lat.loc[oks].mean()), float(lon.loc[oks].mean())) if oks else None
+
+    def _hopsum(members):
+        ds = sorted(members.keys()); cs = {d: _cent(members[d]) for d in ds}; s = 0.0
+        for a, b in zip(ds, ds[1:]):
+            ca, cb = cs[a], cs[b]
+            if ca and cb:
+                dd = road_min_to_pts(ca[0], ca[1], [(cb[0], cb[1])])
+                s += float(dd) if dd is not None else 0.0
+        return s
+
+    for u in [x for x in pd.unique(wk.loc[sched, "plan_unit"]) if x is not None and pd.notna(x)]:
+        um = sched & (wk["plan_unit"] == u)
+        members, _daydate = {}, {}
+        for i in wk.index[um]:
+            d = int(wk.at[i, "day_idx"]); members.setdefault(d, []).append(i)
+            _daydate.setdefault(d, wk.at[i, "plan_day"])
+        if len(members) < 3:        # perlu >=3 hari agar ada pola pergi-balik yg bisa dihemat
+            continue
+        base = _hopsum(members); info["km_awal"] += base
+        for _ in range(iters):
+            moved_any = False
+            for D in sorted(members.keys()):
+                for i in list(members.get(D, [])):
+                    if hard[i] or not coord_ok[i] or len(members[D]) <= 1:
+                        continue
+                    # hanya pertimbangkan OUTLIER: sumur yang jauh dari cluster hari-nya sendiri
+                    # (yang dekat sudah pas di tempatnya) → hemat komputasi & fokus ke penyebab zigzag.
+                    _cown = _cent([x for x in members[D] if x != i])
+                    if _cown is not None:
+                        _do = road_min_to_pts(float(lat[i]), float(lon[i]), [(_cown[0], _cown[1])])
+                        if _do is not None and _do <= radius_km:
+                            continue
+                    _mn, _mx = wk.at[i, "min_date"], wk.at[i, "max_date"]
+                    best_gain, best_D2 = 1e-6, None
+                    for D2 in sorted(members.keys()):
+                        if D2 == D or len(members[D2]) >= int(max_wells):
+                            continue
+                        _dt2 = _daydate.get(D2)
+                        if pd.notna(_mn) and pd.notna(_dt2) and pd.Timestamp(_dt2) < pd.Timestamp(_mn): continue
+                        if pd.notna(_mx) and pd.notna(_dt2) and pd.Timestamp(_dt2) > pd.Timestamp(_mx): continue
+                        c2 = _cent(members[D2])
+                        if not c2: continue
+                        _near = road_min_to_pts(float(lat[i]), float(lon[i]), [(c2[0], c2[1])])
+                        if _near is None or _near > radius_km: continue   # harus dekat cluster hari tujuan
+                        members[D].remove(i); members[D2].append(i)
+                        gain = base - _hopsum(members)
+                        members[D2].remove(i); members[D].append(i)
+                        if gain > best_gain:
+                            best_gain, best_D2 = gain, D2
+                    if best_D2 is not None:
+                        members[D].remove(i); members[best_D2].append(i)
+                        wk.at[i, "day_idx"] = best_D2
+                        wk.at[i, "plan_day"] = _daydate.get(best_D2)
+                        base = _hopsum(members); info["moved"] += 1; moved_any = True
+            if not moved_any:
+                break
+        info["km_akhir"] += _hopsum(members)
+    return wk, info
+
 def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
                executed, comp_disp_set, pending_set, ncmp_replan, woff_set):
     """Kelayakan & urgensi satu periode: dari kandidat mentah → elig (siap dijadwalkan).
@@ -2950,6 +3034,12 @@ with st.sidebar:
         area_cont_km = st.slider("Radius kontinuitas (km jalan)", 5, 40, 15, disabled=not area_cont,
             help="Sumur low-urgency yang jarak JALAN-nya melebihi radius ini dari area kerja fleet kemarin "
                  "akan ditunda, agar rute antar hari tetap berdekatan.")
+        interday_smooth = st.checkbox("Penghalus rute antar hari (Approach C)", value=True,
+            help="Setelah penjadwalan, geser sumur urgensi-rendah (Reg B/C/D/RTN, bukan manual) ke hari "
+                 "LAIN pada unit yang sama bila itu memperpendek total jarak antar-hari unit dan sumurnya "
+                 f"masih dekat (<= radius {area_cont_km} km) ke cluster hari tujuan serta tetap dalam "
+                 "window-nya. Tidak membuka trip baru; Reg A/NW/AWS/PRQ tak digeser. "
+                 "Hasil penghematan tampil di tab Analisis Jarak.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -3755,7 +3845,19 @@ if regroup_prox and mode == "pooled":
     week_df, _regroup_info = regroup_by_proximity(week_df, max_wells, extra_movable=_auto_placed)
     _ckpt("regroup_by_proximity")
 
+# ── Approach C: penghalus rute antar hari (geser sumur deferrable ke hari lain unit yg sama) ──
+_interday_info = None
+if interday_smooth and mode == "pooled":
+    week_df, _interday_info = smooth_interday(week_df, max_wells, radius_km=float(area_cont_km))
+    _ckpt("smooth_interday")
+
 scheduled_all = week_df[week_df["scheduled"]].copy()
+if _interday_info and _interday_info.get("moved"):
+    _ii = _interday_info
+    _save = max(0.0, _ii["km_awal"] - _ii["km_akhir"])
+    st.caption(f"🔀 **Penghalus rute antar hari** — {_ii['moved']} sumur digeser harinya, "
+               f"jarak antar-hari fleet turun {_ii['km_awal']:.1f} → {_ii['km_akhir']:.1f} km "
+               f"(hemat {_save:.1f} km). Rincian di tab Analisis Jarak.")
 
 # ── Pipeline optimasi otomatis (7 tahap): banner progres + maju antar tahap ──
 # auto_pipe: 1=optimasi default, 2=preemption, 3=rescue+re-optimasi, 4=rescue miss-deadline,
