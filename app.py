@@ -2186,7 +2186,13 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     off_wells = cand[cand["status"] == "OFF"].copy()
     woff_wells = raw[raw["well"].isin(woff_set)].copy()
     elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set))].copy()
-    elig_all["carry_ncmp"] = elig_all["well"].isin(ncmp_replan)
+    # NCMP-Hambatan: hanya kategori Regular/NW/AWS yang dijadwalkan ULANG sebagai carry (ikut lapis
+    # prioritas optimasi utama, _base_prio). Kategori Add Manual TIDAK diberi status carry — ia tetap
+    # di jalur Add Manual/Backfill (mengisi sisa kapasitas), sesuai permintaan: NCMP Add Manual
+    # dijadwalkan via mekanisme Backfill, bukan direbutkan sebagai prioritas di optimasi utama.
+    _addm_e = elig_all["is_addmanual"].fillna(False) if "is_addmanual" in elig_all.columns else pd.Series(False, index=elig_all.index)
+    _catman_e = elig_all["category"].astype(str).str.upper().str.contains("MANUAL", na=False)
+    elig_all["carry_ncmp"] = elig_all["well"].isin(ncmp_replan) & ~(_addm_e | _catman_e)
     elig_all["_defer_outside"] = _outside_defer.reindex(elig_all.index).fillna(False)
 
     elig_all["urgency"] = (elig_all["max_date"] - week_lo).dt.days
@@ -3629,10 +3635,14 @@ _ckpt(f"build_elig (elig={len(_E['elig'])}, cand={len(_E['cand'])})")
 batch_lo, batch_hi = _E["batch_lo"], _E["batch_hi"]
 cand, comp_wells, elig, elig_all = _E["cand"], _E["comp_wells"], _E["elig"], _E["elig_all"]
 # Add Manual A/B/C/D = kandidat BACKLOG (late/early) → JANGAN ikut optimasi utama. Disisihkan
-# untuk dijadwalkan di pass tersendiri setelah optimasi selesai (mengisi sisa kapasitas unit).
-if "is_addmanual" in elig.columns:
-    _addman_pool = elig[elig["is_addmanual"].fillna(False)].copy()
-    elig = elig[~elig["is_addmanual"].fillna(False)].copy()
+# untuk dijadwalkan di pass tersendiri (mengisi sisa kapasitas unit / Backfill). Pakai is_addmanual
+# ATAU test_category mengandung "MANUAL" (robust walau remark memuat REQ bikin is_addmanual meleset),
+# supaya NCMP-Hambatan kategori Add Manual pasti lewat jalur Backfill, bukan direbutkan di optimasi utama.
+if "is_addmanual" in elig.columns and len(elig):
+    _am_route = (elig["is_addmanual"].fillna(False)
+                 | elig["category"].astype(str).str.upper().str.contains("MANUAL", na=False))
+    _addman_pool = elig[_am_route].copy()
+    elig = elig[~_am_route].copy()
 else:
     _addman_pool = elig.iloc[0:0].copy()
 expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["ncmp_expired"]
