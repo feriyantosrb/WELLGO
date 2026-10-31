@@ -5979,37 +5979,42 @@ with tab_cart:
                 _n_mov = 0
                 for _, _w in _sub.iterrows():
                     _tp = str(_w.get("tipe", "")); _rt = str(_w.get("req_tag", "")).upper()
-                    _hard = (_tp in ("NW", "AWS") or _rt in ("PRQ", "ORQ")
-                             or bool(_w.get("is_reg_a", False)) or bool(_w.get("manual", False)))
+                    _is_hardcat = (_tp in ("NW", "AWS") or _rt in ("PRQ", "ORQ") or bool(_w.get("is_reg_a", False)))
+                    _is_manual = bool(_w.get("manual", False))
                     _mn, _mx = _w.get("min_date"), _w.get("max_date")
                     _wlat, _wlon = _w.get("lat"), _w.get("lon")
                     _wz = str(_w.get("zone", "")) or _uzone(_u)
                     _allow = _w.get("allow_units")
-                    if _hard:
-                        _stat, _tgt = "🔒 Terkunci (keras: NW/AWS/PRQ/Reg A/manual)", "-"
+                    if _is_hardcat:
+                        _stat, _tgt = "🔒 Terkunci (keras: NW/AWS/PRQ/Reg A)", "-"
+                    elif _is_manual:
+                        _stat, _tgt = "📌 Manual (sengaja ditaruh: konsolidasi/backfill/rescue/assign)", "-"
                     else:
-                        _win_days = [d2 for d2 in _active_days if d2 != _d and _in_win(_d2date.get(d2), _mn, _mx)]
-                        if not _win_days:
-                            _stat, _tgt = "🔒 Terkunci (window hanya hari ini)", "-"
+                        # Scan SEMUA unit-hari aktif se-zona di SEMUA hari periode. Dua kelas tujuan:
+                        # on-time (hari tujuan dalam window sumur) & early/late (hari lain, window dilanggar).
+                        _best_iw, _best_any = None, None
+                        for (_u2, _d2), _c2 in _cellcnt.items():
+                            if (_u2, _d2) == (_u, _d) or _c2 >= max_wells: continue
+                            if _uzone(_u2) != _wz: continue
+                            if isinstance(_allow, (list, tuple)) and len(_allow) and _u2 not in _allow: continue
+                            _c2c = _cell_cent.get((_u2, int(_d2)))
+                            if not _c2c or pd.isna(_wlat) or pd.isna(_c2c[0]): continue
+                            _dd = road_min_to_pts(float(_wlat), float(_wlon), [(_c2c[0], _c2c[1])])
+                            if _dd is None: continue
+                            _room2 = int(max_wells - _c2)
+                            if _best_any is None or _dd < _best_any[0]:
+                                _best_any = (_dd, _u2, int(_d2), _room2)
+                            if _in_win(_d2date.get(int(_d2)), _mn, _mx) and (_best_iw is None or _dd < _best_iw[0]):
+                                _best_iw = (_dd, _u2, int(_d2), _room2)
+                        _rad = float(area_cont_km)
+                        if _best_iw and _best_iw[0] <= _rad:
+                            _stat = "➡️ Bisa dioper (on-time)"; _tgt = f"{_best_iw[1]} · H{_best_iw[2]} ({_best_iw[0]:.1f} km, sisa {_best_iw[3]})"; _n_mov += 1
+                        elif _best_any and _best_any[0] <= _rad:
+                            _stat = "➡️ Bisa dioper (early/late)"; _tgt = f"{_best_any[1]} · H{_best_any[2]} ({_best_any[0]:.1f} km, sisa {_best_any[3]})"; _n_mov += 1
+                        elif _best_any is not None:
+                            _stat = "⛔ Mentok (tujuan hanya jauh)"; _tgt = f"terdekat {_best_any[1]} · H{_best_any[2]} ({_best_any[0]:.1f} km, sisa {_best_any[3]})"
                         else:
-                            _best = None
-                            for (_u2, _d2), _c2 in _cellcnt.items():
-                                if (_u2, _d2) == (_u, _d) or int(_d2) not in _win_days: continue
-                                if _c2 >= max_wells: continue
-                                if _uzone(_u2) != _wz: continue
-                                if isinstance(_allow, (list, tuple)) and len(_allow) and _u2 not in _allow: continue
-                                _c2c = _cell_cent.get((_u2, int(_d2)))
-                                if not _c2c or pd.isna(_wlat) or pd.isna(_c2c[0]): continue
-                                _dd = road_min_to_pts(float(_wlat), float(_wlon), [(_c2c[0], _c2c[1])])
-                                if _dd is None: continue
-                                if _best is None or _dd < _best[0]:
-                                    _best = (_dd, _u2, int(_d2), int(max_wells - _c2))
-                            if _best is None:
-                                _stat, _tgt = "⛔ Mentok (tak ada unit-hari se-zona berkapasitas dalam window)", "-"
-                            elif _best[0] <= float(area_cont_km):
-                                _stat = "➡️ Bisa dioper"; _tgt = f"{_best[1]} · H{_best[2]} ({_best[0]:.1f} km, sisa {_best[3]})"; _n_mov += 1
-                            else:
-                                _stat = "⛔ Mentok (tujuan hanya jauh)"; _tgt = f"terjauh {_best[1]} · H{_best[2]} ({_best[0]:.1f} km)"
+                            _stat, _tgt = "⛔ Mentok (semua unit-hari se-zona penuh, semua hari)", "-"
                     _rows.append({"Unit-Hari": f"{_u} · H{_d} ({_cellcnt[(_u, _d)]}/{max_wells})", "Well": _w["well"],
                                   "Kategori": _fv(_w.get("category")), "Window": f"{_fd(_mn)} .. {_fd(_mx)}",
                                   "Status": _stat, "Tujuan oper (terdekat)": _tgt})
@@ -6017,9 +6022,11 @@ with tab_cart:
             _n_elim = sum(1 for (c, (mv, tot)) in _cell_moves.items() if mv == tot and tot > 0)
             _n_movwells = sum(1 for r in _rows if r["Status"].startswith("➡️"))
             st.caption(f"**{len(_thin_cells)}** trip tipis (≤{_THIN_MAX} well) · **{_n_movwells}** well bisa dioper ke "
-                       f"unit-hari lain (lintas-unit, dalam window & radius {area_cont_km:.0f} km) · **{_n_elim}** trip "
-                       "berpotensi dibatalkan seluruhnya (semua well-nya bisa dioper). 🔒 = tak bisa dipindah (deadline/"
-                       "window kunci di hari itu); ⛔ = deferrable tapi tak ada tujuan (semua unit-hari se-zona penuh / jauh).")
+                       f"unit-hari lain (lintas-unit, se-zona, dicek SEMUA hari periode, radius {area_cont_km:.0f} km, "
+                       f"on-time atau early/late) · **{_n_elim}** trip "
+                       "berpotensi dibatalkan seluruhnya (semua well-nya bisa dioper). 🔒 = keras (NW/AWS/PRQ/Reg A), "
+                       "deadline kunci di hari itu; 📌 = sengaja ditaruh (hasil konsolidasi/backfill/rescue/assign manual); "
+                       "⛔ = deferrable tapi tak ada tujuan (semua unit-hari se-zona penuh / jauh).")
             st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
             st.caption("Catatan: ini diagnostik (belum memindahkan apa pun). Kalau banyak '➡️ Bisa dioper', "
                        "berarti pass Konsolidasi Trip Tipis layak dibuat untuk benar-benar mengopernya & membebaskan unit.")
