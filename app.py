@@ -5857,7 +5857,86 @@ with tab_cart:
         st.dataframe(grid_df, use_container_width=True)
 
     st.divider()
-    
+
+    # ── Diagnostik Trip Tipis: unit-hari ≤3 well — bisa dioper (lintas-unit) atau terkunci? ──
+    ui.section("🔎 Diagnostik Trip Tipis", eyebrow="Unit-hari ≤3 well: apakah sumurnya bisa dioper ke unit-hari lain, atau memang terkunci")
+    _THIN_MAX = 3
+    _fd = lambda x: pd.Timestamp(x).strftime("%Y-%m-%d") if pd.notna(x) else "-"
+    _uzone = lambda u: "remote" if u in REMOTE_UNITS else "non-remote"
+    def _in_win(dt, mn, mx):
+        if pd.isna(dt): return False
+        if pd.notna(mn) and pd.Timestamp(dt) < pd.Timestamp(mn): return False
+        if pd.notna(mx) and pd.Timestamp(dt) > pd.Timestamp(mx): return False
+        return True
+    if not len(scheduled_all):
+        st.caption("Belum ada jadwal.")
+    else:
+        _cellcnt = {(u, int(d)): int(c) for (u, d), c in scheduled_all.groupby(["plan_unit", "day_idx"]).size().to_dict().items()}
+        _cc = (scheduled_all[scheduled_all["has_coord"].fillna(False)]
+               .groupby(["plan_unit", "day_idx"]).agg(_la=("lat", "mean"), _lo=("lon", "mean")))
+        _cell_cent = {(k[0], int(k[1])): (r["_la"], r["_lo"]) for k, r in _cc.iterrows()}
+        _d2date = {}
+        for _d, _pday in zip(scheduled_all["day_idx"], scheduled_all["plan_day"]):
+            _d2date.setdefault(int(_d), _pday)
+        _active_days = set(int(x) for x in scheduled_all["day_idx"].unique())
+        _thin_cells = sorted([(u, int(d)) for (u, d), c in _cellcnt.items() if c <= _THIN_MAX],
+                             key=lambda x: (x[1], x[0]))
+        if not _thin_cells:
+            st.success(f"Tidak ada trip tipis (semua unit-hari > {_THIN_MAX} well).")
+        else:
+            _rows, _cell_moves = [], {}
+            for (_u, _d) in _thin_cells:
+                _sub = scheduled_all[(scheduled_all["plan_unit"] == _u) & (scheduled_all["day_idx"] == _d)]
+                _n_mov = 0
+                for _, _w in _sub.iterrows():
+                    _tp = str(_w.get("tipe", "")); _rt = str(_w.get("req_tag", "")).upper()
+                    _hard = (_tp in ("NW", "AWS") or _rt in ("PRQ", "ORQ")
+                             or bool(_w.get("is_reg_a", False)) or bool(_w.get("manual", False)))
+                    _mn, _mx = _w.get("min_date"), _w.get("max_date")
+                    _wlat, _wlon = _w.get("lat"), _w.get("lon")
+                    _wz = str(_w.get("zone", "")) or _uzone(_u)
+                    _allow = _w.get("allow_units")
+                    if _hard:
+                        _stat, _tgt = "🔒 Terkunci (keras: NW/AWS/PRQ/Reg A/manual)", "-"
+                    else:
+                        _win_days = [d2 for d2 in _active_days if d2 != _d and _in_win(_d2date.get(d2), _mn, _mx)]
+                        if not _win_days:
+                            _stat, _tgt = "🔒 Terkunci (window hanya hari ini)", "-"
+                        else:
+                            _best = None
+                            for (_u2, _d2), _c2 in _cellcnt.items():
+                                if (_u2, _d2) == (_u, _d) or int(_d2) not in _win_days: continue
+                                if _c2 >= max_wells: continue
+                                if _uzone(_u2) != _wz: continue
+                                if isinstance(_allow, (list, tuple)) and len(_allow) and _u2 not in _allow: continue
+                                _c2c = _cell_cent.get((_u2, int(_d2)))
+                                if not _c2c or pd.isna(_wlat) or pd.isna(_c2c[0]): continue
+                                _dd = road_min_to_pts(float(_wlat), float(_wlon), [(_c2c[0], _c2c[1])])
+                                if _dd is None: continue
+                                if _best is None or _dd < _best[0]:
+                                    _best = (_dd, _u2, int(_d2), int(max_wells - _c2))
+                            if _best is None:
+                                _stat, _tgt = "⛔ Mentok (tak ada unit-hari se-zona berkapasitas dalam window)", "-"
+                            elif _best[0] <= float(area_cont_km):
+                                _stat = "➡️ Bisa dioper"; _tgt = f"{_best[1]} · H{_best[2]} ({_best[0]:.1f} km, sisa {_best[3]})"; _n_mov += 1
+                            else:
+                                _stat = "⛔ Mentok (tujuan hanya jauh)"; _tgt = f"terjauh {_best[1]} · H{_best[2]} ({_best[0]:.1f} km)"
+                    _rows.append({"Unit-Hari": f"{_u} · H{_d} ({_cellcnt[(_u, _d)]}/{max_wells})", "Well": _w["well"],
+                                  "Kategori": _fv(_w.get("category")), "Window": f"{_fd(_mn)} .. {_fd(_mx)}",
+                                  "Status": _stat, "Tujuan oper (terdekat)": _tgt})
+                _cell_moves[(_u, _d)] = (_n_mov, len(_sub))
+            _n_elim = sum(1 for (c, (mv, tot)) in _cell_moves.items() if mv == tot and tot > 0)
+            _n_movwells = sum(1 for r in _rows if r["Status"].startswith("➡️"))
+            st.caption(f"**{len(_thin_cells)}** trip tipis (≤{_THIN_MAX} well) · **{_n_movwells}** well bisa dioper ke "
+                       f"unit-hari lain (lintas-unit, dalam window & radius {area_cont_km:.0f} km) · **{_n_elim}** trip "
+                       "berpotensi dibatalkan seluruhnya (semua well-nya bisa dioper). 🔒 = tak bisa dipindah (deadline/"
+                       "window kunci di hari itu); ⛔ = deferrable tapi tak ada tujuan (semua unit-hari se-zona penuh / jauh).")
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+            st.caption("Catatan: ini diagnostik (belum memindahkan apa pun). Kalau banyak '➡️ Bisa dioper', "
+                       "berarti pass Konsolidasi Trip Tipis layak dibuat untuk benar-benar mengopernya & membebaskan unit.")
+
+    st.divider()
+
     # ── Break-In & Sumur Tanpa Koordinat — assign manual dgn tinjau field ───
     ui.section("🧩 Break-In & Sumur Tanpa Koordinat", eyebrow="Assign manual dengan meninjau field")
     if len(leftover):
