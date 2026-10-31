@@ -3105,7 +3105,8 @@ with st.sidebar:
             for _lk in ("preempt_wells", "preempt_bumped", "preempt_ran", "repair_wells", "repair_assign_keys",
                         "repair_moves", "repair_ran", "rescued_wells", "rescue_added_km", "rescue_skip_far",
                         "rescue_late_early", "addman_added_wells", "addman_open_new",
-                        "backfill_wells", "backfill_detail", "backfill_open_new"):
+                        "backfill_wells", "backfill_detail", "backfill_open_new",
+                        "consol_added_wells", "consol_detail"):
                 st.session_state.pop(_lk, None)
             st.session_state["auto_pipe"] = 1
             st.rerun()
@@ -3840,7 +3841,7 @@ if man_un:
 _regroup_info = None
 if regroup_prox and mode == "pooled":
     _auto_placed = set()
-    for _mk in ("rescued_wells", "repair_wells", "preempt_wells", "addman_added_wells", "backfill_wells"):
+    for _mk in ("rescued_wells", "repair_wells", "preempt_wells", "addman_added_wells", "backfill_wells", "consol_added_wells"):
         _auto_placed |= set(st.session_state.get(_mk, []) or [])
     week_df, _regroup_info = regroup_by_proximity(week_df, max_wells, extra_movable=_auto_placed)
     _ckpt("regroup_by_proximity")
@@ -5784,6 +5785,94 @@ with tab_cart:
         st.session_state["auto_pipe"] = 7
         st.rerun()
 
+    # ── 🧲 Konsolidasi Trip Tipis: isi trip aktif ≤ambang dgn sumur tertunda sekitar (radius sendiri, early/late) ──
+    # Berbeda dari Backfill biasa (radius ketat, semua trip): ini KHUSUS trip ≤ambang well, radius longgar
+    # sendiri, membolehkan early/late, dan hanya mengisi trip yang SUDAH aktif (tak membuka unit baru).
+    st.divider()
+    ui.section("🧲 Konsolidasi Trip Tipis", eyebrow="Isi trip aktif ≤ambang well dgn sumur tertunda terdekat (radius longgar, boleh early/late)")
+    _kc1, _kc2 = st.columns(2)
+    _KT_MAX = _kc1.slider("Ambang trip tipis (≤ well)", 1, 5, 3, key="consol_thin_max")
+    _KT_RAD = _kc2.slider("Radius konsolidasi (km jalan)", 5, 40, 15, key="consol_radius")
+    _kt_added = st.session_state.get("consol_added_wells", [])
+    _consol_uz = lambda u: "remote" if u in REMOTE_UNITS else "non-remote"
+    if not len(scheduled_all):
+        st.caption("Belum ada jadwal.")
+    else:
+        _ccnt = {(u, int(d)): int(c) for (u, d), c in scheduled_all.groupby(["plan_unit", "day_idx"]).size().items()}
+        _ccen = {(k[0], int(k[1])): (r["_la"], r["_lo"]) for k, r in
+                 scheduled_all[scheduled_all["has_coord"].fillna(False)].groupby(["plan_unit", "day_idx"])
+                 .agg(_la=("lat", "mean"), _lo=("lon", "mean")).iterrows()}
+        _thin_act = [(u, d) for (u, d), c in _ccnt.items() if c <= _KT_MAX and (u, d) in _ccen]
+        _pool = (week_df[(~week_df["scheduled"].fillna(False)) & week_df["has_coord"].fillna(False)
+                         & week_df["lat"].notna()].drop_duplicates("well").copy()
+                 if len(week_df) else week_df.iloc[0:0])
+        if woff_set: _pool = _pool[~_pool["well"].isin(woff_set)]
+        if "req_tag" in _pool.columns:
+            _bkp = _pool["is_breakin"].fillna(False) if "is_breakin" in _pool.columns else pd.Series(False, index=_pool.index)
+            _sfp = _pool["is_ssf"].fillna(False) if "is_ssf" in _pool.columns else pd.Series(False, index=_pool.index)
+            _pool = _pool[~((_pool["req_tag"] == "PRQ") & (_bkp | _sfp))]
+        _fill_seats = sum(max(0, max_wells - _ccnt[k]) for k in _thin_act)
+        st.caption(f"**{len(_thin_act)}** trip tipis aktif (≤{_KT_MAX} well) · **{_fill_seats}** kursi sisa · "
+                   f"**{len(_pool)}** sumur tertunda. Tombol menarik sumur tertunda terdekat (≤ {_KT_RAD} km, se-zona, "
+                   "mapping dihormati, boleh early/late) ke trip tipis. Hanya mengisi trip yang sudah aktif (tak membuka "
+                   "unit baru); backfill biasa tak terpengaruh. Bisa dibatalkan.")
+        _kcb1, _kcb2 = st.columns(2)
+        _do_consol = _kcb1.button("🧲 Jalankan Konsolidasi Trip Tipis", type="primary",
+                                  disabled=(not len(_pool) or _fill_seats <= 0), key="btn_consol")
+        _do_consol_cancel = _kcb2.button("↩️ Batal", disabled=(not _kt_added), key="btn_consol_cancel")
+        if _do_consol_cancel:
+            _as = dict(st.session_state.get("manual_assign", {}))
+            for _w in _kt_added: _as.pop(_w, None)
+            st.session_state["manual_assign"] = _as
+            for _ck in ("consol_added_wells", "consol_detail"):
+                st.session_state.pop(_ck, None)
+            st.rerun()
+        if _do_consol and len(_pool) and _fill_seats > 0:
+            _room = {k: int(max_wells - _ccnt[k]) for k in _thin_act}
+            _mind = _pool.set_index("well")["min_date"].to_dict() if "min_date" in _pool.columns else {}
+            _d2date = {}
+            for _d, _pday in zip(scheduled_all["day_idx"], scheduled_all["plan_day"]):
+                _d2date.setdefault(int(_d), _pday)
+            _pairs = []
+            for _, _w in _pool.iterrows():
+                _wn = _w["well"]; _wlat = float(_w["lat"]); _wlon = float(_w["lon"])
+                _wz = str(_w.get("zone", "")) or ("remote" if str(_w.get("area", "")).upper() in REMOTE_AREAS else "non-remote")
+                _al = _w.get("allow_units")
+                for k in _thin_act:
+                    if _consol_uz(k[0]) != _wz: continue
+                    if isinstance(_al, (list, tuple)) and len(_al) and k[0] not in _al: continue
+                    _c = _ccen.get(k)
+                    if not _c or pd.isna(_c[0]): continue
+                    _dd = road_min_to_pts(_wlat, _wlon, [(_c[0], _c[1])])
+                    if _dd is None or _dd > _KT_RAD: continue
+                    _pairs.append((float(_dd), _wn, k))
+            _pairs.sort(key=lambda t: t[0])
+            _as = dict(st.session_state.get("manual_assign", {}))
+            _placed, _detail, _taken = [], [], set()
+            for _dd, _wn, k in _pairs:
+                if _wn in _taken or _room.get(k, 0) <= 0: continue
+                _as[_wn] = {"unit": k[0], "day_idx": int(k[1])}
+                _room[k] -= 1; _taken.add(_wn); _placed.append(_wn)
+                _ddate = _d2date.get(int(k[1])); _mn = _mind.get(_wn)
+                _early = bool(pd.notna(_mn) and pd.notna(_ddate) and pd.Timestamp(_mn) > pd.Timestamp(_ddate))
+                _detail.append({"Well": _wn, "Ke Unit-Hari": f"{k[0]} · H{int(k[1])}",
+                                "Tanggal": (pd.Timestamp(_ddate).strftime("%Y-%m-%d") if pd.notna(_ddate) else "-"),
+                                "Window Min": (pd.Timestamp(_mn).strftime("%Y-%m-%d") if pd.notna(_mn) else "-"),
+                                "Early": "ya" if _early else "-", "Jarak (km)": round(_dd, 1)})
+            st.session_state["manual_assign"] = _as
+            st.session_state["consol_added_wells"] = _placed
+            st.session_state["consol_detail"] = _detail
+            st.rerun()
+        if _kt_added:
+            _sn = set(scheduled_all["well"])
+            _in = [w for w in _kt_added if w in _sn]
+            _det = st.session_state.get("consol_detail", [])
+            _ne = sum(1 for d in _det if d.get("Early") == "ya")
+            st.success(f"✅ {len(_in)} dari {len(_kt_added)} sumur tertunda ditarik mengisi trip tipis "
+                       f"({_ne} di antaranya early). Rincian di bawah.")
+            if _det:
+                st.dataframe(pd.DataFrame(_det), use_container_width=True, hide_index=True)
+
     st.divider()
     ui.section("Matriks Ketersediaan Kapasitas", eyebrow="Visualisasi load per unit harian")
 
@@ -5964,10 +6053,13 @@ with tab_cart:
             if _fill_rows:
                 _fdf = pd.DataFrame(_fill_rows)
                 _tot_fill = int((_fdf["yg dlm window (✓)"] > 0).sum())
-                st.caption(f"Radius {area_cont_km:.0f} km, se-zona. **{_tot_fill}** dari {len(_thin_cells)} trip tipis punya "
-                           "sumur tertunda **dalam window (✓)** di sekitarnya — itu yang bisa ditarik mengisi trip secara "
-                           "on-time (kalau belum, kemungkinan radius Backfill lebih kecil atau kapasitas). '~' = ada di "
-                           "sekitar tapi di luar window (hanya bisa early/late). '0' = memang tak ada sumur tertunda di sekitar.")
+                _tot_any = int((_fdf["Tertunda di sekitar"] > 0).sum())
+                st.caption(f"Radius {area_cont_km:.0f} km, se-zona. **{_tot_any}** dari {len(_thin_cells)} trip tipis punya "
+                           f"sumur tertunda di sekitarnya yang bisa ditarik mengisinya ({_tot_fill} di antaranya ada yang "
+                           "ON-TIME ✓; '~' = di luar window, hanya early/late). **Backfill Kapasitas MEMBOLEHKAN early/late** "
+                           "(tak menggerbang window), jadi kandidat '~' pun bisa ditarik — yang menahan biasanya **radius "
+                           f"Backfill** (default 7 km). Naikkan slider 'Batas jarak tarik ke rute trip' ke ~{area_cont_km:.0f} km "
+                           "lalu jalankan Backfill untuk menariknya. '0' = memang tak ada sumur tertunda di sekitar (trip tipis wajar).")
                 st.dataframe(_fdf, use_container_width=True, hide_index=True)
 
     st.divider()
