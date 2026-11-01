@@ -67,6 +67,32 @@ ui.inject_theme()
 DB_PATH = "welltest_status.db"
 ROAD_PARQUET = "road_dist_cache.parquet"   # basis cache jarak jalan bawaan repo (bertahan lintas redeploy Streamlit Cloud)
 ROAD_GEOM_PARQUET = "road_geom_cache.parquet"   # basis geometri polyline jalan (utk gambar peta) bawaan repo
+# Folder shard (tiap bagian <25MB) alternatif file tunggal — untuk batas upload GitHub (25MB).
+# Bila folder ini ada & berisi *.parquet, ia DIDAHULUKAN atas file tunggal. pyarrow.dataset &
+# pandas.read_parquet membaca folder berisi banyak parquet sebagai satu dataset (pushdown tetap jalan),
+# jadi pemecahan file transparan bagi pembaca.
+ROAD_PARQUET_DIR = "road_dist_cache_parts"
+ROAD_GEOM_PARQUET_DIR = "road_geom_cache_parts"
+
+def _parq_src(single, parts_dir):
+    """Kembalikan sumber parquet: folder shard bila ada & berisi *.parquet, kalau tidak file tunggal, else None."""
+    try:
+        if os.path.isdir(parts_dir) and any(f.endswith(".parquet") for f in os.listdir(parts_dir)):
+            return parts_dir
+    except Exception:
+        pass
+    return single if os.path.exists(single) else None
+
+def _parq_rows(single, parts_dir):
+    """Jumlah baris total (file tunggal atau semua shard) tanpa memuat datanya."""
+    src = _parq_src(single, parts_dir)
+    if src is None:
+        return 0
+    try:
+        import pyarrow.dataset as _ds
+        return int(_ds.dataset(src, format="parquet").count_rows())
+    except Exception:
+        return 0
 
 # Tooltip peta pydeck memakai bentuk {"text": ...} bawaan. CATATAN: pada Streamlit/pydeck versi
 # terbaru, menambahkan key "style" pada tooltip membuat tooltip TIDAK DIRENDER sama sekali, jadi
@@ -1026,7 +1052,8 @@ def _parquet_pairs(need):
     tiap ganti periode, dan tak ada array raksasa yang ditahan di memori sepanjang sesi.
     Penyaringan tepat pasangan berarah tetap dilakukan pemanggil lewat _dict_from_dist_df."""
     empty = pd.DataFrame(columns=["alat", "alon", "blat", "blon", "km"])
-    if not need or not os.path.exists(ROAD_PARQUET):
+    _src = _parq_src(ROAD_PARQUET, ROAD_PARQUET_DIR)
+    if not need or _src is None:
         return empty
     try:
         import pyarrow as pa
@@ -1037,13 +1064,13 @@ def _parquet_pairs(need):
         lons = pa.array(np.unique(np.rint(pts[:, 1] * 1e5) / 1e5))
         flt = (ds.field("alat").isin(lats) & ds.field("alon").isin(lons) &
                ds.field("blat").isin(lats) & ds.field("blon").isin(lons))
-        tbl = ds.dataset(ROAD_PARQUET, format="parquet").to_table(
+        tbl = ds.dataset(_src, format="parquet").to_table(
             columns=["alat", "alon", "blat", "blon", "km"], filter=flt)
         return tbl.to_pandas()
     except Exception:
         # Fallback aman bila pyarrow.dataset tak tersedia: baca kolom lalu biar pemanggil saring.
         try:
-            return pd.read_parquet(ROAD_PARQUET, columns=["alat", "alon", "blat", "blon", "km"])
+            return pd.read_parquet(_src, columns=["alat", "alon", "blat", "blon", "km"])
         except Exception:
             return empty
 
@@ -1084,11 +1111,7 @@ def _road_dist_count():
     """Jumlah total pasangan tersimpan (Parquet + SQLite) untuk ditampilkan — TANPA memuat
     dict-nya. Baca num_rows dari metadata Parquet (murah) + COUNT SQLite."""
     n = 0
-    try:
-        import pyarrow.parquet as _pq
-        n += int(_pq.ParquetFile(ROAD_PARQUET).metadata.num_rows)
-    except Exception:
-        pass
+    n += _parq_rows(ROAD_PARQUET, ROAD_PARQUET_DIR)
     con = db_connect()
     try:
         n += int(con.execute("SELECT COUNT(*) FROM road_dist_cache").fetchone()[0])
@@ -1269,14 +1292,15 @@ def load_road_geom(need=None):
     supaya tak memuat ratusan ribu polyline ke memori sekaligus (anti-OOM di Streamlit)."""
     out = {}
     # Basis Parquet, disaring pushdown ke sumur `need`.
-    if need and os.path.exists(ROAD_GEOM_PARQUET):
+    _gsrc = _parq_src(ROAD_GEOM_PARQUET, ROAD_GEOM_PARQUET_DIR)
+    if need and _gsrc is not None:
         try:
             import pyarrow as pa
             import pyarrow.dataset as ds
             pts = np.array(list(need), dtype=float)
             lats = pa.array(np.unique(np.rint(pts[:, 0] * 1e5) / 1e5))
             flt = ds.field("alat").isin(lats) & ds.field("blat").isin(lats)
-            tbl = ds.dataset(ROAD_GEOM_PARQUET, format="parquet").to_table(
+            tbl = ds.dataset(_gsrc, format="parquet").to_table(
                 columns=["alat", "alon", "blat", "blon", "geom"], filter=flt)
             for r in tbl.to_pylist():
                 try:
@@ -1311,12 +1335,7 @@ def load_road_geom(need=None):
 def _road_geom_count():
     """Jumlah geometri tersimpan (Parquet + SQLite) untuk tampilan sidebar, TANPA memuat dict."""
     n = 0
-    try:
-        import pyarrow.parquet as _pq
-        if os.path.exists(ROAD_GEOM_PARQUET):
-            n += int(_pq.ParquetFile(ROAD_GEOM_PARQUET).metadata.num_rows)
-    except Exception:
-        pass
+    n += _parq_rows(ROAD_GEOM_PARQUET, ROAD_GEOM_PARQUET_DIR)
     con = db_connect()
     try:
         n += int(con.execute("SELECT COUNT(*) FROM road_geom_cache").fetchone()[0])
@@ -2740,19 +2759,24 @@ with st.sidebar:
     ui.section("4️⃣ Paksa ON Wells NW/AWS")
     _nwaws_all = (raw[(raw["tipe"].isin(["NW", "AWS"])) & (raw["status"] == "OFF")]["well"].tolist()
                   if {"tipe", "status", "well"} <= set(raw.columns) else [])
+    _force_all = st.checkbox(f"Paksa semua NW/AWS OFF → ON (default) · {len(_nwaws_all)} sumur", value=True,
+                             key="force_all_nwaws",
+                             help="Default AKTIF: semua sumur NW/AWS berstatus OFF di Excel dipaksa ON (masuk "
+                                  "eligible). Matikan untuk memilih per sumur (tombol di bawah / tab Prioritas & "
+                                  "Status Khusus).")
     _fc1, _fc2 = st.columns(2)
-    if _fc1.button(f"Paksa ON semua ({len(_nwaws_all)})", disabled=(not _nwaws_all),
+    if _fc1.button(f"Paksa ON semua ({len(_nwaws_all)})", disabled=(_force_all or not _nwaws_all),
                    use_container_width=True, key="sb_force_all"):
         st.session_state["force_on_nwaws"] = _nwaws_all
         st.session_state["force_on_ms"] = list(_nwaws_all)   # samakan state multiselect tab → tak ter-reset balik OFF
         st.rerun()
-    if _fc2.button("Reset", disabled=(not st.session_state.get("force_on_nwaws")),
+    if _fc2.button("Reset", disabled=(_force_all or not st.session_state.get("force_on_nwaws")),
                    use_container_width=True, key="sb_force_reset"):
         st.session_state["force_on_nwaws"] = []
         st.session_state["force_on_ms"] = []
         st.rerun()
-    st.caption("Paksa semua sumur NW/AWS berstatus OFF agar masuk eligible. Pilih per sumur "
-               "ada di tab Prioritas & Status Khusus.")
+    st.caption("Default: semua NW/AWS OFF dipaksa ON. Matikan centang untuk pilih per sumur "
+               "(tombol di atas / tab Prioritas & Status Khusus).")
 
     st.divider()
     ui.section("5️⃣ Parameter & Konstrain · a. Filter Area & Unit")
@@ -2783,7 +2807,7 @@ with st.sidebar:
                 _lbl = f"{_PETANI} · {_ar}"
                 _ts_opts.append(_lbl); _opt_meta[_lbl] = ("arah", _ar)
         _ts_sel = st.multiselect("TS Spesifik Down (Dialihkan ke MWT)", _ts_opts,
-                                 default=[o for o in _ts_opts if o == "Bekasap_TS_C"],
+                                 default=[o for o in _ts_opts if o in ("Bekasap_TS_C", f"{_PETANI} · #31")],
                                  help="Pilih fasilitas TS yang sedang down. Sumur pada TS ini (reguler & "
                                       "backlog) dialihkan ke MWT. Petani_TS_C bisa dipilih per arah "
                                       "(North/South/#31/#16/Single Line) dari sheet Mapping_PetaniTS, "
@@ -3593,7 +3617,10 @@ in_raw = set(raw["well"])
 # Override OFF→ON untuk sumur NW/AWS terpilih (status Excel mungkin belum terupdate)
 nwaws_off_pool = raw[(raw["tipe"].isin(["NW", "AWS"])) & (raw["status"] == "OFF")][
     ["well", "tipe", "category", "field", "area"]].copy()
-force_on = set(st.session_state.get("force_on_nwaws", [])) & set(nwaws_off_pool["well"])
+if st.session_state.get("force_all_nwaws", True):
+    force_on = set(nwaws_off_pool["well"])            # default: semua NW/AWS OFF → ON
+else:
+    force_on = set(st.session_state.get("force_on_nwaws", [])) & set(nwaws_off_pool["well"])
 if force_on:
     raw.loc[raw["well"].isin(force_on), "status"] = "ON"
 
@@ -6891,12 +6918,17 @@ with tab_priority:
         # Opsi = nama sumur (bukan label), jadi state widget == force_on_nwaws. Tombol sidebar
         # menulis key "force_on_ms" juga, sehingga pilihan tidak ter-reset balik ke OFF oleh
         # widget yang menyimpan state lama. Disaring ke opsi valid supaya tak crash saat data ganti.
+        _force_all_on = st.session_state.get("force_all_nwaws", True)
+        if _force_all_on:
+            st.info("Mode **Paksa semua NW/AWS OFF → ON** (default) aktif di sidebar — semua sumur NW/AWS OFF "
+                    "otomatis ON. Matikan centang itu untuk memilih per sumur di sini.")
         _seed = (st.session_state["force_on_ms"] if "force_on_ms" in st.session_state
                  else [w for w in _names if w in force_on])
         st.session_state["force_on_ms"] = [w for w in _seed if w in _names]
         _picked = st.multiselect("Sumur NW/AWS OFF → paksa ON:", _names,
-                                 format_func=lambda w: _fmt.get(w, w), key="force_on_ms")
-        if set(_picked) != force_on:
+                                 format_func=lambda w: _fmt.get(w, w), key="force_on_ms",
+                                 disabled=_force_all_on)
+        if (not _force_all_on) and set(_picked) != force_on:
             st.session_state["force_on_nwaws"] = list(_picked)
             st.rerun()
         if force_on:
