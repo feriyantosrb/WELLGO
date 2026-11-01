@@ -787,8 +787,9 @@ def resolve_coords(df, spatial_db, cache, field_assign=None):
     if not spatial_db.empty:
         s_map = spatial_db.set_index("WELL")
         has_master = df["well"].isin(s_map.index)
-        df.loc[has_master, "lat"] = df.loc[has_master, "well"].map(s_map["LAT"])
-        df.loc[has_master, "lon"] = df.loc[has_master, "well"].map(s_map["LON"])
+        if has_master.any():   # guard: assign kosong ke kolom float bikin TypeError di pandas/Arrow baru
+            df.loc[has_master, "lat"] = pd.to_numeric(df.loc[has_master, "well"].map(s_map["LAT"]), errors="coerce")
+            df.loc[has_master, "lon"] = pd.to_numeric(df.loc[has_master, "well"].map(s_map["LON"]), errors="coerce")
 
         empty_fld = df["field"].isna() | (df["field"] == "")
         upd_fld = empty_fld & has_master
@@ -804,9 +805,10 @@ def resolve_coords(df, spatial_db, cache, field_assign=None):
         cmap = cache.set_index("well_name")
         miss = df["coord_source"] == "none"
         has_cache = miss & df["well"].isin(cmap.index)
-        df.loc[has_cache, "lat"] = df.loc[has_cache, "well"].map(cmap["lat"])
-        df.loc[has_cache, "lon"] = df.loc[has_cache, "well"].map(cmap["lon"])
-        df.loc[has_cache, "coord_source"] = "cache"
+        if has_cache.any():
+            df.loc[has_cache, "lat"] = pd.to_numeric(df.loc[has_cache, "well"].map(cmap["lat"]), errors="coerce")
+            df.loc[has_cache, "lon"] = pd.to_numeric(df.loc[has_cache, "well"].map(cmap["lon"]), errors="coerce")
+            df.loc[has_cache, "coord_source"] = "cache"
 
     if not spatial_db.empty and "FIELD" in spatial_db.columns:
         cent_f = spatial_db.groupby("FIELD")[["LAT", "LON"]].mean()
@@ -817,9 +819,10 @@ def resolve_coords(df, spatial_db, cache, field_assign=None):
 
     miss = df["coord_source"] == "none"
     has_cent = miss & df["field"].isin(cent_f.index)
-    df.loc[has_cent, "lat"] = df.loc[has_cent, "field"].map(cent_f["LAT"])
-    df.loc[has_cent, "lon"] = df.loc[has_cent, "field"].map(cent_f["LON"])
-    df.loc[has_cent, "coord_source"] = "imputed_field"
+    if has_cent.any():   # guard: tanpa ini, map kosong → assign str kosong ke kolom float64 → TypeError
+        df.loc[has_cent, "lat"] = pd.to_numeric(df.loc[has_cent, "field"].map(cent_f["LAT"]), errors="coerce")
+        df.loc[has_cent, "lon"] = pd.to_numeric(df.loc[has_cent, "field"].map(cent_f["LON"]), errors="coerce")
+        df.loc[has_cent, "coord_source"] = "imputed_field"
 
     for well, fld in field_assign.items():
         m = (df["well"] == well) & (df["coord_source"] == "none")
