@@ -6587,7 +6587,54 @@ with tab_diagnostics:
             st.bar_chart(per_day.set_index("Tanggal")["km/sumur"])
     else:
         st.info("Unggah berkas untuk melihat visualisasi matriks rute.")
-        
+
+    # ── Cakupan Jalan Nyata vs Garis Lurus (per rute/well) ─────────────────
+    ui.section("🛣️ Jalan Nyata vs 📏 Garis Lurus", eyebrow="Leg rute mana pakai jarak jalan nyata (cache) & mana jatuh ke garis lurus (haversine)")
+    if not _USE_ROAD or not _ROAD_KM:
+        st.info("Mode jarak jalan nyata (OSRM) tak aktif / cache kosong → SEMUA perangkaian memakai garis lurus (haversine).")
+    elif not len(scheduled_all):
+        st.caption("Belum ada rute terjadwal.")
+    else:
+        _rc_rows, _fleet_road, _fleet_straight = [], 0, 0
+        for (_u, _d), _g in scheduled_all.groupby(["plan_unit", "day_idx"]):
+            _c = _g[_g["has_coord"].fillna(False) & pd.to_numeric(_g["lat"], errors="coerce").notna()]
+            if not len(_c): continue
+            _la = pd.to_numeric(_c["lat"], errors="coerce").values
+            _lo = pd.to_numeric(_c["lon"], errors="coerce").values
+            _wl = _c["well"].values
+            _srcs = (_c["coord_source"].astype(str).values if "coord_source" in _c.columns else [""] * len(_c))
+            _order = _solve_route(_la, _lo)[0] if len(_c) >= 2 else [0]
+            _well_road = {i: [] for i in range(len(_c))}
+            for _k in range(1, len(_order)):
+                _a, _b = _order[_k - 1], _order[_k]
+                _ka = _rk(_la[_a], _lo[_a]); _kb = _rk(_la[_b], _lo[_b])
+                _isroad = (_ROAD_KM.get((_ka, _kb)) is not None) or (_ROAD_KM.get((_kb, _ka)) is not None)
+                if _isroad: _fleet_road += 1
+                else: _fleet_straight += 1
+                _well_road[_a].append(_isroad); _well_road[_b].append(_isroad)
+            for _i in range(len(_c)):
+                _stt = _well_road[_i]
+                _lbl = ("• tunggal (tanpa leg)" if not _stt else
+                        "🛣️ Jalan nyata" if all(_stt) else
+                        "📏 Garis lurus" if not any(_stt) else "🔀 Campuran")
+                _rc_rows.append({"Unit": _u, "Hari": int(_d), "Well": _wl[_i], "Rangkai": _lbl,
+                                 "Koordinat": ("centroid field" if _srcs[_i] in ("imputed_field", "manual_field") else "asli"),
+                                 "Leg jalan": int(sum(_stt)), "Leg lurus": int(len(_stt) - sum(_stt))})
+        if _rc_rows:
+            _rcdf = pd.DataFrame(_rc_rows)
+            _tl = _fleet_road + _fleet_straight
+            _cov = (100.0 * _fleet_road / _tl) if _tl else 0.0
+            _n_straight = int((_rcdf["Rangkai"] == "📏 Garis lurus").sum())
+            st.caption(f"Dari **{_tl}** leg rute fleet: **{_fleet_road}** jalan nyata (cache) + **{_fleet_straight}** garis "
+                       f"lurus (haversine) → cakupan jalan nyata **{_cov:.0f}%**. **{_n_straight}** sumur dirangkai murni "
+                       "garis lurus (pasangan belum ada di cache, atau koordinat = centroid field). Lengkapi cache lewat "
+                       "update_road_cache untuk menaikkan cakupan.")
+            _flt = st.selectbox("Filter", ["Semua", "📏 Garis lurus", "🔀 Campuran", "🛣️ Jalan nyata"], key="roadcov_flt")
+            _vw = _rcdf if _flt == "Semua" else _rcdf[_rcdf["Rangkai"] == _flt]
+            st.dataframe(_vw.sort_values(["Rangkai", "Unit", "Hari", "Well"]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Tak ada rute berkoordinat untuk dinilai.")
+
     ui.section("Raw Data Perencanaan Rute", eyebrow="Tabel breakdown logistik operasional")
     if len(disp):
         scols_view = ["day_idx", "plan_day", "plan_unit", "manual", "timing_label", "tipe", "well", "subarea", "dur", "min_date", "max_date"]
