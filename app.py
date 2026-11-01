@@ -3851,7 +3851,12 @@ if man:
         _u = info["unit"]
         _uzone = "remote" if _u in REMOTE_UNITS else "non-remote"
         _wzone = str(week_df.loc[m, "zone"].iloc[0])
-        if _uzone != _wzone:
+        # Mapping unit (allow_units) MENANG atas batasan zona: bila unit tujuan termasuk daftar
+        # unit yang berhak atas sumur ini (mis. area remote di-mapping ke unit non-remote), assign
+        # lintas-zona DIIZINKAN. Tanpa mapping, batasan zona tetap berlaku (self-heal).
+        _allow_w = week_df.loc[m, "allow_units"].iloc[0] if "allow_units" in week_df.columns else None
+        _mapped_ok = isinstance(_allow_w, (list, tuple)) and len(_allow_w) and _u in _allow_w
+        if _uzone != _wzone and not _mapped_ok:
             zone_rejects.append((w, _wzone, _u, _uzone))
             st.session_state.get("manual_assign", {}).pop(w, None)  # buang assignment lintas-zona (self-heal)
             continue
@@ -4024,7 +4029,13 @@ leftover = week_df[~week_df["scheduled"]].copy()
 if len(leftover):
     # Gerbang deadline sama dgn missed_all: carry yang deadline-nya masih SETELAH periode
     # belum gagal apa-apa — biarkan jadi "ditunda" seperti kandidat lain.
-    _is_carry = leftover["well"].isin(ncmp_carry) & (leftover["max_date"] <= batch_hi)
+    # Hanya NCMP-Hambatan kategori ADD MANUAL yang tetap dipisah (ditangani jalur Backfill).
+    # NCMP-Hambatan Non-Add-Manual (Regular/NW/AWS) yang tak kebagian slot diperlakukan sebagai
+    # Miss-Deadline biasa → masuk `missed` supaya muncul di list miss, diagnosis, & bisa di-Rescue.
+    _am_lo = (leftover["is_addmanual"].fillna(False) if "is_addmanual" in leftover.columns
+              else pd.Series(False, index=leftover.index)) | \
+             leftover["category"].astype(str).str.upper().str.contains("MANUAL", na=False)
+    _is_carry = leftover["well"].isin(ncmp_carry) & (leftover["max_date"] <= batch_hi) & _am_lo
     missed_carry = leftover[_is_carry].copy()
     missed_carry["kode_hambatan"] = missed_carry["well"].map(ncmp_carry)
     missed_carry["kategori_ncmp"] = missed_carry["kode_hambatan"].map(carry_label)
@@ -4258,6 +4269,7 @@ def _comp_review_panel(df_src, key, only_hits=False):
     "📘 Panduan", "📅 Jadwal Operasional", "🗺️ Peta Rute", "🛒 Cart Manual",
     "🗃️ SCH Database", "📏 Analisis Jarak", "⭐ Prioritas & Status Khusus", "📤 Export", "🧾 Kandidat"
 ])
+_kandidat_export = pd.DataFrame()   # diisi di tab Kandidat; dipakai sbg sheet 'Kandidat' di Master Mingguan
 
 with tab_candidates:
     ui.section("Monitor Kandidat — Smart Schedule", eyebrow=f"Semua sumur dari Excel · periode {per_lo_ts.date()} s/d {per_hi_ts.date()}")
@@ -4353,22 +4365,22 @@ with tab_candidates:
     if pick_stat != "Semua": view = view[view["Status Periode"] == pick_stat]
     if pick_fld != "Semua": view = view[view["field"].astype(str) == pick_fld]
 
-    show = view[["well", "field", "area", "subarea", "Kategori", "Tier", "min_date", "max_date", "Overlap Window", "Status Periode"]].rename(
-        columns={"well": "Well", "field": "Field", "area": "Area", "subarea": "Sub-area",
-                 "min_date": "Min Date", "max_date": "Max Date (deadline)"}).copy()
-    if unit_map:
-        # Kolom audit: unit mana saja yang berhak atas sumur ini menurut sheet Mapping_Unit.
-        show.insert(4, "Unit Mapping", view["allow_units"].map(lambda u: ", ".join(u) if u else "— (bebas)"))
-    show["Min Date"] = pd.to_datetime(show["Min Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
-    show["Max Date (deadline)"] = pd.to_datetime(show["Max Date (deadline)"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
-    st.dataframe(show.sort_values(["Status Periode", "Field", "Well"]), use_container_width=True, hide_index=True)
-
-    _buf = BytesIO()
-    with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
-        xl_sheet(_w, show, "Kandidat")
-    st.download_button("⬇️ Unduh Monitor Kandidat (.xlsx)", _buf.getvalue(),
-                       file_name=f"kandidat_monitor_{per_lo_ts.date()}_{per_hi_ts.date()}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    def _mk_kandidat_tbl(_src):
+        _t = _src[["well", "field", "area", "subarea", "Kategori", "Tier", "min_date", "max_date", "Overlap Window", "Status Periode"]].rename(
+            columns={"well": "Well", "field": "Field", "area": "Area", "subarea": "Sub-area",
+                     "min_date": "Min Date", "max_date": "Max Date (deadline)"}).copy()
+        if unit_map:
+            # Kolom audit: unit mana saja yang berhak atas sumur ini menurut sheet Mapping_Unit.
+            _t.insert(4, "Unit Mapping", _src["allow_units"].map(lambda u: ", ".join(u) if u else "— (bebas)"))
+        _t["Min Date"] = pd.to_datetime(_t["Min Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+        _t["Max Date (deadline)"] = pd.to_datetime(_t["Max Date (deadline)"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+        return _t.sort_values(["Status Periode", "Field", "Well"])
+    show = _mk_kandidat_tbl(view)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    # Monitor Kandidat DIGABUNG ke Master Mingguan (sheet 'Kandidat') — pakai SELURUH kandidat (cd), bukan view terfilter.
+    _kandidat_export = _mk_kandidat_tbl(cd)
+    st.caption("ℹ️ Unduhan Monitor Kandidat kini menyatu di **Master Mingguan (.xlsx)** (tab Export), sheet "
+               "**Kandidat** — berisi SEMUA kandidat (tak terpengaruh filter di atas).")
 
 with tab_guide:
     guide.render_guide()
@@ -4971,7 +4983,13 @@ with tab_cart:
                     (float(_r["lat"]), float(_r["lon"])))
         _near_rows = []
         for _, _w in missed.sort_values(["urgency", "max_date"]).iterrows():
-            _pool = REMOTE_UNITS if str(_w.get("area", "")).upper() in REMOTE_AREAS else NONREMOTE_UNITS
+            # Hormati mapping unit (allow_units) bila ada — bisa lintas zona (mis. sumur area remote
+            # yang di-mapping ke unit non-remote). Tanpa mapping, pakai zona area seperti biasa.
+            _allow = _w.get("allow_units")
+            if isinstance(_allow, (list, tuple)) and len(_allow):
+                _pool = [u for u in (list(REMOTE_UNITS) + list(NONREMOTE_UNITS)) if u in _allow]
+            else:
+                _pool = REMOTE_UNITS if str(_w.get("area", "")).upper() in REMOTE_AREAS else NONREMOTE_UNITS
             _cand_days = _cand_days_tol(_w)
             _has_c = bool(_w.get("has_coord", True)) and pd.notna(_w.get("lat"))
             _best = None                       # (unit, day, dist)
@@ -5247,7 +5265,12 @@ with tab_cart:
         _rescued, _added_km, _skip_far, _n_late, _n_early = [], 0.0, 0, 0, 0
         for _, _w in missed.sort_values(["urgency", "max_date"]).iterrows():
             _wn = _w["well"]
-            _pool = REMOTE_UNITS if str(_w.get("area", "")).upper() in REMOTE_AREAS else NONREMOTE_UNITS
+            # Hormati mapping unit (allow_units) bila ada — bisa lintas zona; tanpa mapping pakai zona area.
+            _allow = _w.get("allow_units")
+            if isinstance(_allow, (list, tuple)) and len(_allow):
+                _pool = [u for u in (list(REMOTE_UNITS) + list(NONREMOTE_UNITS)) if u in _allow]
+            else:
+                _pool = REMOTE_UNITS if str(_w.get("area", "")).upper() in REMOTE_AREAS else NONREMOTE_UNITS
             _cand_days = _cand_days_tol(_w)                # window ± toleransi Late/Early
             if not _cand_days:
                 continue
@@ -6689,6 +6712,7 @@ with tab_export:
         if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
         if len(missed_carry): xl_sheet(w, _annot_cand(missed_carry)[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
         if len(_off_export): xl_sheet(w, _off_export[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFF")
+        if len(_kandidat_export): xl_sheet(w, _kandidat_export, "Kandidat")   # Monitor Kandidat menyatu di sini
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
 
     if view_day is not None:
