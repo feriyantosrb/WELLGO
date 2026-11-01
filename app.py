@@ -1610,6 +1610,12 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
     dist_mat = _dist_matrix(lats, lons)
 
     field_arr = df["field"].values
+    # Sumur tanpa koordinat asli yang koordinatnya DI-IMPUTASI dari centroid field (mis. NW1 baru):
+    # koordinatnya kasar, jadi perangkaian berbasis jarak ke centroid bisa menyesatkan. Ditandai agar
+    # boleh dirangkai JARAK BERAPAPUN bila sefield dgn anggota klaster, atau sampai 7 km walau di luar
+    # elastic_limit. Tetap bisa jadi seed (punya koordinat + urgensi deadline).
+    imputed_arr = (df["coord_source"].isin(["imputed_field", "manual_field"]).values
+                   if "coord_source" in df.columns else np.zeros(len(df), dtype=bool))
     area_arr = df["area"].values
     has_fu = df["forced_unit"].notna().values
     fu_arr = df["forced_unit"].values
@@ -1693,10 +1699,21 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             c_dists = dist_mat[np.ix_(unit_clusters[u], cand_pool)]
             min_dists = c_dists.min(axis=0)
             max_dists = c_dists.max(axis=0)
+            _cluster_fields = {field_arr[i] for i in unit_clusters[u]}
+            _cluster_has_imputed = any(imputed_arr[i] for i in unit_clusters[u])
             valid_cands = []
             for i_cand, cand_idx in enumerate(cand_pool):
                 d_min = min_dists[i_cand]; d_max = max_dists[i_cand]; urg = urg_arr[cand_idx]
                 is_same_fld = (target_fld is not None and field_arr[cand_idx] == target_fld)
+                # Sumur koordinat-imputasi (field centroid): koordinat kasar → aturan khusus.
+                _samefld_any = is_same_fld or (field_arr[cand_idx] in _cluster_fields)
+                _imp_involved = imputed_arr[cand_idx] or _cluster_has_imputed
+                if _samefld_any and _imp_involved:
+                    # Ada well di FIELD yang sama & salah satunya imputasi → rangkai JARAK BERAPAPUN.
+                    valid_cands.append((cand_idx, d_min, d_min - 60)); continue
+                if imputed_arr[cand_idx] and d_min <= 7.0:
+                    # Kandidat imputasi: boleh dirangkai sampai 7 km walau di luar elastic_limit normal.
+                    valid_cands.append((cand_idx, d_min, d_min - 5)); continue
                 if d_max > elastic_limit: continue
                 if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and (urg <= 2 or pullfwd_arr[cand_idx])):
                     c_score = d_min
