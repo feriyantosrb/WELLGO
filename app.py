@@ -762,6 +762,8 @@ def load_candidates(file_bytes, sheet):
     # SSF (Static/Shut-in survey) dari kolom REMARK (Remark / REMARK for IEMS Req or Spare candidate).
     # Dipakai utk label "PRQ (SSF)" & menandai sumur ini strict 2-kunjungan.
     df["is_ssf"] = rmk.str.contains(r"\bSSF\b", regex=True, na=False)
+    # Permintaan HOLD di remark (mis. "Hold test menunggu konfirmasi PE") → JANGAN dijadwalkan dulu.
+    df["is_hold"] = rmk.str.contains(r"\bHOLD\b|DI[\s-]*HOLD|DITAHAN|DI[\s-]*TAHAN|MENUNGGU\s+KONFIRMASI", regex=True, na=False)
     df["is_addmanual"] = cat_u.str.contains("MANUAL", na=False) & (df["req_tag"] == "") & ~cat_force
     df["is_gp"] = st_.eq("GP")
     df["is_reg_a"] = cat_u.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
@@ -2224,7 +2226,10 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
 
     off_wells = cand[cand["status"] == "OFF"].copy()
     woff_wells = raw[raw["well"].isin(woff_set)].copy()
-    elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set))].copy()
+    # HOLD dari remark → disisihkan dari eligible (tak dijadwalkan), tetap tampil sbg daftar Hold.
+    _hold_c = cand["is_hold"].fillna(False) if "is_hold" in cand.columns else pd.Series(False, index=cand.index)
+    hold_wells = cand[_hold_c].copy()
+    elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set)) & (~_hold_c)].copy()
     # NCMP-Hambatan: hanya kategori Regular/NW/AWS yang dijadwalkan ULANG sebagai carry (ikut lapis
     # prioritas optimasi utama, _base_prio). Kategori Add Manual TIDAK diberi status carry — ia tetap
     # di jalur Add Manual/Backfill (mengisi sisa kapasitas), sesuai permintaan: NCMP Add Manual
@@ -2281,7 +2286,7 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     return {"batch_lo": batch_lo, "batch_hi": batch_hi, "cand": cand, "comp_wells": comp_wells,
             "elig": elig, "elig_all": elig_all, "expired_df": expired_df, "ncmp_carry": ncmp_carry,
             "ncmp_expired": ncmp_expired, "ncmp_replan": ncmp_replan, "nocoord": nocoord,
-            "off_wells": off_wells, "pending_nodata": pending_nodata, "pending_wells": pending_wells,
+            "off_wells": off_wells, "hold_wells": hold_wells, "pending_nodata": pending_nodata, "pending_wells": pending_wells,
             "replan_df": replan_df, "woff_wells": woff_wells}
 
 
@@ -3694,6 +3699,7 @@ else:
     _addman_pool = elig.iloc[0:0].copy()
 expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["ncmp_expired"]
 ncmp_replan, nocoord, off_wells = _E["ncmp_replan"], _E["nocoord"], _E["off_wells"]
+hold_wells = _E["hold_wells"]
 
 # Reklasifikasi carry dari riwayat SCH penuh: sumur yang baris SCH Database TERBARU-nya NCMP
 # ber-hambatan (FACI/ROAD/WOFF) — walau tanggalnya DI LUAR periode & kolom SCH Excel belum NCMP —
@@ -4304,11 +4310,13 @@ with tab_candidates:
     _carry_w = set(missed_carry["well"]) if len(missed_carry) else set()
     _elig_w = set(elig_all["well"]) if len(elig_all) else set()
     _off_w  = set(off_wells["well"]) if len(off_wells) else set()
+    _hold_w = set(hold_wells["well"]) if len(hold_wells) else set()
 
     def _cand_status(r):
         w = r["well"]
         if w in executed: return "✔️ COMP (sudah)"
         if w in pending_set: return "⏳ Pending"
+        if w in _hold_w: return "⏸️ Hold (remark)"
         if w in _sched_map:
             u, di = _sched_map[w]
             return f"✅ Dijadwalkan · {u} · H{int(di)}"
@@ -6696,6 +6704,8 @@ with tab_export:
         "BOPD": [round(float(v), 1) if pd.notna(v) else None for v in _bopd_col] if len(_jm) else [],
         "Timing": _jm["timing"].values if ("timing" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
         "Early_late": _jm["timing_label"].values if ("timing_label" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
+        "Remark": (_jm["remark"].astype(str).replace({"nan": "", "None": ""}).values
+                   if ("remark" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
     })
 
     _rt_rows = []
@@ -6733,6 +6743,9 @@ with tab_export:
         if len(missed_carry): xl_sheet(w, _annot_cand(missed_carry)[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
         if len(_off_export): xl_sheet(w, _off_export[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFF")
         if len(_kandidat_export): xl_sheet(w, _kandidat_export, "Kandidat")   # Monitor Kandidat menyatu di sini
+        if len(hold_wells):   # sumur ber-remark HOLD (disisihkan dari jadwal)
+            _hold_cols = [c for c in ["well", "field", "area", "subarea", "category", "min_date", "max_date", "remark", "remark_iems"] if c in hold_wells.columns]
+            xl_sheet(w, hold_wells[_hold_cols].rename(columns={"min_date": "earliest", "max_date": "deadline"}), "Hold")
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
 
     if view_day is not None:
