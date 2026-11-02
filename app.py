@@ -362,6 +362,15 @@ def carry_code(comment):
 def carry_label(code):
     return f"Not Complete (NCMP) {code}-Miss Deadline" if code else NCMP_CARRY_LABEL
 
+# ── Penanda penjadwalan ulang (RESC) ──────────────────────────────────────
+# Hanya NCMP yang COMMENT IF NOT COMPLETE-nya menandai RESC yang dijadwalkan
+# ulang. "RESC" eksplisit maupun hambatan lapangan FACI/ROAD/WOFF (yang memang
+# wajib dibawa ulang) sama-sama dianggap penanda RESC. NCMP tanpa penanda ini
+# (komentar kosong/lain) hanya jadi informasi, tak dijadwalkan lagi.
+def resc_marker(comment):
+    s = str(comment).upper()
+    return bool(re.search(r"\bRESC", s)) or bool(carry_code(s))
+
 SCHDB_COLS = ["well", "unit", "date", "raw_stat", "stat", "reason", "comment", "note_resc"]
 
 def read_schdb(file_bytes):
@@ -764,6 +773,8 @@ def load_candidates(file_bytes, sheet):
     df["is_ssf"] = rmk.str.contains(r"\bSSF\b", regex=True, na=False)
     # Permintaan HOLD di remark (mis. "Hold test menunggu konfirmasi PE") → JANGAN dijadwalkan dulu.
     df["is_hold"] = rmk.str.contains(r"\bHOLD\b|DI[\s-]*HOLD|DITAHAN|DI[\s-]*TAHAN|MENUNGGU\s+KONFIRMASI", regex=True, na=False)
+    # Remark Completed/Complete/Done → sudah selesai, jangan dijadwalkan lagi.
+    df["is_done"] = rmk.str.contains(r"\bCOMPLETED?\b|\bDONE\b", regex=True, na=False)
     df["is_addmanual"] = cat_u.str.contains("MANUAL", na=False) & (df["req_tag"] == "") & ~cat_force
     df["is_gp"] = st_.eq("GP")
     df["is_reg_a"] = cat_u.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
@@ -2226,10 +2237,15 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
 
     off_wells = cand[cand["status"] == "OFF"].copy()
     woff_wells = raw[raw["well"].isin(woff_set)].copy()
-    # HOLD dari remark → disisihkan dari eligible (tak dijadwalkan), tetap tampil sbg daftar Hold.
+    # Remark HOLD atau COMPLETED/DONE → disisihkan dari eligible (tak dijadwalkan), tetap tampil sbg daftar.
     _hold_c = cand["is_hold"].fillna(False) if "is_hold" in cand.columns else pd.Series(False, index=cand.index)
-    hold_wells = cand[_hold_c].copy()
-    elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set)) & (~_hold_c)].copy()
+    _done_c = cand["is_done"].fillna(False) if "is_done" in cand.columns else pd.Series(False, index=cand.index)
+    _skip_c = _hold_c | _done_c
+    hold_wells = cand[_skip_c].copy()
+    if len(hold_wells):
+        hold_wells["skip_reason"] = np.where(hold_wells.get("is_hold", pd.Series(False, index=hold_wells.index)).fillna(False),
+                                             "HOLD (remark)", "COMPLETED (remark)")
+    elig_all = cand[(cand["status"] != "OFF") & (~cand["well"].isin(woff_set)) & (~_skip_c)].copy()
     # NCMP-Hambatan: hanya kategori Regular/NW/AWS yang dijadwalkan ULANG sebagai carry (ikut lapis
     # prioritas optimasi utama, _base_prio). Kategori Add Manual TIDAK diberi status carry — ia tetap
     # di jalur Add Manual/Backfill (mengisi sisa kapasitas), sesuai permintaan: NCMP Add Manual
@@ -2832,7 +2848,7 @@ with st.sidebar:
                 _lbl = f"{_PETANI} · {_ar}"
                 _ts_opts.append(_lbl); _opt_meta[_lbl] = ("arah", _ar)
         _ts_sel = st.multiselect("TS Spesifik Down (Dialihkan ke MWT)", _ts_opts,
-                                 default=[o for o in _ts_opts if o in ("Bekasap_TS_C", f"{_PETANI} · #31")],
+                                 default=[o for o in _ts_opts if o == f"{_PETANI} · #31"],
                                  help="Pilih fasilitas TS yang sedang down. Sumur pada TS ini (reguler & "
                                       "backlog) dialihkan ke MWT. Petani_TS_C bisa dipilih per arah "
                                       "(North/South/#31/#16/Single Line) dari sheet Mapping_PetaniTS, "
@@ -3462,7 +3478,10 @@ if len(_nw):
         pop = _w["pop_date"] if _has_pop_n else pd.NaT
         _cyc = (pd.Timestamp(pop).normalize() if pd.notna(pop)
                 else (pd.Timestamp(_w["min_date"]).normalize() if pd.notna(_w.get("min_date")) else None))
-        ds = sorted(pd.Timestamp(d).normalize() for d, _r in recs if pd.notna(d))
+        # Hanya COMP ber-Reason NW1 yang menaikkan fase (NW1→NW2 & NW2→NW3 sama-sama
+        # dipicu Reason NW1 di SCH Database). COMP dgn reason lain tak menaikkan fase.
+        ds = sorted(pd.Timestamp(d).normalize() for d, _r in recs
+                    if pd.notna(d) and ("NW1" in str(_r) or "NEW WELL 1" in str(_r)))
         if _cyc is not None:
             ds = [d for d in ds if d >= _cyc]
         n_comp = len(ds)
@@ -3495,6 +3514,41 @@ if "last_wt" in raw.columns:
         _m = _mask & _lw.notna()
         raw.loc[_m, "min_date"] = _lw[_m] + pd.Timedelta(days=_lo)
         raw.loc[_m, "max_date"] = _lw[_m] + pd.Timedelta(days=_hi)
+
+# ── Info transisi AWS/NW untuk Excel export ──────────────────────────────────
+# Sumur yang naik fase (AWS2 / NW2 / NW3) beserta window fase lanjutnya. Bila window
+# masuk periode terpilih → memang dijadwalkan periode ini; bila di luar periode →
+# hanya informasi: kapan / di window mana fase ke-n akan dijadwalkan. (Tampil hanya
+# di Excel export, bukan panel layar.)
+_trans = {}
+for _wn, (_ph, _, _) in aws_active.items():
+    if _ph == "AWS2":
+        _trans[_wn] = "AWS2"
+for _r in aws_extra_rows:
+    _trans[_r["well"]] = "AWS2"
+for _wn, (_p, _) in nw_active.items():
+    _trans[_wn] = f"NW{_p}"
+nwaws_trans = pd.DataFrame(columns=["Well", "Field", "Area", "Fase_berikut",
+                                    "Window_mulai", "Window_akhir", "Status"])
+if _trans:
+    _rwt = raw.drop_duplicates("well").set_index("well")
+    _rows_t = []
+    for _wn, _fase in _trans.items():
+        if _wn not in _rwt.index:
+            continue
+        _lo = _rwt.at[_wn, "min_date"] if "min_date" in _rwt.columns else pd.NaT
+        _hi = _rwt.at[_wn, "max_date"] if "max_date" in _rwt.columns else pd.NaT
+        _inper = pd.notna(_lo) and pd.notna(_hi) and (_lo <= per_hi_ts) and (_hi >= per_lo_ts)
+        _rows_t.append({
+            "Well": _wn,
+            "Field": _rwt.at[_wn, "field"] if "field" in _rwt.columns else "",
+            "Area": _rwt.at[_wn, "area"] if "area" in _rwt.columns else "",
+            "Fase_berikut": _fase,
+            "Window_mulai": _lo, "Window_akhir": _hi,
+            "Status": "Dijadwalkan periode ini" if _inper else "Info: di luar periode (dijadwalkan nanti)",
+        })
+    if _rows_t:
+        nwaws_trans = pd.DataFrame(_rows_t).sort_values(["Status", "Fase_berikut", "Well"])
 
 # ── COMP hanya berlaku untuk WINDOW YANG BERJALAN ─────────────────────────
 # Kolom SCH STATUS dan riwayat execution_log memuat status tes TERAKHIR tanpa
@@ -3639,8 +3693,11 @@ ncmp_set = (set(ncmp_log["well"]) | ncmp_col) - executed - pending_set
 
 in_raw = set(raw["well"])
 
-# Override OFF→ON untuk sumur NW/AWS terpilih (status Excel mungkin belum terupdate)
-nwaws_off_pool = raw[(raw["tipe"].isin(["NW", "AWS"])) & (raw["status"] == "OFF")][
+# Override OFF→ON untuk sumur NW/AWS terpilih (status Excel mungkin belum terupdate).
+# HANYA NW/AWS yang window-nya overlap periode terpilih (min<=per_hi & max>=per_lo) — di luar
+# periode tak ikut dipaksa ON (tak relevan untuk siklus ini).
+_nwaws_inper = ((raw["min_date"] <= per_hi_ts) & (raw["max_date"] >= per_lo_ts))
+nwaws_off_pool = raw[(raw["tipe"].isin(["NW", "AWS"])) & (raw["status"] == "OFF") & _nwaws_inper][
     ["well", "tipe", "category", "field", "area"]].copy()
 if st.session_state.get("force_all_nwaws", True):
     force_on = set(nwaws_off_pool["well"])            # default: semua NW/AWS OFF → ON
@@ -3656,7 +3713,12 @@ if skip_woff:
 else:
     woff_set = set()
 
-ncmp_replan = (ncmp_set & in_raw) - woff_set
+# Penjadwalan ulang HANYA untuk NCMP ber-RESC (COMMENT IF NOT COMPLETE = RESC,
+# atau hambatan FACI/ROAD/WOFF) di dalam periode terpilih. ncmp_log sudah period-
+# scoped (plan_date per_lo..per_hi) sehingga NCMP sebelum periode otomatis tak
+# ikut; NCMP dari kolom SCH Excel (tanpa komentar) juga bukan RESC → info saja.
+ncmp_resc = {r.well for r in ncmp_log.itertuples() if resc_marker(getattr(r, "comment", ""))}
+ncmp_replan = (ncmp_resc & in_raw) - woff_set
 ncmp_no_data = sorted(ncmp_set - in_raw)
 
 ncmp_col_df = pd.DataFrame({"well": sorted(ncmp_col), "reason": "", "comment": "", "plan_date": "(kolom)"})
@@ -4310,11 +4372,13 @@ with tab_candidates:
     _carry_w = set(missed_carry["well"]) if len(missed_carry) else set()
     _elig_w = set(elig_all["well"]) if len(elig_all) else set()
     _off_w  = set(off_wells["well"]) if len(off_wells) else set()
-    _hold_w = set(hold_wells["well"]) if len(hold_wells) else set()
+    _hold_w = set(hold_wells.loc[hold_wells["is_hold"].fillna(False), "well"]) if ("is_hold" in hold_wells.columns and len(hold_wells)) else set()
+    _done_w = set(hold_wells.loc[hold_wells["is_done"].fillna(False), "well"]) if ("is_done" in hold_wells.columns and len(hold_wells)) else set()
 
     def _cand_status(r):
         w = r["well"]
         if w in executed: return "✔️ COMP (sudah)"
+        if w in _done_w: return "✅ Completed (remark)"
         if w in pending_set: return "⏳ Pending"
         if w in _hold_w: return "⏸️ Hold (remark)"
         if w in _sched_map:
@@ -6666,7 +6730,7 @@ with tab_export:
     # kandidat, sehingga sumur OFF eligible yang ter-exclude (mis. PENDING di SCH_Database) tidak
     # ikut terekspor. Yang sudah executed (benar-benar dites) tetap dikecualikan.
     def _annot_cand(df):
-        """Tambah kolom Kandidat (TS/MWT), Unit_Name (unit_name asli Excel), dan Tes_Terakhir_SCH."""
+        """Tambah kolom Kandidat (TS/MWT), Unit_History (unit_name asli Excel = riwayat unit), dan Tes_Terakhir_SCH."""
         if not len(df): return df
         df = df.copy()
         _u = (df["unit_name_ts"].astype(str).str.strip() if "unit_name_ts" in df.columns
@@ -6674,14 +6738,14 @@ with tab_export:
         _t = (df["is_ts"].fillna(False) if "is_ts" in df.columns
               else _u.str.upper().str.contains("TS", na=False))
         df["Kandidat"] = ["TS" if x else "MWT" for x in _t.values]
-        df["Unit_Name"] = _u.values
+        df["Unit_History"] = _u.values
         df["Tes_Terakhir_SCH"] = df["well"].map(last_sch_str)
         return df
 
     _off_export = _annot_cand(raw[(raw["status"] == "OFF")
                       & (raw["min_date"] <= batch_hi) & (raw["max_date"] >= batch_lo)
                       & (~raw["well"].isin(executed))].copy())
-    _off_cols = [c for c in ["well", "unit", "Kandidat", "Unit_Name", "subarea", "field", "category", "kat_full",
+    _off_cols = [c for c in ["well", "unit", "Kandidat", "Unit_History", "subarea", "field", "category", "kat_full",
                              "dur", "status", "min_date", "max_date", "Tes_Terakhir_SCH"] if c in _off_export.columns]
     _off_ren = {"unit": "unit_asli", "dur": "durasi_test_menit", "kat_full": "kategori",
                 "min_date": "earliest", "max_date": "deadline", "status": "status_sumur"}
@@ -6735,7 +6799,7 @@ with tab_export:
         "Well": _jm["well"].values if len(_jm) else [],
         "Unit": _jm["plan_unit"].values if len(_jm) else [],
         "Kandidat": ["TS" if t else "MWT" for t in _is_ts_v.values],
-        "Unit_Name": _una.values,
+        "Unit_History": _una.values,
         "Sch_Date": (pd.to_datetime(_jm["plan_day"], errors="coerce").dt.strftime("%Y-%m-%d").values if len(_jm) else []),
         "Min_Date": (pd.to_datetime(_jm["min_date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-").values
                      if ("min_date" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
@@ -6751,7 +6815,7 @@ with tab_export:
         "BOPD": [round(float(v), 1) if pd.notna(v) else None for v in _bopd_col] if len(_jm) else [],
         "Timing": _jm["timing"].values if ("timing" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
         "Early_late": _jm["timing_label"].values if ("timing_label" in _jm.columns and len(_jm)) else ([""] * len(_jm)),
-        "Remark": (_jm["remark"].astype(str).replace({"nan": "", "None": ""}).values
+        "Remark di Schedule": (_jm["remark"].astype(str).replace({"nan": "", "None": ""}).values
                    if ("remark" in _jm.columns and len(_jm)) else ([""] * len(_jm))),
     })
 
@@ -6785,14 +6849,16 @@ with tab_export:
     with pd.ExcelWriter(out_w, engine="openpyxl") as w:
         xl_sheet(w, _jadwal, "Jadwal_Mingguan", "JadwalMingguan")
         xl_sheet(w, _rute_df, "Rute_Mingguan", "RuteMingguan")
-        if len(missed): xl_sheet(w, _annot_cand(missed)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "urgency", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
-        if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_Name", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
+        if len(missed): xl_sheet(w, _annot_cand(missed)[["well", "unit", "Kandidat", "Unit_History", "subarea", "category", "dur", "urgency", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Miss-Deadline", "MissDeadline")
+        if len(missed_outside): xl_sheet(w, _annot_cand(missed_outside)[["well", "unit", "Kandidat", "Unit_History", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "Luar-Periode", "LuarPeriode")
         if len(missed_carry): xl_sheet(w, _annot_cand(missed_carry)[["well", "kategori_ncmp", "kode_hambatan", "unit", "subarea", "category", "dur", "min_date", "max_date", "Tes_Terakhir_SCH"]].rename(columns={"kategori_ncmp": "kategori", "kode_hambatan": "kode", "dur": "durasi_test_menit", "min_date": "earliest", "max_date": "deadline", "unit": "unit_asli"}), "NCMP-Hambatan", "NCMPHambatan")
         if len(_off_export): xl_sheet(w, _off_export[_off_cols].rename(columns=_off_ren), "Well-OFF", "WellOFF")
         if len(_kandidat_export): xl_sheet(w, _kandidat_export, "Kandidat")   # Monitor Kandidat menyatu di sini
         if len(hold_wells):   # sumur ber-remark HOLD (disisihkan dari jadwal)
-            _hold_cols = [c for c in ["well", "field", "area", "subarea", "category", "min_date", "max_date", "remark", "remark_iems"] if c in hold_wells.columns]
-            xl_sheet(w, hold_wells[_hold_cols].rename(columns={"min_date": "earliest", "max_date": "deadline"}), "Hold")
+            _hold_cols = [c for c in ["well", "skip_reason", "field", "area", "subarea", "category", "min_date", "max_date", "remark", "remark_iems"] if c in hold_wells.columns]
+            xl_sheet(w, hold_wells[_hold_cols].rename(columns={"skip_reason": "sebab", "min_date": "earliest", "max_date": "deadline"}), "Hold-Completed", "HoldCompleted")
+        if len(nwaws_trans):   # transisi fase AWS1→AWS2 / NW1→NW2→NW3 (kapan fase ke-n dijadwalkan)
+            xl_sheet(w, nwaws_trans, "Transisi-AWS-NW", "TransisiAWSNW")
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
 
     if view_day is not None:
