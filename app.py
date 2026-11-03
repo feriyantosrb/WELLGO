@@ -363,13 +363,11 @@ def carry_label(code):
     return f"Not Complete (NCMP) {code}-Miss Deadline" if code else NCMP_CARRY_LABEL
 
 # ── Penanda penjadwalan ulang (RESC) ──────────────────────────────────────
-# Hanya NCMP yang COMMENT IF NOT COMPLETE-nya menandai RESC yang dijadwalkan
-# ulang. "RESC" eksplisit maupun hambatan lapangan FACI/ROAD/WOFF (yang memang
-# wajib dibawa ulang) sama-sama dianggap penanda RESC. NCMP tanpa penanda ini
-# (komentar kosong/lain) hanya jadi informasi, tak dijadwalkan lagi.
+# HANYA NCMP yang COMMENT IF NOT COMPLETE-nya memuat "RESC" yang dijadwalkan ulang.
+# Komentar lain (FACI/ROAD/WOFF, kosong, dll) TIDAK dijadwalkan ulang — hanya jadi
+# informasi NCMP terakhir. (Sesuai aturan: reschedule murni dari penanda RESC.)
 def resc_marker(comment):
-    s = str(comment).upper()
-    return bool(re.search(r"\bRESC", s)) or bool(carry_code(s))
+    return bool(re.search(r"\bRESC", str(comment).upper()))
 
 SCHDB_COLS = ["well", "unit", "date", "raw_stat", "stat", "reason", "comment", "note_resc"]
 
@@ -2167,7 +2165,7 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
     return wk, info
 
 def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
-               executed, comp_disp_set, pending_set, ncmp_replan, woff_set):
+               executed, comp_disp_set, pending_set, ncmp_replan, woff_set, ncmp_skip=None):
     """Kelayakan & urgensi satu periode: dari kandidat mentah → elig (siap dijadwalkan).
     Dijadikan fungsi supaya tab Analisis Performa bisa menjalankan periode LAIN dengan
     aturan yang persis sama — kalau blok ini disalin, dua salinannya pasti berbeda
@@ -2175,11 +2173,11 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     batch_lo, batch_hi = per_lo_ts, per_hi_ts
     win_in_range = (raw["min_date"] <= batch_hi) & (raw["max_date"] >= batch_lo)   # overlap window min-max
 
-    # NCMP ber-COMMENT IF NOT COMPLETE = FACI/ROAD/WOFF → dibawa ulang sepanjang periode.
-    # Kegagalannya hambatan lapangan, bukan kapasitas kru, jadi window yang sudah lewat
-    # tidak boleh mementalkannya seperti carry-over NCMP biasa.
-    ncmp_carry = {r.well: r.kode_hambatan for r in ncmp_df.itertuples()
-                  if r.kode_hambatan and r.well in ncmp_replan}
+    # NCMP ber-RESC → dibawa ulang sepanjang periode walau window-nya sudah lewat.
+    # Penanda reschedule eksplisit (RESC), bukan kapasitas kru, jadi tes gagal di awal
+    # periode tetap bisa dijadwalkan ulang di sisa periode yang sama.
+    ncmp_skip = ncmp_skip or set()
+    ncmp_carry = {w: "RESC" for w in ncmp_replan}
 
     # Carry-over NCMP TIDAK menembus aturan overlap. NCMP dari periode lampau yang
     # window-nya sudah lewat = overdue, dan overdue hanya boleh utk PRQ/ORQ (+FACI/ROAD/WOFF).
@@ -2230,7 +2228,11 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     pending_wells = raw[raw["well"].isin(pending_set)].copy()
     pending_nodata = sorted(pending_set - set(pending_wells["well"]))
     nwaws_dropped = raw[is_nwaws_c & ~in_range & ~overdue_prio & ~_outside_defer & (~raw["well"].isin(executed))].copy()
-    cand = raw[(in_range | is_ncmp | req_force | overdue_prio | addman_c | _outside_defer) & (~raw["well"].isin(executed | pending_set))].copy()
+    # NCMP non-RESC → disisihkan dari kandidat (tak dijadwalkan ulang walau window overlap),
+    # KECUALI yang memang permintaan eksplisit PRQ/ORQ (req_force/overdue_prio tetap dilayani).
+    _ncmp_skip_mask = raw["well"].isin(ncmp_skip) & ~req_force & ~overdue_prio
+    cand = raw[(in_range | is_ncmp | req_force | overdue_prio | addman_c | _outside_defer)
+               & (~raw["well"].isin(executed | pending_set)) & (~_ncmp_skip_mask)].copy()
 
     cand["np_in_range"] = np_in_range.loc[cand.index]
     cand["max_in_range"] = ((raw["max_date"] >= batch_lo) & (raw["max_date"] <= batch_hi)).loc[cand.index]
@@ -2798,8 +2800,23 @@ if spatial_db.empty: st.error("⚠️ Struktur berkas Data Spasial tidak valid a
 with st.sidebar:
     st.divider()
     ui.section("4️⃣ Paksa ON Wells NW/AWS")
-    _nwaws_all = (raw[(raw["tipe"].isin(["NW", "AWS"])) & (raw["status"] == "OFF")]["well"].tolist()
-                  if {"tipe", "status", "well"} <= set(raw.columns) else [])
+    # Hanya NW/AWS OFF yang window-nya overlap periode terpilih (konsisten dgn nwaws_off_pool).
+    # Periode dibaca dari state selectbox (sel_periode_pick); default = periode terakhir.
+    _sb_plo = _sb_phi = None
+    if HAS_PERIODS and period_opts is not None and len(period_opts):
+        _sp = st.session_state.get("sel_periode_pick")
+        if _sp not in period_opts.index:
+            _sp = period_opts.index[-1]
+        _sbe = period_opts.loc[_sp, "_e"]
+        _sb_plo = pd.Timestamp(period_opts.loc[_sp, "_s"])
+        _sb_phi = pd.Timestamp(_sbe) if pd.notna(_sbe) else _sb_plo + pd.Timedelta(days=9)
+    if {"tipe", "status", "well"} <= set(raw.columns):
+        _m_nwaws = raw["tipe"].isin(["NW", "AWS"]) & (raw["status"] == "OFF")
+        if _sb_plo is not None and {"min_date", "max_date"} <= set(raw.columns):
+            _m_nwaws &= (raw["min_date"] <= _sb_phi) & (raw["max_date"] >= _sb_plo)
+        _nwaws_all = raw[_m_nwaws]["well"].tolist()
+    else:
+        _nwaws_all = []
     _force_all = st.checkbox(f"Paksa semua NW/AWS OFF → ON (default) · {len(_nwaws_all)} sumur", value=True,
                              key="force_all_nwaws",
                              help="Default AKTIF: semua sumur NW/AWS berstatus OFF di Excel dipaksa ON (masuk "
@@ -3013,7 +3030,7 @@ with st.sidebar:
     sel_periode = None
     if HAS_PERIODS and period_opts is not None and len(period_opts):
         sel_periode = st.selectbox("Rentang Periode (Compiled Schedule)", list(period_opts.index),
-                                   index=len(period_opts) - 1,
+                                   index=len(period_opts) - 1, key="sel_periode_pick",
                                    help="WELLGO hanya memproses baris sumur pada rentang periode ini. "
                                         "Default menampilkan periode paling akhir (terkini).")
         per_lo = period_opts.loc[sel_periode, "_s"].date()
@@ -3713,12 +3730,14 @@ if skip_woff:
 else:
     woff_set = set()
 
-# Penjadwalan ulang HANYA untuk NCMP ber-RESC (COMMENT IF NOT COMPLETE = RESC,
-# atau hambatan FACI/ROAD/WOFF) di dalam periode terpilih. ncmp_log sudah period-
-# scoped (plan_date per_lo..per_hi) sehingga NCMP sebelum periode otomatis tak
-# ikut; NCMP dari kolom SCH Excel (tanpa komentar) juga bukan RESC → info saja.
+# Penjadwalan ulang HANYA untuk NCMP ber-RESC (COMMENT IF NOT COMPLETE memuat RESC)
+# di dalam periode terpilih. ncmp_log sudah period-scoped (plan_date per_lo..per_hi)
+# sehingga NCMP sebelum periode otomatis tak ikut; NCMP dari kolom SCH Excel (tanpa
+# komentar) juga bukan RESC → info saja. ncmp_skip = NCMP non-RESC → DISISIHKAN dari
+# penjadwalan (tak boleh ikut walau window-nya overlap), hanya tampil sbg informasi.
 ncmp_resc = {r.well for r in ncmp_log.itertuples() if resc_marker(getattr(r, "comment", ""))}
 ncmp_replan = (ncmp_resc & in_raw) - woff_set
+ncmp_skip = (ncmp_set & in_raw) - ncmp_resc
 ncmp_no_data = sorted(ncmp_set - in_raw)
 
 ncmp_col_df = pd.DataFrame({"well": sorted(ncmp_col), "reason": "", "comment": "", "plan_date": "(kolom)"})
@@ -3744,7 +3763,7 @@ if _USE_ROAD:
 _ckpt(f"road_dist (pairs={len(_ROAD_KM)}, detour={_ROAD_DETOUR:.3f})")
 
 _E = build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
-                executed, comp_disp_set, pending_set, ncmp_replan, woff_set)
+                executed, comp_disp_set, pending_set, ncmp_replan, woff_set, ncmp_skip)
 _ckpt(f"build_elig (elig={len(_E['elig'])}, cand={len(_E['cand'])})")
 batch_lo, batch_hi = _E["batch_lo"], _E["batch_hi"]
 cand, comp_wells, elig, elig_all = _E["cand"], _E["comp_wells"], _E["elig"], _E["elig_all"]
@@ -3763,17 +3782,9 @@ expired_df, ncmp_carry, ncmp_expired = _E["expired_df"], _E["ncmp_carry"], _E["n
 ncmp_replan, nocoord, off_wells = _E["ncmp_replan"], _E["nocoord"], _E["off_wells"]
 hold_wells = _E["hold_wells"]
 
-# Reklasifikasi carry dari riwayat SCH penuh: sumur yang baris SCH Database TERBARU-nya NCMP
-# ber-hambatan (FACI/ROAD/WOFF) — walau tanggalnya DI LUAR periode & kolom SCH Excel belum NCMP —
-# diperlakukan sebagai NCMP-carry, bukan Pure-Miss. Menutup kasus mis. PN058 (NCMP FACI 14 Okt
-# di luar periode 15-21). Hanya memengaruhi pelaporan (missed_carry), bukan optimasi yang sudah jalan.
-_in_raw_set = set(raw["well"])
-for _w, _v in _sch_last.items():
-    _stt, _cmt = _v[1], _v[2]
-    if _stt == "NCMP" and _w in _in_raw_set and _w not in ncmp_carry:
-        _cc = carry_code(_cmt)
-        if _cc:
-            ncmp_carry[_w] = _cc
+# Carry = RESC saja. NCMP non-RESC (termasuk FACI/ROAD/WOFF, baik di dalam maupun luar
+# periode) TIDAK lagi dibawa ulang — hanya informasi. Jadi tak ada reklasifikasi carry
+# dari riwayat SCH penuh di sini (dulu menambah FACI/ROAD/WOFF sbg carry; kini ditiadakan).
 pending_nodata, pending_wells = _E["pending_nodata"], _E["pending_wells"]
 replan_df, woff_wells = _E["replan_df"], _E["woff_wells"]
 
@@ -4374,6 +4385,7 @@ with tab_candidates:
     _off_w  = set(off_wells["well"]) if len(off_wells) else set()
     _hold_w = set(hold_wells.loc[hold_wells["is_hold"].fillna(False), "well"]) if ("is_hold" in hold_wells.columns and len(hold_wells)) else set()
     _done_w = set(hold_wells.loc[hold_wells["is_done"].fillna(False), "well"]) if ("is_done" in hold_wells.columns and len(hold_wells)) else set()
+    _ncmp_info_w = set(ncmp_skip)   # NCMP non-RESC → informasi saja, tak dijadwalkan ulang
 
     def _cand_status(r):
         w = r["well"]
@@ -4385,6 +4397,7 @@ with tab_candidates:
             u, di = _sched_map[w]
             return f"✅ Dijadwalkan · {u} · H{int(di)}"
         if (w in _off_w) or (str(r.get("status")).upper() == "OFF"): return "⛔ OFF"
+        if w in _ncmp_info_w: return "ℹ️ NCMP non-RESC (info, tak dijadwalkan ulang)"
         if w in _carry_w: return f"🚧 {carry_label(ncmp_carry.get(w, ''))}"
         if w in _miss_w: return "⚠️ Miss Deadline (kuota penuh)"
         if w in _mout_w: return "🗓️ Luar periode (deadline lampau)"
