@@ -2190,14 +2190,16 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
         info["km_akhir"] += _hopsum(members)
     return wk, info
 
-def pull_forward_thin_days(wk, max_wells, cross_cap=7.0):
+def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False):
     """Optimasi Lanjut — TARIK MAJU: isi hari LEBIH AWAL unit yang SAMA (mis. hari tipis 1 well)
     dengan sumur dari hari BELAKANGAN unit itu, supaya trip tipis terisi & hari belakang bebas.
-    Dijalankan SEBELUM pass Add Manual, sehingga Add Manual hanya mengisi sisa kapasitas setelah
-    konsolidasi ini.
+    Dijalankan SEBELUM pass Add Manual, lalu diulang di akhir pipeline agar pola hari-tipis yang
+    baru muncul dari Add Manual/assign manual ikut terkonsolidasi (berlaku di semua pilihan
+    "Mulai Planning dari Tanggal", bukan hanya saat mulai = awal periode).
       • Sumur SE-FIELD dgn anggota hari tujuan → bebas ditarik (tak dibatasi jarak).
       • BEDA field → hanya bila jarak JALAN ke klaster hari tujuan <= cross_cap (default 5–7 km).
       • Tetap on-time: tanggal tujuan harus >= min_date sumur (tak menarik sebelum window buka).
+      • skip_manual=True → sumur assign-manual user TIDAK dipindah (tetap jadi anchor/target).
     Menarik MAJU selalu aman thd deadline (tanggal jadi lebih awal). Return (wk_baru, info)."""
     info = {"moved": 0, "detail": []}
     if not len(wk) or "plan_unit" not in wk.columns or "day_idx" not in wk.columns:
@@ -2209,6 +2211,7 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0):
     coord_ok = lat.notna() & lon.notna()
     fld = wk["field"].astype(str) if "field" in wk.columns else pd.Series("", index=wk.index)
     _mnd = pd.to_datetime(wk.get("min_date"), errors="coerce")
+    _manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
 
     for u in [x for x in pd.unique(wk.loc[sched, "plan_unit"]) if x is not None and pd.notna(x)]:
         um = sched & (wk["plan_unit"] == u)
@@ -2227,6 +2230,8 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0):
                 for c in list(members.get(D2, [])):
                     if len(members[D1]) >= int(max_wells):
                         break
+                    if skip_manual and bool(_manual.loc[c]):
+                        continue                     # jangan pindah sumur assign-manual user
                     if pd.notna(_mnd.loc[c]) and pd.notna(d1date) and d1date < _mnd.loc[c]:
                         continue                     # window belum buka di tanggal tujuan → jangan early
                     _same = any(fld.loc[c] == fld.loc[m] for m in members[D1])
@@ -4073,6 +4078,17 @@ if man_un:
     week_df.loc[m_un, "day_idx"] = 0
     week_df.loc[m_un, "plan_day"] = pd.NaT
     week_df.loc[m_un, "manual"] = False
+
+# ── Tarik maju hari tipis (ULANG) setelah Add Manual & assign manual ───────────
+# Pass pertama (sebelum Add Manual) hanya melihat hasil optimasi utama. Pola hari-tipis bisa
+# BARU muncul dari penempatan Add Manual / assign manual — terutama saat Mulai Planning dari
+# Tanggal bukan awal periode (komposisi hari berbeda). Ulangi di sini pada jadwal FINAL, tanpa
+# memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
+if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
+    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=7.0, skip_manual=True)
+    if _pf2.get("moved"):
+        _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
+    _ckpt(f"pull_forward_thin_days (pass-2 final, moved={_pf2['moved']})")
 
 # ── Grouping ulang murni kedekatan (Pooled & Mapping Unit) ─────────────────
 # Dijalankan SETELAH seluruh penugasan final (termasuk assign manual) supaya yang
