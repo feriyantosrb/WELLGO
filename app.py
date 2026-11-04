@@ -1730,9 +1730,14 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                     valid_cands.append((cand_idx, d_min, d_min - 5)); continue
                 if d_max > elastic_limit: continue
                 if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and (urg <= 2 or pullfwd_arr[cand_idx])):
-                    c_score = d_min
-                    if is_same_fld: c_score -= 50
-                    if urg <= 2: c_score -= 20
+                    if is_same_fld:
+                        # Dalam satu field: rangkai berdasarkan DEADLINE dulu (urgensi), bukan jarak.
+                        # urg = hari ke deadline (makin kecil makin mendesak) jadi term utama; jarak
+                        # hanya pemecah seri. Offset besar agar se-field tetap didahulukan dr lintas-field.
+                        c_score = -100000.0 + urg * 100.0 + d_min
+                    else:
+                        c_score = d_min
+                        if urg <= 2: c_score -= 20
                     valid_cands.append((cand_idx, d_min, c_score))
             if not valid_cands: break
             valid_cands.sort(key=lambda x: x[2])
@@ -1823,6 +1828,8 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
     _thin_fields = set()
     while unassigned and (avail_remote or avail_nonremote):
         field_scores = {}
+        field_crit = {}       # jumlah sumur KRITIS (NW/AWS in-window / deadline hari ini / overdue) per field
+        field_min_urg = {}    # urgensi terkecil (paling mendesak) per field
         un_list = [i for i in unassigned if not has_fu[i]]
         if not un_list: break
         un_fields = field_arr[un_list]
@@ -1831,8 +1838,14 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             f_wells = [w for w in un_list if field_arr[w] == fld]
             if not f_wells: continue
             score = 0
+            _crit = 0
+            _minu = None
             for w in f_wells:
                 u = urg_arr[w]
+                if (_minu is None) or (u < _minu): _minu = u
+                # Sumur kritis = deadline hari ini/overdue (u<=0); NW/AWS in-window sudah di-boost
+                # ke urgensi <=-10000 sehingga ikut tercakup. Add Manual (u sangat besar) tidak.
+                if u <= 0: _crit += 1
                 if (_URG_MODE != "tier") and nwaws1_arr[w]: score += 50000   # NW1/AWS1 = setara urgensi 0
                 elif u >= ADDMAN_URG: score += 1
                 elif u < 0: score += 100000
@@ -1847,9 +1860,22 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                     # jadi di antara field berskor-deadline mirip, kategori lebih tinggi menang.
                     score += (5 - int(tier_arr[w])) * TIER_TIEBREAK
             field_scores[fld] = score
+            field_crit[fld] = _crit
+            field_min_urg[fld] = _minu if _minu is not None else 0
 
         if not field_scores: break
-        sorted_fields = sorted(field_scores.keys(), key=lambda k: field_scores[k], reverse=True)
+        # Menangkan dulu field yang punya sumur KRITIS (NW/AWS in-window / deadline hari ini / overdue),
+        # lepas dari populasi — jadi 1 AWS atau beberapa sumur berdeadline hari ini mengalahkan field
+        # berpopulasi besar yang deadline-nya tak mendesak. Di antara field kritis: yang sumur
+        # termendesaknya paling mendesak dulu, lalu yang kritisnya lebih banyak. Field tanpa sumur
+        # kritis diurutkan skor populasi (perilaku lama) sebagai pemecah seri terakhir.
+        def _fkey(k):
+            crit = field_crit[k] > 0
+            return (1 if crit else 0,
+                    (-field_min_urg[k]) if crit else 0.0,
+                    field_crit[k],
+                    field_scores[k])
+        sorted_fields = sorted(field_scores.keys(), key=_fkey, reverse=True)
 
         assigned_this_round = False
         for target_fld in sorted_fields:
