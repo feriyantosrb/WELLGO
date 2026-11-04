@@ -2273,6 +2273,54 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                     wk.at[c, "plan_day"] = d1date
                     info["moved"] += 1
                     info["detail"].append((str(wk.at[c, "well"]), u2, u1, int(D2), int(D1)))
+
+    # ── Diagnostik: kenapa sumur hari-belakang TAK tertarik ke hari lebih awal ──
+    # Dihitung pada kondisi FINAL (setelah semua move). Untuk tiap sumur di hari > hari
+    # pertama, cek apakah ada slot (unit,hari) lebih awal berkapasitas yang BISA menerimanya;
+    # kalau tidak, catat alasan dominannya.
+    diag = {"early_free_seats": 0, "later_wells": 0, "could_move": 0,
+            "blk_dist": 0, "blk_elig": 0, "blk_ontime": 0, "blk_noslot": 0}
+    byslot, daydate2 = {}, {}
+    for i in wk.index[wk["scheduled"].fillna(False)]:
+        u = wk.at[i, "plan_unit"]
+        if u is None or (isinstance(u, float) and pd.isna(u)):
+            continue
+        d = int(wk.at[i, "day_idx"])
+        byslot.setdefault((u, d), []).append(i)
+        daydate2.setdefault(d, pd.Timestamp(wk.at[i, "plan_day"]))
+    days2 = sorted(daydate2.keys())
+    if days2:
+        first_day, last_day = days2[0], days2[-1]
+        for (u, d), mem in byslot.items():
+            if d < last_day:
+                diag["early_free_seats"] += max(0, int(max_wells) - len(mem))
+        for (u, d), mem in byslot.items():
+            if d <= first_day:
+                continue
+            for c in mem:
+                diag["later_wells"] += 1
+                reason, ok_any = "noslot", False
+                for (u1, D1), mem1 in byslot.items():
+                    if D1 >= d or len(mem1) >= int(max_wells):
+                        continue
+                    if not _unit_ok_for(c, u1):
+                        if reason == "noslot": reason = "elig"
+                        continue
+                    d1date = daydate2.get(D1)
+                    if pd.notna(_mnd.loc[c]) and pd.notna(d1date) and d1date < _mnd.loc[c]:
+                        reason = "ontime"; continue
+                    if not any(fld.loc[c] == fld.loc[m] for m in mem1):
+                        _pts = [(float(lat[m]), float(lon[m])) for m in mem1 if coord_ok[m]]
+                        _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if (coord_ok[c] and _pts) else None
+                        if _dm is None or _dm > cross_cap:
+                            reason = "dist"; continue
+                    ok_any = True; break
+                if ok_any: diag["could_move"] += 1
+                elif reason == "elig": diag["blk_elig"] += 1
+                elif reason == "ontime": diag["blk_ontime"] += 1
+                elif reason == "dist": diag["blk_dist"] += 1
+                else: diag["blk_noslot"] += 1
+    info["diag"] = diag
     return wk, info
 
 def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
@@ -4112,10 +4160,12 @@ if man_un:
 # BARU muncul dari penempatan Add Manual / assign manual — terutama saat Mulai Planning dari
 # Tanggal bukan awal periode (komposisi hari berbeda). Ulangi di sini pada jadwal FINAL, tanpa
 # memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
+_pullfwd_diag = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
     week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=7.0, skip_manual=True)
     if _pf2.get("moved"):
         _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
+    _pullfwd_diag = _pf2.get("diag")
     _ckpt(f"pull_forward_thin_days (pass-2 final, moved={_pf2['moved']})")
 
 # ── Grouping ulang murni kedekatan (Pooled & Mapping Unit) ─────────────────
@@ -4140,6 +4190,26 @@ if _pullfwd_info and _pullfwd_info.get("moved"):
     st.caption(f"⏩ **Tarik maju hari tipis** — {_pullfwd_info['moved']} sumur ditarik ke hari lebih awal "
                f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field bebas, beda field ≤ 7 km, "
                "unit tujuan tetap berhak atas sumur).")
+if pull_forward_thin and mode == "pooled" and _pullfwd_diag is not None:
+    _dg = _pullfwd_diag
+    _mv = _pullfwd_info["moved"] if _pullfwd_info else 0
+    with st.expander(f"🔎 Diagnostik Tarik Maju — {_mv} ditarik, {_dg['early_free_seats']} kursi kosong di hari awal", expanded=(_mv == 0)):
+        st.caption(f"Target isi per trip: **{max_wells}** sumur. Mulai planning: **{plan_start_ts.date()}** "
+                   f"(day_offset={day_offset}).")
+        st.markdown(
+            f"- **{_dg['early_free_seats']}** kursi kosong pada trip hari-hari awal (sisa kapasitas yang bisa diisi).\n"
+            f"- **{_dg['later_wells']}** sumur ada di hari BELAKANG (kandidat sumber tarik maju).\n"
+            f"- Dari kandidat itu, alasan TIDAK bisa ditarik ke hari lebih awal:\n"
+            f"    - 🚧 **{_dg['blk_dist']}** terhalang jarak (beda field & > 7 km dari klaster hari awal)\n"
+            f"    - 🔒 **{_dg['blk_elig']}** terhalang eligibilitas unit (forced_unit/mapping/zona)\n"
+            f"    - ⏳ **{_dg['blk_ontime']}** terhalang window (min_date belum buka di tanggal lebih awal)\n"
+            f"    - 🈳 **{_dg['blk_noslot']}** tak ada trip hari-awal berkapasitas untuk menampung\n"
+            f"    - ✅ **{_dg['could_move']}** sebenarnya BISA ditarik (bila >0 berarti ada celah logika, laporkan)")
+        if _dg["later_wells"] == 0:
+            st.info("Tidak ada sumur di hari belakang. Hari awal sudah sepadat yang data izinkan (atau jadwal hanya 1 hari).")
+        elif _dg["blk_dist"] and _dg["blk_dist"] >= _dg["later_wells"] * 0.5:
+            st.warning("Mayoritas terhalang jarak beda-field > 7 km. Kalau ingin tetap dipadatkan, "
+                       "pertimbangkan opsi 'pindah trip utuh ke depan' (abaikan jarak antar-field).")
 if _interday_info and _interday_info.get("moved"):
     _ii = _interday_info
     _save = max(0.0, _ii["km_awal"] - _ii["km_akhir"])
