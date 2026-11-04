@@ -3293,8 +3293,13 @@ with st.sidebar:
                  "dengan menarik sumur dari hari BELAKANGAN — LINTAS UNIT (hari awal tipis boleh diisi "
                  "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
                  "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
-                 "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= 7 km. "
+                 "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= batas. "
                  "Tetap on-time (tak menarik sebelum window buka).")
+        pull_fwd_cap = st.number_input("Batas jarak beda-field tarik maju (km)", min_value=5, max_value=10,
+            value=7, step=1, disabled=not pull_forward_thin,
+            help="Hanya untuk tarik maju LINTAS/BEDA field: sumur beda field ditarik ke klaster hari awal "
+                 "bila jarak jalannya <= batas ini (5–10 km). Sumur SE-FIELD selalu bebas ditarik tanpa "
+                 "batas. Ketik angkanya (5,6,7,8,9,10).")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -4060,7 +4065,7 @@ else:
 # beda field <= 7 km, tetap on-time) supaya Add Manual hanya mengisi sisa kapasitas sesudahnya.
 _pullfwd_info = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=7.0)
+    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap))
     _ckpt(f"pull_forward_thin_days (moved={_pullfwd_info['moved']})")
 
 # ── Pass Add Manual (backlog) ──────────────────────────────────────────────
@@ -4162,7 +4167,7 @@ if man_un:
 # memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
 _pullfwd_diag = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=7.0, skip_manual=True)
+    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True)
     if _pf2.get("moved"):
         _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
     _pullfwd_diag = _pf2.get("diag")
@@ -4188,7 +4193,7 @@ if interday_smooth and mode == "pooled":
 scheduled_all = week_df[week_df["scheduled"]].copy()
 if _pullfwd_info and _pullfwd_info.get("moved"):
     st.caption(f"⏩ **Tarik maju hari tipis** — {_pullfwd_info['moved']} sumur ditarik ke hari lebih awal "
-               f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field bebas, beda field ≤ 7 km, "
+               f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field bebas, beda field ≤ {int(pull_fwd_cap)} km, "
                "unit tujuan tetap berhak atas sumur).")
 if pull_forward_thin and mode == "pooled" and _pullfwd_diag is not None:
     _dg = _pullfwd_diag
@@ -4200,7 +4205,7 @@ if pull_forward_thin and mode == "pooled" and _pullfwd_diag is not None:
             f"- **{_dg['early_free_seats']}** kursi kosong pada trip hari-hari awal (sisa kapasitas yang bisa diisi).\n"
             f"- **{_dg['later_wells']}** sumur ada di hari BELAKANG (kandidat sumber tarik maju).\n"
             f"- Dari kandidat itu, alasan TIDAK bisa ditarik ke hari lebih awal:\n"
-            f"    - 🚧 **{_dg['blk_dist']}** terhalang jarak (beda field & > 7 km dari klaster hari awal)\n"
+            f"    - 🚧 **{_dg['blk_dist']}** terhalang jarak (beda field & > {int(pull_fwd_cap)} km dari klaster hari awal)\n"
             f"    - 🔒 **{_dg['blk_elig']}** terhalang eligibilitas unit (forced_unit/mapping/zona)\n"
             f"    - ⏳ **{_dg['blk_ontime']}** terhalang window (min_date belum buka di tanggal lebih awal)\n"
             f"    - 🈳 **{_dg['blk_noslot']}** tak ada trip hari-awal berkapasitas untuk menampung\n"
@@ -4208,8 +4213,9 @@ if pull_forward_thin and mode == "pooled" and _pullfwd_diag is not None:
         if _dg["later_wells"] == 0:
             st.info("Tidak ada sumur di hari belakang. Hari awal sudah sepadat yang data izinkan (atau jadwal hanya 1 hari).")
         elif _dg["blk_dist"] and _dg["blk_dist"] >= _dg["later_wells"] * 0.5:
-            st.warning("Mayoritas terhalang jarak beda-field > 7 km. Kalau ingin tetap dipadatkan, "
-                       "pertimbangkan opsi 'pindah trip utuh ke depan' (abaikan jarak antar-field).")
+            st.warning(f"Mayoritas terhalang jarak beda-field > {int(pull_fwd_cap)} km. Naikkan 'Batas jarak "
+                       "beda-field tarik maju (km)' (maks 10), atau pertimbangkan opsi 'pindah trip utuh ke "
+                       "depan' (abaikan jarak antar-field).")
 if _interday_info and _interday_info.get("moved"):
     _ii = _interday_info
     _save = max(0.0, _ii["km_awal"] - _ii["km_akhir"])
