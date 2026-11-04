@@ -2190,16 +2190,18 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
         info["km_akhir"] += _hopsum(members)
     return wk, info
 
-def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False):
-    """Optimasi Lanjut — TARIK MAJU: isi hari LEBIH AWAL unit yang SAMA (mis. hari tipis 1 well)
-    dengan sumur dari hari BELAKANGAN unit itu, supaya trip tipis terisi & hari belakang bebas.
-    Dijalankan SEBELUM pass Add Manual, lalu diulang di akhir pipeline agar pola hari-tipis yang
-    baru muncul dari Add Manual/assign manual ikut terkonsolidasi (berlaku di semua pilihan
-    "Mulai Planning dari Tanggal", bukan hanya saat mulai = awal periode).
-      • Sumur SE-FIELD dgn anggota hari tujuan → bebas ditarik (tak dibatasi jarak).
-      • BEDA field → hanya bila jarak JALAN ke klaster hari tujuan <= cross_cap (default 5–7 km).
+def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True):
+    """Optimasi Lanjut — TARIK MAJU: padatkan HARI-HARI AWAL hingga kapasitas penuh (max_wells,
+    mis. 6 well) dengan menarik sumur dari hari BELAKANGAN. LINTAS UNIT: hari awal yang tipis
+    boleh diisi sumur dari hari belakangan unit mana pun, asalkan unit tujuan BERHAK atas sumur
+    itu (forced_unit/mapping/zona dihormati). Hari belakang jadi bebas; fleet memadat di depan.
+    Dijalankan SEBELUM pass Add Manual, lalu diulang di jadwal final agar pola yang muncul dari
+    Add Manual/assign manual ikut terkonsolidasi (berlaku di semua pilihan Mulai Planning).
+      • Sumur SE-FIELD dgn anggota slot tujuan → bebas ditarik (tak dibatasi jarak).
+      • BEDA field → hanya bila jarak JALAN ke klaster slot tujuan <= cross_cap (default 5–7 km).
       • Tetap on-time: tanggal tujuan harus >= min_date sumur (tak menarik sebelum window buka).
       • skip_manual=True → sumur assign-manual user TIDAK dipindah (tetap jadi anchor/target).
+      • cross_unit=False → batasi tarik hanya dalam unit yang sama.
     Menarik MAJU selalu aman thd deadline (tanggal jadi lebih awal). Return (wk_baru, info)."""
     info = {"moved": 0, "detail": []}
     if not len(wk) or "plan_unit" not in wk.columns or "day_idx" not in wk.columns:
@@ -2210,43 +2212,67 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False):
     lon = pd.to_numeric(wk.get("lon"), errors="coerce")
     coord_ok = lat.notna() & lon.notna()
     fld = wk["field"].astype(str) if "field" in wk.columns else pd.Series("", index=wk.index)
+    area = wk["area"].astype(str) if "area" in wk.columns else pd.Series("", index=wk.index)
+    allow = wk["allow_units"] if "allow_units" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
+    forced = wk["forced_unit"] if "forced_unit" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
     _mnd = pd.to_datetime(wk.get("min_date"), errors="coerce")
     _manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
 
-    for u in [x for x in pd.unique(wk.loc[sched, "plan_unit"]) if x is not None and pd.notna(x)]:
-        um = sched & (wk["plan_unit"] == u)
-        members, daydate = {}, {}
-        for i in wk.index[um]:
-            d = int(wk.at[i, "day_idx"]); members.setdefault(d, []).append(i)
-            daydate.setdefault(d, pd.Timestamp(wk.at[i, "plan_day"]))
-        days_sorted = sorted(members.keys())
-        if len(days_sorted) < 2:
+    def _unit_ok_for(c, u):
+        fu = forced.loc[c]
+        if fu is not None and pd.notna(fu) and str(fu) != "":
+            return u == fu                                   # forced_unit: hanya unit itu
+        a = allow.loc[c]
+        if isinstance(a, (list, tuple)) and len(a):
+            return u in a                                    # mapping unit menang
+        wz = "remote" if area.loc[c] in REMOTE_AREAS else "non-remote"
+        uz = "remote" if u in REMOTE_UNITS else "non-remote"
+        return wz == uz                                      # tanpa mapping: cocokkan zona
+
+    # Slot = (unit, day_idx) → daftar index sumur terjadwal; daydate = day_idx → tanggal.
+    slots, daydate = {}, {}
+    for i in wk.index[sched]:
+        u = wk.at[i, "plan_unit"];
+        if u is None or (isinstance(u, float) and pd.isna(u)):
             continue
-        for D1 in days_sorted:                       # hari awal → akhir; isi yg awal dulu
-            d1date = daydate.get(D1)
-            for D2 in [x for x in days_sorted if x > D1]:
-                if len(members.get(D1, [])) >= int(max_wells):
-                    break
-                for c in list(members.get(D2, [])):
-                    if len(members[D1]) >= int(max_wells):
+        d = int(wk.at[i, "day_idx"])
+        slots.setdefault((u, d), []).append(i)
+        daydate.setdefault(d, pd.Timestamp(wk.at[i, "plan_day"]))
+    if not slots:
+        return wk, info
+    all_days = sorted(daydate.keys())
+
+    # Target slot diurut hari paling AWAL dulu → hari-hari awal dipenuhi lebih dahulu.
+    for (u1, D1) in sorted(slots.keys(), key=lambda k: (k[1], str(k[0]))):
+        d1date = daydate.get(D1)
+        for D2 in [d for d in all_days if d > D1]:
+            if len(slots.get((u1, D1), [])) >= int(max_wells):
+                break
+            _src_slots = [k for k in list(slots.keys()) if k[1] == D2 and (cross_unit or k[0] == u1)]
+            for (u2, _d2) in _src_slots:
+                for c in list(slots.get((u2, D2), [])):
+                    if len(slots[(u1, D1)]) >= int(max_wells):
                         break
                     if skip_manual and bool(_manual.loc[c]):
-                        continue                     # jangan pindah sumur assign-manual user
+                        continue
+                    if not _unit_ok_for(c, u1):
+                        continue
                     if pd.notna(_mnd.loc[c]) and pd.notna(d1date) and d1date < _mnd.loc[c]:
-                        continue                     # window belum buka di tanggal tujuan → jangan early
-                    _same = any(fld.loc[c] == fld.loc[m] for m in members[D1])
+                        continue                             # window belum buka → jangan early
+                    _same = any(fld.loc[c] == fld.loc[m] for m in slots[(u1, D1)])
                     if not _same:
                         if not coord_ok[c]:
                             continue
-                        _pts = [(float(lat[m]), float(lon[m])) for m in members[D1] if coord_ok[m]]
+                        _pts = [(float(lat[m]), float(lon[m])) for m in slots[(u1, D1)] if coord_ok[m]]
                         _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if _pts else None
                         if _dm is None or _dm > cross_cap:
                             continue
-                    members[D2].remove(c); members[D1].append(c)
+                    slots[(u2, D2)].remove(c); slots[(u1, D1)].append(c)
+                    wk.at[c, "plan_unit"] = u1
                     wk.at[c, "day_idx"] = D1
                     wk.at[c, "plan_day"] = d1date
                     info["moved"] += 1
-                    info["detail"].append((str(wk.at[c, "well"]), u, int(D2), int(D1)))
+                    info["detail"].append((str(wk.at[c, "well"]), u2, u1, int(D2), int(D1)))
     return wk, info
 
 def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
@@ -3214,10 +3240,12 @@ with st.sidebar:
                  "window-nya. Tidak membuka trip baru; Reg A/NW/AWS/PRQ tak digeser. "
                  "Hasil penghematan tampil di tab Analisis Jarak.")
 
-        pull_forward_thin = st.checkbox("Tarik maju hari tipis ke hari lebih awal", value=True,
-            help="Konsolidasi unit: isi hari LEBIH AWAL (mis. hari yang cuma 1 well) dengan sumur dari "
-                 "hari BELAKANGAN unit yang sama, supaya hari belakang bebas. Dijalankan SEBELUM pengisian "
-                 "Add Manual. Sumur se-field bebas ditarik; beda field hanya bila jarak jalan <= 7 km. "
+        pull_forward_thin = st.checkbox("Tarik maju: padatkan hari-hari awal", value=True,
+            help="Konsolidasi: penuhi hari LEBIH AWAL sampai kapasitas (Target Sumur/Unit/Hari, mis. 6) "
+                 "dengan menarik sumur dari hari BELAKANGAN — LINTAS UNIT (hari awal tipis boleh diisi "
+                 "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
+                 "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
+                 "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= 7 km. "
                  "Tetap on-time (tak menarik sebelum window buka).")
 
         pad_promote_km = st.slider(
@@ -4110,7 +4138,8 @@ if interday_smooth and mode == "pooled":
 scheduled_all = week_df[week_df["scheduled"]].copy()
 if _pullfwd_info and _pullfwd_info.get("moved"):
     st.caption(f"⏩ **Tarik maju hari tipis** — {_pullfwd_info['moved']} sumur ditarik ke hari lebih awal "
-               "unit yang sama (se-field bebas, beda field ≤ 7 km) sebelum pengisian Add Manual.")
+               f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field bebas, beda field ≤ 7 km, "
+               "unit tujuan tetap berhak atas sumur).")
 if _interday_info and _interday_info.get("moved"):
     _ii = _interday_info
     _save = max(0.0, _ii["km_awal"] - _ii["km_akhir"])
