@@ -623,6 +623,85 @@ def load_wtr_last_type(file_bytes, sheet):
         res[w] = (pd.Timestamp(_last["_dt"]).normalize(), str(_last["_code"]))
     return res
 
+SHEET_READYME_NAMES = ("READ ME", "READ_ME", "README", "READYME", "READ-ME", "Read Me")
+
+def _blk_truthy(x):
+    if isinstance(x, bool): return x
+    if isinstance(x, (int, float)): return (not pd.isna(x)) and x != 0
+    return str(x).strip().upper() in ("TRUE", "YES", "Y", "1", "X", "✓", "V", "ON")
+
+def _read_readme_grid(file_bytes):
+    """Baca sheet READ ME sbg grid mentah (header=None). Pakai openpyxl DULU (paling andal
+    membaca nilai boolean/checkbox native Excel), fallback engine default. (nama_sheet, DataFrame)."""
+    for _sh in SHEET_READYME_NAMES:
+        for _eng in ("openpyxl", None):
+            try:
+                _kw = {"sheet_name": _sh, "header": None}
+                df = (pd.read_excel(BytesIO(file_bytes), engine=_eng, **_kw) if _eng
+                      else _read_excel(BytesIO(file_bytes), **_kw))
+                if df is not None and len(df):
+                    return _sh, df
+            except Exception:
+                continue
+    return None, None
+
+@st.cache_data(show_spinner=False)
+def load_unit_blackout(file_bytes):
+    """Baca matriks 'Unit MWT Tidak Tersedia' dari sheet READ ME file kandidat.
+    Layout: satu sel berisi 'Unit MWT' = header; kolom di kanannya = tanggal; baris di bawahnya =
+    nama unit + TRUE/FALSE per tanggal (TRUE = unit tak tersedia hari itu). Jumlah kolom tanggal
+    mengikuti isi sheet. Return (out, diag): out = {date_key '%Y-%m-%d': set(unit)}."""
+    diag = {"sheet": None, "header_found": False, "n_dates": 0, "n_true": 0,
+            "n_units": 0, "sample": None}
+    out = {}
+    _sh, df = _read_readme_grid(file_bytes)
+    diag["sheet"] = _sh
+    if df is None or not len(df):
+        return out, diag
+    # Cari sel 'UNIT MWT' PERSIS (bukan 'Unit MWT Tidak Tersedia') → baris & kolom header matriks.
+    hr = hc = None
+    for r in range(len(df)):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if isinstance(v, str) and v.strip().upper() == "UNIT MWT":
+                hr, hc = r, c
+                break
+        if hr is not None:
+            break
+    if hr is None:
+        return out, diag
+    diag["header_found"] = True
+    # Tanggal di kanan header.
+    date_cols = {}
+    for c in range(hc + 1, df.shape[1]):
+        dt = pd.to_datetime(df.iat[hr, c], errors="coerce", dayfirst=True)
+        if pd.notna(dt):
+            date_cols[c] = pd.Timestamp(dt).strftime("%Y-%m-%d")
+    diag["n_dates"] = len(date_cols)
+    if not date_cols:
+        return out, diag
+    # Baris unit di bawah header.
+    _units = 0
+    _sample = None
+    for r in range(hr + 1, len(df)):
+        u = df.iat[r, hc]
+        if u is None or (isinstance(u, float) and pd.isna(u)):
+            continue
+        u = str(u).strip()
+        if not u:
+            continue
+        _units += 1
+        for c, dk in date_cols.items():
+            _cell = df.iat[r, c]
+            if _sample is None:
+                _sample = f"{u}×{dk}={_cell!r} (tipe {type(_cell).__name__})"
+            if _blk_truthy(_cell):
+                out.setdefault(dk, set()).add(u)
+    diag["n_units"] = _units
+    diag["n_true"] = sum(len(v) for v in out.values())
+    diag["sample"] = _sample
+    return out, diag
+
 @st.cache_data(show_spinner=False)
 def load_spatial_data(file_bytes, sheet):
     try:
@@ -2235,7 +2314,7 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
         info["km_akhir"] += _hopsum(members)
     return wk, info
 
-def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True):
+def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True, blocked_by_day=None):
     """Optimasi Lanjut — TARIK MAJU: padatkan HARI-HARI AWAL hingga kapasitas penuh (max_wells,
     mis. 6 well) dengan menarik sumur dari hari BELAKANGAN. LINTAS UNIT: hari awal yang tipis
     boleh diisi sumur dari hari belakangan unit mana pun, asalkan unit tujuan BERHAK atas sumur
@@ -2290,6 +2369,9 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
     # Target slot diurut hari paling AWAL dulu → hari-hari awal dipenuhi lebih dahulu.
     for (u1, D1) in sorted(slots.keys(), key=lambda k: (k[1], str(k[0]))):
         d1date = daydate.get(D1)
+        # Jangan isi slot unit yang DIBLOKIR (Unit MWT Tidak Tersedia) di tanggal itu.
+        if blocked_by_day and pd.notna(d1date) and (u1 in blocked_by_day.get(pd.Timestamp(d1date).strftime("%Y-%m-%d"), set())):
+            continue
         for D2 in [d for d in all_days if d > D1]:
             if len(slots.get((u1, D1), [])) >= int(max_wells):
                 break
@@ -3262,6 +3344,19 @@ with st.sidebar:
         _blk_days = [(_ps + pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(_hz)]
         st.caption("Centang sel **(unit × tanggal)** saat unit MWT tidak beroperasi / tidak bisa menampung "
                    "sumur pada tanggal tsb. Sumur akan dialihkan ke unit lain atau hari lain.")
+        # Dibaca otomatis dari sheet READ ME (matriks 'Unit MWT Tidak Tersedia'): TRUE = tak tersedia.
+        _xl_blk, _xl_diag = load_unit_blackout(up.getvalue())
+        if _xl_blk:
+            _n_xl = sum(len(v) for v in _xl_blk.values())
+            _rng = f"{min(_xl_blk)}…{max(_xl_blk)}" if len(_xl_blk) > 1 else next(iter(_xl_blk))
+            st.caption(f"📄 Dari sheet **READ ME**: **{_n_xl}** slot unit×tanggal tak-tersedia terbaca otomatis "
+                       f"({len(_xl_blk)} tanggal: {_rng}) dan langsung dipakai. Grid di bawah = tambahan manual.")
+        else:
+            st.caption("📄 Sheet **READ ME** (matriks 'Unit MWT Tidak Tersedia') belum terbaca TRUE apa pun.")
+            st.caption(f"🔎 Diagnostik baca READ ME: sheet={_xl_diag['sheet']!r}, header 'Unit MWT' "
+                       f"ketemu={_xl_diag['header_found']}, kolom tanggal={_xl_diag['n_dates']}, "
+                       f"baris unit={_xl_diag['n_units']}, sel TRUE={_xl_diag['n_true']}. "
+                       f"Contoh sel: {_xl_diag['sample']}")
         _prev_blk = set(tuple(x) for x in st.session_state.get("unit_blackout", []))
         _grid = pd.DataFrame(False, index=ALL_UNITS, columns=_blk_days)
         for (_u, _dk) in _prev_blk:
@@ -4035,6 +4130,11 @@ replan_df, woff_wells = _E["replan_df"], _E["woff_wells"]
 
 # ── Unit MWT Tidak Tersedia per Tanggal (blackout) — input ada di sidebar ───
 unit_blackout_by_day = {}
+# SUMBER UTAMA: matriks 'Unit MWT Tidak Tersedia' di sheet READ ME file kandidat (dibaca otomatis).
+_xl_blk_main, _ = load_unit_blackout(up.getvalue())
+for _dk, _us in _xl_blk_main.items():
+    unit_blackout_by_day.setdefault(_dk, set()).update(_us)
+# TAMBAHAN: centangan manual di sidebar (union dengan yang dari Excel).
 for (_u, _dk) in st.session_state.get("unit_blackout", []):
     unit_blackout_by_day.setdefault(_dk, set()).add(_u)
 
@@ -4138,7 +4238,7 @@ else:
 # beda field <= 7 km, tetap on-time) supaya Add Manual hanya mengisi sisa kapasitas sesudahnya.
 _pullfwd_info = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap))
+    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), blocked_by_day=unit_blackout_by_day)
     _ckpt(f"pull_forward_thin_days (moved={_pullfwd_info['moved']})")
 
 # ── Pass Add Manual (backlog) ──────────────────────────────────────────────
@@ -4240,7 +4340,7 @@ if man_un:
 # memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
 _pullfwd_diag = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True)
+    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True, blocked_by_day=unit_blackout_by_day)
     if _pf2.get("moved"):
         _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
     _pullfwd_diag = _pf2.get("diag")
