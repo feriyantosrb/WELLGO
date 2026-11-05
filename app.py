@@ -578,6 +578,51 @@ def load_wtr_last(file_bytes, sheet):
     out[cw] = out[cw].astype(str).str.strip()
     return out.groupby(cw)["_dt"].max().to_dict()
 
+def _wtr_phase_code(t):
+    """Normalkan TEST TYPE WTR → kode fase: NW1/NW2/NW3/AWS1/AWS2, '' bila tak dikenali.
+    Toleran spasi/strip/underscore: 'New Well 3', 'NW-3', 'NW3', 'AWS 2', 'AS2' dll."""
+    s = str(t).upper()
+    if re.search(r"(?:NEW\s*WELL|NW)\W*3", s): return "NW3"
+    if re.search(r"(?:NEW\s*WELL|NW)\W*2", s): return "NW2"
+    if re.search(r"(?:NEW\s*WELL|NW)\W*1", s): return "NW1"
+    if re.search(r"(?:AWS|AS)\W*2", s): return "AWS2"
+    if re.search(r"(?:AWS|AS)\W*1", s): return "AWS1"
+    return ""
+
+@st.cache_data(show_spinner=False)
+def load_wtr_last_type(file_bytes, sheet):
+    """{well: (Timestamp TEST DATE terakhir, kode fase TEST TYPE)} dari WTR (Well Test Report).
+    Dipakai sbg PATOKAN transisi AWS/NW: anchor = TEST DATE terakhir, fase = TEST TYPE terakhir.
+    Lebih akurat dari COMP SCH Database yang sering belum update. '' bila TEST TYPE tak dikenali."""
+    if not sheet or not str(sheet).strip():
+        return {}
+    try:
+        df = _read_excel(BytesIO(file_bytes), sheet_name=str(sheet).strip())
+    except Exception:
+        return {}
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    cw = next((c for c in ("WELL", "WELL NAME", "WELL_NAME", "WELLNAME") if c in df.columns), None)
+    cd = next((c for c in ("TEST DATE", "TEST_DATE", "TESTDATE", "TGL TEST", "TANGGAL TEST") if c in df.columns), None)
+    ct = next((c for c in ("TEST TYPE", "TEST_TYPE", "TESTTYPE", "JENIS TEST", "TIPE TEST", "JENIS TES") if c in df.columns), None)
+    if not (cw and cd):
+        return {}
+    cols = [c for c in (cw, cd, ct) if c]
+    out = df[cols].copy()
+    out["_dt"] = pd.to_datetime(out[cd], errors="coerce")
+    out = out[out["_dt"].notna()]
+    if not len(out):
+        return {}
+    out[cw] = out[cw].astype(str).str.strip()
+    out["_code"] = out[ct].map(_wtr_phase_code) if ct else ""
+    _rank = {"NW1": 1, "AWS1": 1, "NW2": 2, "AWS2": 2, "NW3": 3}
+    out["_rk"] = out["_code"].map(lambda c: _rank.get(c, 0))
+    out = out.sort_values(["_dt", "_rk"])          # ambil baris paling akhir; seri tanggal → fase tertinggi
+    res = {}
+    for w, g in out.groupby(cw):
+        _last = g.iloc[-1]
+        res[w] = (pd.Timestamp(_last["_dt"]).normalize(), str(_last["_code"]))
+    return res
+
 @st.cache_data(show_spinner=False)
 def load_spatial_data(file_bytes, sheet):
     try:
@@ -2864,7 +2909,8 @@ with st.sidebar:
                               help="File Excel TERSENDIRI berisi Well Test Report (hasil tes). Dipakai sebagai "
                                    "sumber tambahan deteksi COMP bila SCH Database belum terupdate.")
     sheet_wtr = st.text_input("Sheet WTR", "Database",
-                              help="Nama sheet di file WTR Database (kolom WELL + TEST DATE).")
+                              help="Nama sheet di file WTR Database (kolom WELL + TEST DATE + TEST TYPE). "
+                                   "TEST TYPE (New Well 1/2/3, AWS1, AWS2) dipakai sbg patokan fase transisi AWS/NW.")
     use_wtr = st.checkbox("Pakai WTR Database untuk deteksi COMP", value=True,
                           help="Jika aktif, TEST DATE terbaru per sumur dari WTR Database ikut jadi 'tes terakhir', "
                                "sehingga sumur yang sudah dites (ada di WTR) dalam window-nya dianggap COMP walau "
@@ -3554,6 +3600,10 @@ executed_log, ncmp_log, pending_log = status_in_period(per_lo, per_hi)
 comp_col = set(raw.loc[raw["sch_status"] == "COMP", "well"])
 manual_comp = set(st.session_state.get("manual_comp", []))  # ditandai COMP manual oleh user (review SCH)
 
+# PATOKAN transisi AWS/NW: TEST DATE + TEST TYPE terakhir dari WTR Database (lebih akurat dari
+# COMP SCH Database yang sering belum update). {well: (tgl_test_terakhir, kode_fase)}.
+_wtr_phase = load_wtr_last_type(up_wtr.getvalue(), sheet_wtr) if (use_wtr and up_wtr is not None) else {}
+
 # ── AWS dua-fase (Option C): auto-transisi AWS1→AWS2 dari POP_Date + riwayat COMP ──
 # AWS1 = POP+1..+3. Deteksi fase (COMP AWS1 → naik AWS2) tetap via POP/riwayat.
 # CATATAN: window AWS2 final dihitung ulang dari last_wt_date (test date AWS1) di blok
@@ -3568,6 +3618,18 @@ if len(_aws):
     _has_pop_col = "pop_date" in raw.columns
     for _, _w in _aws.iterrows():
         _wn = _w["well"]
+        # PATOKAN WTR: bila ada TEST TYPE terakhir utk sumur ini, itulah penentu fase & anchor
+        # (bukan COMP SCH Database yang bisa basi). AWS2 terakhir → selesai; AWS1 → naik AWS2
+        # dgn window = TEST DATE terakhir + 5..10.
+        _wp = _wtr_phase.get(_wn)
+        if _wp and _wp[1] in ("AWS1", "AWS2"):
+            _wdate, _wcode = _wp
+            if _wcode == "AWS2":
+                aws_done.add(_wn)
+            else:
+                aws_active[_wn] = ("AWS2", _wdate + pd.Timedelta(days=5), _wdate + pd.Timedelta(days=10))
+                raw.loc[raw["well"] == _wn, "last_wt"] = _wdate
+            continue
         recs = _recs.get(_wn, [])
         reasons = [r for _, r in recs]
         as1 = any(("AS1" in r) or ("AWS1" in r) for r in reasons)
@@ -3660,6 +3722,17 @@ if len(_nw):
     _has_pop_n = "pop_date" in raw.columns
     for _, _w in _nw.iterrows():
         _wn = _w["well"]; _bwn = _w.get(_bcol_n, _wn)
+        # PATOKAN WTR: TEST TYPE terakhir menentukan fase; anchor = TEST DATE terakhir (WTR).
+        # NW3 terakhir → selesai; NW2 → naik NW3; NW1 → naik NW2. Window dihitung di blok bawah
+        # dari last_wt (anchor WTR) +10..+15.
+        _wp = _wtr_phase.get(_bwn) or _wtr_phase.get(_wn)
+        if _wp and _wp[1] in ("NW1", "NW2", "NW3"):
+            _wdate, _wcode = _wp
+            if _wcode == "NW3":
+                nw_done.add(_wn)
+            else:
+                nw_active[_wn] = ((3 if _wcode == "NW2" else 2), _wdate)
+            continue
         recs = _recsN.get(_bwn, [])
         _c0 = str(_w.get("category", "")).upper().replace("-", " ").replace("_", " ")
         _m0 = re.search(r"NEW WELL\s*([123])", _c0)
