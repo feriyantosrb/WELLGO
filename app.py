@@ -336,6 +336,25 @@ def tier_label(cat):
     m = re.search(r"REGULAR\s*([ABCD])\b", c)
     return m.group(1) if m else "-"
 
+def canon_category(cat):
+    """Normalkan test_category ke bentuk kanonik agar deteksi NW/AWS konsisten di SELURUH app
+    (tipe, is_nwaws, transisi fase, boost, label). Toleran bentuk singkat & panjang:
+      'NW1'/'NW 1'/'NW-1'/'New Well 1' → 'New Well 1' (idem NW2/NW3); 'NW' → 'New Well';
+      'AS1'/'AWS 1'/'AWS1' → 'AWS1' (idem AWS2); 'AWS' → 'AWS'.
+    Kategori lain (REGULAR/RTN/PRQ/Add Manual/…) dibiarkan apa adanya."""
+    s = " ".join(str(cat).upper().replace("-", " ").replace("_", " ").split())
+    m = re.search(r"\b(?:NEW\s*WELL|NW)\s*([123])\b", s)
+    if m:
+        return f"New Well {m.group(1)}"
+    if re.search(r"\bNEW\s*WELL\b", s) or s == "NW":
+        return "New Well"
+    m = re.search(r"\b(?:AWS|AS)\s*([12])\b", s)
+    if m:
+        return f"AWS{m.group(1)}"
+    if s == "AWS":
+        return "AWS"
+    return str(cat)
+
 def classify_status(stat):
     s = str(stat).strip().upper().replace("-", " ").replace("_", " ")
     s = " ".join(s.split())
@@ -874,6 +893,10 @@ def load_candidates(file_bytes, sheet):
     df["is_ts"] = _u_cls.str.contains("TS", na=False) & ~df["is_mpas"]
     df["unit_unknown"] = _u_cls.isin(["(BELUM)", "(BELUM PERNAH)", "(BELUM PERNAH COMP)", "NAN", "NONE", ""]) | (df["unit_name_ts"].astype(str).str.strip() == "")
 
+    # Normalkan test_category dulu: 'NW1' (sheet BreakIn) & 'New Well 1' → bentuk kanonik sama,
+    # supaya deteksi NW/AWS (tipe, is_nwaws, fase, boost) konsisten dan NW tak jatuh jadi RTN.
+    if "category" in df.columns:
+        df["category"] = df["category"].map(canon_category)
     NWAWS = {"NEW WELL 1", "NEW WELL 2", "NEW WELL 3", "AWS1", "AWS2"}
     cat_u = df["category"].astype(str).str.upper().str.strip()
     cat_force = cat_u.isin(NWAWS)
