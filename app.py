@@ -1868,13 +1868,14 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 is_same_fld = (target_fld is not None and field_arr[cand_idx] == target_fld)
                 # Sumur koordinat-imputasi (field centroid): koordinat kasar → aturan khusus.
                 _samefld_any = is_same_fld or (field_arr[cand_idx] in _cluster_fields)
-                _imp_involved = imputed_arr[cand_idx] or _cluster_has_imputed
-                if _samefld_any and _imp_involved:
-                    # Ada well di FIELD yang sama & salah satunya imputasi → rangkai JARAK BERAPAPUN.
-                    valid_cands.append((cand_idx, d_min, d_min - 60)); continue
-                if imputed_arr[cand_idx] and d_min <= 7.0:
-                    # Kandidat imputasi: boleh dirangkai sampai 7 km walau di luar elastic_limit normal.
-                    valid_cands.append((cand_idx, d_min, d_min - 5)); continue
+                # Sumur imputasi (koordinat = centroid field, kasar) boleh dirangkai walau di luar
+                # elastic_limit, TAPI tetap ada batas: max(elastic_limit, 7) km. TIDAK lagi "jarak
+                # berapapun" (dulu bikin field luas spt Bangko/Balam jadi trip raksasa >25 km). Dan
+                # HANYA kandidat imputasi yang dapat relaksasi — sumur nyata tak lagi ikut terseret
+                # jauh hanya karena klaster memuat satu sumur imputasi.
+                _imp_cap = max(float(elastic_limit), 7.0)
+                if imputed_arr[cand_idx] and d_min <= _imp_cap:
+                    valid_cands.append((cand_idx, d_min, (d_min - 60) if _samefld_any else (d_min - 5))); continue
                 if d_max > elastic_limit: continue
                 if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and (urg <= 2 or pullfwd_arr[cand_idx])):
                     if is_same_fld:
@@ -7193,6 +7194,33 @@ with tab_diagnostics:
             st.bar_chart(per_unit.set_index("Unit")["KM / WELL"])
         st.caption("KM/WELL tinggi = unit menempuh jarak besar untuk sedikit sumur (rute kurang efisien / sumur tersebar). "
                    "Pakai untuk spot unit yang rutenya boros.")
+
+        # ── Diagnostik per-trip: jarak terjauh antar sumur vs Elastic Limit ──
+        ui.section("Diagnostik per Trip (sebaran sumur)", eyebrow="Jarak terjauh antar sumur dalam satu trip vs Elastic Limit")
+        _trip_rows = []
+        _sc_coord = scheduled_all[scheduled_all["has_coord"].fillna(False)] if len(scheduled_all) else scheduled_all
+        for (_tu, _tdi), _tsub in _sc_coord.groupby(["plan_unit", "day_idx"]):
+            _tla = pd.to_numeric(_tsub["lat"], errors="coerce").values
+            _tlo = pd.to_numeric(_tsub["lon"], errors="coerce").values
+            _tn = len(_tsub)
+            _trt = float(route_distance(_tla, _tlo)) if _tn > 1 else 0.0
+            _tmx = float(np.max(_dist_matrix(_tla, _tlo))) if _tn > 1 else 0.0
+            _tdd = _tsub["plan_day"].iloc[0]
+            _trip_rows.append({"Unit": _tu, "Hari": int(_tdi),
+                               "Tanggal": pd.Timestamp(_tdd).strftime("%Y-%m-%d") if pd.notna(_tdd) else "-",
+                               "Sumur": _tn, "Rute (km)": round(_trt, 1),
+                               "Jarak terjauh antar sumur (km)": round(_tmx, 1),
+                               "> Elastic Limit": "⚠️ ya" if _tmx > float(elastic_limit) + 0.01 else "-"})
+        if _trip_rows:
+            _tripdf = pd.DataFrame(_trip_rows).sort_values("Jarak terjauh antar sumur (km)", ascending=False)
+            _n_over = int((_tripdf["> Elastic Limit"] == "⚠️ ya").sum())
+            st.caption(f"Elastic Limit aktif: **{elastic_limit} km**. Trip yang 'jarak terjauh antar sumur'-nya "
+                       f"MELEBIHI Elastic Limit ({_n_over} trip) TIDAK dibentuk oleh grow optimasi dasar (yang "
+                       "dibatasi Elastic Limit), melainkan oleh tarik-maju / regroup / backfill. Itu trip yang "
+                       "rutenya cenderung membengkak.")
+            st.dataframe(_tripdf, width='stretch', hide_index=True)
+        else:
+            st.caption("Belum ada trip terjadwal untuk dianalisis.")
 
         # ── Diagnostik: kontribusi tiap tahap Optimasi Tahap Lanjut ke km/well ──
         ui.section("Diagnostik Optimasi Tahap Lanjut", eyebrow="Tahap mana yang paling membengkakkan km/well")
