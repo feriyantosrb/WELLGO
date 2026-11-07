@@ -1120,6 +1120,9 @@ def _rk(lat, lon):
 #   "hybrid"             : urgensi tetap H-deadline (penentu utama), kategori hanya PEMECAH SERI saat
 #                          deadline mirip (nudge kecil) + jadi kunci kedua pemilihan seed.
 _URG_MODE = "deadline"
+# Dasar urutan rangkai sumur SE-FIELD di _grow: False = deadline dulu (urgensi), True = kedekatan
+# (jarak) dulu. Kedekatan bikin rute lebih rapat; deadline bikin sumur mendesak didahulukan.
+_SAMEFLD_BY_DIST = False
 TIER_TIEBREAK = 0.001    # bobot nudge kategori di mode hybrid; sangat kecil agar tak pernah melompati
                          # jenjang skor deadline, jadi deadline tetap dominan dan miss tetap minimal.
 # NW/AWS & REG A yang window-nya overlap periode tapi deadline di luar periode: bila True, jangan
@@ -1879,10 +1882,13 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
                 if d_max > elastic_limit: continue
                 if is_same_fld or d_min <= 5.0 or (d_min <= elastic_limit and (urg <= 2 or pullfwd_arr[cand_idx])):
                     if is_same_fld:
-                        # Dalam satu field: rangkai berdasarkan DEADLINE dulu (urgensi), bukan jarak.
-                        # urg = hari ke deadline (makin kecil makin mendesak) jadi term utama; jarak
-                        # hanya pemecah seri. Offset besar agar se-field tetap didahulukan dr lintas-field.
-                        c_score = -100000.0 + urg * 100.0 + d_min
+                        # Se-field tetap didahulukan dari lintas-field (offset -100000). Urutan di dalam
+                        # se-field: KEDEKATAN dulu (jarak, rute lebih rapat) bila _SAMEFLD_BY_DIST, atau
+                        # DEADLINE dulu (urgensi) bila tidak. Term kedua hanya pemecah seri.
+                        if _SAMEFLD_BY_DIST:
+                            c_score = -100000.0 + d_min * 100.0 + urg
+                        else:
+                            c_score = -100000.0 + urg * 100.0 + d_min
                     else:
                         c_score = d_min
                         if urg <= 2: c_score -= 20
@@ -3504,10 +3510,11 @@ with st.sidebar:
                  "(default 3). PRQ/ORQ dari Compiled Schedule boleh early TANPA batas. Strict (tak boleh "
                  "early): NW/AWS, Regular A, serta PRQ/ORQ/SSF dari sheet BreakIn. 0 = semua non-PRQ strict.")
         pull_fwd_same = st.number_input("Batas jarak SE-field tarik maju (km)", min_value=3, max_value=50,
-            value=15, step=1, disabled=not pull_forward_thin,
+            value=7, step=1, disabled=not pull_forward_thin,
             help="Sumur se-field pun dibatasi jaraknya (field luas spt Bangko/Balam jangan dirangkai "
                  "sembarang jarak). Sumur se-field ditarik bila jarak jalan ke klaster hari awal <= batas ini. "
-                 "Sumur se-field tanpa koordinat (imputed/NW1) tetap boleh. Default 15 km.")
+                 "Sumur se-field tanpa koordinat (imputed/NW1) tetap boleh. Default 7 km (turun dari 15 agar "
+                 "rute lebih rapat; naikkan bila ingin konsolidasi lebih agresif).")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -3529,6 +3536,11 @@ with st.sidebar:
         _URG_MODE = {"H-deadline (default)": "deadline",
                      "Hybrid (deadline + tiebreak kategori)": "hybrid",
                      "Tier penuh (eksperimen)": "tier"}[_urg_mode_lbl]
+
+        _SAMEFLD_BY_DIST = st.checkbox("Rangkai se-field berdasarkan KEDEKATAN (bukan deadline)", value=False,
+            help="Saat satu unit merangkai sumur SE-FIELD: bila dicentang, pilih sumur TERDEKAT dulu "
+                 "(rute lebih rapat, km/well lebih rendah); bila tidak, pilih yang paling dekat DEADLINE dulu "
+                 "(sumur mendesak didahulukan). Keduanya tetap dibatasi Elastic Limit & urutan hari.")
 
         _nodefer_lbl = st.radio(
             "NW/AWS & REG A (window buka, deadline lewat periode)",
@@ -4021,15 +4033,22 @@ if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in ra
     _vc_bk = _bkrows["base_well"].value_counts()
     _ssf_multi = set(_vc_bk[_vc_bk >= 2].index)
     if _ssf_multi:
-        _base_dates = {}
+        _base_dates = {}      # tanggal TES (COMP/executed + WTR) per base_well
         for _b, _rc in comp_records(_ssf_multi).items():
             _base_dates.setdefault(_b, []).extend(pd.Timestamp(d) for d, _ in _rc if pd.notna(d))
         for _bb, _dd in _wtr_last.items():
             if _bb in _ssf_multi and pd.notna(_dd):
                 _base_dates.setdefault(_bb, []).append(pd.Timestamp(_dd))
+        # PENDING (jadwal sudah ada, status belum diisi) juga dihitung "sudah ditangani" untuk tugas-nya:
+        # tugas yang tanggal rencananya PENDING tak perlu dijadwalkan ulang; tinggal tugas berikutnya.
+        _pend_by_well = {}
+        for _pr in pending_log.itertuples(index=False):
+            _pd0 = pd.to_datetime(getattr(_pr, "plan_date", None), errors="coerce")
+            if pd.notna(_pd0):
+                _pend_by_well.setdefault(_pr.well, []).append(pd.Timestamp(_pd0))
         # Penugasan POSISIONAL: tes ke-k (kronologis, di dalam rentang tugas) menyelesaikan tugas
-        # ke-k (urut window). Jadi tes-1 (mis. 1 Nov) hanya menandai COMP tugas-1; tugas-2 (7 Nov)
-        # TIDAK ikut COMP sampai tes-2 benar-benar dilakukan. Mencegah tes-1 bocor ke tugas-2.
+        # ke-k (urut window). Jumlah tugas "sudah ditangani" (ndone) = jumlah TES + PENDING dalam
+        # rentang tugas — jadi tugas-1 PENDING/COMP tak dijadwalkan ulang, tugas berikutnya tetap jalan.
         for _bk in _ssf_multi:
             _tasks = sorted(
                 raw.index[raw["base_well"] == _bk],
@@ -4039,14 +4058,17 @@ if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in ra
             _maxs = [raw.at[i, "max_date"] for i in _tasks if pd.notna(raw.at[i, "max_date"])]
             _lo = min(_mins) if _mins else pd.Timestamp.min
             _hi = max(_maxs) if _maxs else pd.Timestamp.max
-            _dates = sorted(d for d in _base_dates.get(_bk, [])
-                            if pd.notna(d) and (pd.Timestamp(_lo) <= d <= pd.Timestamp(_hi)))
+            _test_dates = sorted(d for d in _base_dates.get(_bk, [])
+                                 if pd.notna(d) and (pd.Timestamp(_lo) <= d <= pd.Timestamp(_hi)))
+            _pend_dates = sorted(d for d in _pend_by_well.get(_bk, [])
+                                 if pd.Timestamp(_lo) <= d <= pd.Timestamp(_hi))
             _ssf_order[_bk] = [raw.at[i, "well"] for i in _tasks]
-            _ssf_ndone[_bk] = len(_dates)
+            # ndone = jumlah tugas yang sudah ditangani (TES + PENDING), dibatasi jumlah tugas.
+            _ssf_ndone[_bk] = min(len(_test_dates) + len(_pend_dates), len(_tasks))
             for _k, _i in enumerate(_tasks):
                 _wk = raw.at[_i, "well"]
-                if _k < len(_dates):
-                    _last_test[_wk] = _dates[_k]       # tes ke-k → tugas ke-k
+                if _k < len(_test_dates):
+                    _last_test[_wk] = _test_dates[_k]   # tanggal TES ke-k → tugas ke-k (utk deteksi COMP)
                 else:
                     _last_test.pop(_wk, None)            # tes-nya belum ada → bukan COMP
 
