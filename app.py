@@ -6458,17 +6458,25 @@ with tab_cart:
     ui.section("🧲 Konsolidasi Trip Tipis", eyebrow="Isi trip aktif ≤ambang well dgn sumur tertunda terdekat (radius longgar, boleh early/late)")
     _kc1, _kc2 = st.columns(2)
     _KT_MAX = _kc1.slider("Ambang trip tipis (≤ well)", 1, 5, 3, key="consol_thin_max")
-    _KT_RAD = _kc2.slider("Radius konsolidasi (km jalan)", 5, 40, 15, key="consol_radius")
+    _KT_RAD = _kc2.slider("Batas jarak ke sumur terdekat trip (km jalan)", 5, 40, 7, key="consol_radius",
+                          help="Jarak JALAN dari sumur kandidat ke sumur TERDEKAT di trip tipis (seperti Backfill), "
+                               "bukan ke centroid. Sumur ditarik bila jaraknya <= batas ini.")
     _kt_added = st.session_state.get("consol_added_wells", [])
     _consol_uz = lambda u: "remote" if u in REMOTE_UNITS else "non-remote"
     if not len(scheduled_all):
         st.caption("Belum ada jadwal.")
     else:
         _ccnt = {(u, int(d)): int(c) for (u, d), c in scheduled_all.groupby(["plan_unit", "day_idx"]).size().items()}
-        _ccen = {(k[0], int(k[1])): (r["_la"], r["_lo"]) for k, r in
-                 scheduled_all[scheduled_all["has_coord"].fillna(False)].groupby(["plan_unit", "day_idx"])
-                 .agg(_la=("lat", "mean"), _lo=("lon", "mean")).iterrows()}
-        _thin_act = [(u, d) for (u, d), c in _ccnt.items() if c <= _KT_MAX and (u, d) in _ccen]
+        # Titik rute per trip (semua sumur berkoordinat di unit-hari itu) → jarak diukur ke sumur
+        # TERDEKAT di trip (seperti Backfill), bukan ke centroid.
+        _crtp = {}
+        for (u, d), sub in scheduled_all[scheduled_all["has_coord"].fillna(False)].groupby(["plan_unit", "day_idx"]):
+            _pp = [(float(a), float(b)) for a, b in zip(pd.to_numeric(sub["lat"], errors="coerce"),
+                                                        pd.to_numeric(sub["lon"], errors="coerce"))
+                   if pd.notna(a) and pd.notna(b)]
+            if _pp:
+                _crtp[(u, int(d))] = _pp
+        _thin_act = [(u, d) for (u, d), c in _ccnt.items() if c <= _KT_MAX and (u, d) in _crtp]
         _pool = (week_df[(~week_df["scheduled"].fillna(False)) & week_df["has_coord"].fillna(False)
                          & week_df["lat"].notna()].drop_duplicates("well").copy()
                  if len(week_df) else week_df.iloc[0:0])
@@ -6507,9 +6515,9 @@ with tab_cart:
                 for k in _thin_act:
                     if _consol_uz(k[0]) != _wz: continue
                     if isinstance(_al, (list, tuple)) and len(_al) and k[0] not in _al: continue
-                    _c = _ccen.get(k)
-                    if not _c or pd.isna(_c[0]): continue
-                    _dd = road_min_to_pts(_wlat, _wlon, [(_c[0], _c[1])])
+                    _pts = _crtp.get(k)
+                    if not _pts: continue
+                    _dd = road_min_to_pts(_wlat, _wlon, _pts)   # jarak ke sumur TERDEKAT di trip
                     if _dd is None or _dd > _KT_RAD: continue
                     _pairs.append((float(_dd), _wn, k))
             _pairs.sort(key=lambda t: t[0])
