@@ -3714,7 +3714,9 @@ week_lo, week_hi = days[0], days[-1]
 # days[k] ⇄ day_nums[k]; konversi baliknya: days[day_idx - 1 - day_offset].
 day_nums = list(range(1 + day_offset, horizon + 1 + day_offset))
 
-executed_log, ncmp_log, pending_log = status_in_period(per_lo, per_hi)
+# Period-scoped SCH_Database dibaca sejak H-1 awal periode (per_lo - 1 hari): tes yang dilakukan
+# sehari sebelum periode mulai tetap dihitung untuk periode ini.
+executed_log, ncmp_log, pending_log = status_in_period(per_lo - timedelta(days=1), per_hi)
 comp_col = set(raw.loc[raw["sch_status"] == "COMP", "well"])
 manual_comp = set(st.session_state.get("manual_comp", []))  # ditandai COMP manual oleh user (review SCH)
 
@@ -7118,6 +7120,61 @@ with tab_diagnostics:
             st.bar_chart(per_unit.set_index("Unit")["KM / WELL"])
         st.caption("KM/WELL tinggi = unit menempuh jarak besar untuk sedikit sumur (rute kurang efisien / sumur tersebar). "
                    "Pakai untuk spot unit yang rutenya boros.")
+
+        # ── Diagnostik: kontribusi tiap tahap Optimasi Tahap Lanjut ke km/well ──
+        ui.section("Diagnostik Optimasi Tahap Lanjut", eyebrow="Tahap mana yang paling membengkakkan km/well")
+        def _fleet_km_wells(_df):
+            if not len(_df):
+                return 0.0, 0
+            _d = _df[_df["has_coord"].fillna(False)] if "has_coord" in _df.columns else _df
+            _tot = 0.0
+            for _, _sub in _d.groupby(["day_idx", "plan_unit"]):
+                if len(_sub) > 1:
+                    _tot += float(route_distance(pd.to_numeric(_sub["lat"], errors="coerce").values,
+                                                 pd.to_numeric(_sub["lon"], errors="coerce").values))
+            return _tot, len(_df)
+        _stage_sets = [
+            ("Preemption Prioritas", set(st.session_state.get("preempt_wells", []) or [])),
+            ("Rescue + Re-optimasi", set(st.session_state.get("repair_wells", []) or [])),
+            ("Rescue Miss-Deadline", set(st.session_state.get("rescued_wells", []) or [])),
+            ("Rescue Add Manual", set(st.session_state.get("addman_added_wells", []) or [])),
+            ("Backfill Kapasitas", set(st.session_state.get("backfill_wells", []) or [])),
+            ("Konsolidasi Trip Tipis", set(st.session_state.get("consol_added_wells", []) or [])),
+        ]
+        _sched_wset = set(scheduled_all["well"]) if len(scheduled_all) else set()
+        _all_added = set().union(*[s for _, s in _stage_sets]) & _sched_wset
+        _full_km, _full_n = _fleet_km_wells(scheduled_all)
+        _base_df = scheduled_all[~scheduled_all["well"].isin(_all_added)] if len(scheduled_all) else scheduled_all
+        _base_km, _base_n = _fleet_km_wells(_base_df)
+        _dk1, _dk2, _dk3 = st.columns(3)
+        _dk1.metric("km/well DASAR", f"{(_base_km/_base_n if _base_n else 0):.2f}",
+                    help=f"{_base_n} sumur · {_base_km:.1f} km (sebelum tahap lanjut menambah sumur)")
+        _dk2.metric("km/well FINAL", f"{(_full_km/_full_n if _full_n else 0):.2f}",
+                    help=f"{_full_n} sumur · {_full_km:.1f} km")
+        _dk3.metric("Tambahan dari tahap lanjut", f"+{_full_n - _base_n} sumur",
+                    help=f"+{_full_km - _base_km:.1f} km total")
+        _drows = []
+        for _nm, _sset in _stage_sets:
+            _inset = _sset & _sched_wset
+            if not _inset:
+                continue
+            _without = scheduled_all[~scheduled_all["well"].isin(_inset)]
+            _wk_km, _ = _fleet_km_wells(_without)
+            _delta = max(0.0, _full_km - _wk_km)
+            _drows.append({"Tahap": _nm, "Sumur ditambah": len(_inset),
+                           "Δ jarak fleet (km)": round(_delta, 1),
+                           "Δ km/well (sumur tahap ini)": round(_delta / len(_inset), 2)})
+        if _drows:
+            _dgdf = pd.DataFrame(_drows).sort_values("Δ km/well (sumur tahap ini)", ascending=False)
+            st.dataframe(_dgdf, width='stretch', hide_index=True)
+            st.caption("Δ jarak fleet = tambahan jarak akibat sumur yang ditambahkan tahap itu (sumur tahap tsb "
+                       "dihapus lalu rute dihitung ulang). **Δ km/well (sumur tahap ini)** = Δ jarak ÷ jumlah sumur "
+                       "tahap itu; baris teratas = tahap paling membengkakkan km/well. Bandingkan km/well DASAR vs "
+                       "FINAL untuk melihat lonjakan total. (Tarik-maju memindah sumur, bukan menambah, jadi "
+                       "efeknya sudah termasuk di km/well DASAR.)")
+        else:
+            st.caption("Belum ada sumur tambahan dari Optimasi Tahap Lanjut (belum dijalankan atau tak menambah sumur). "
+                       "km/well DASAR = FINAL.")
 
         ui.section("Tren Jarak Geografis Harian", eyebrow="Total KM & KM/WELL per hari")
         per_day = kdf_an.groupby(["Tanggal"]).agg(km=("km", "sum"), Unit=("Unit", "nunique"), Sumur=("Sumur", "sum")).reset_index()
