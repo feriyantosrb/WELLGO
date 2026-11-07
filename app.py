@@ -2337,7 +2337,7 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
         info["km_akhir"] += _hopsum(members)
     return wk, info
 
-def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True, blocked_by_day=None):
+def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True, blocked_by_day=None, early_tol_days=0):
     """Optimasi Lanjut — TARIK MAJU: padatkan HARI-HARI AWAL hingga kapasitas penuh (max_wells,
     mis. 6 well) dengan menarik sumur dari hari BELAKANGAN. LINTAS UNIT: hari awal yang tipis
     boleh diisi sumur dari hari belakangan unit mana pun, asalkan unit tujuan BERHAK atas sumur
@@ -2364,6 +2364,24 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
     forced = wk["forced_unit"] if "forced_unit" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
     _mnd = pd.to_datetime(wk.get("min_date"), errors="coerce")
     _manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
+    # Sumur "strict" (tak boleh early sama sekali): NW/AWS, Regular A, PRQ/ORQ, break-in/SSF.
+    # Sumur lain (Reg B/C/D, RTN generik) boleh ditarik maju hingga early_tol_days sebelum window.
+    _tipe = wk["tipe"].astype(str) if "tipe" in wk.columns else pd.Series("", index=wk.index)
+    _catu = wk["category"].astype(str).str.upper() if "category" in wk.columns else pd.Series("", index=wk.index)
+    _rtag = wk["req_tag"].astype(str).str.upper() if "req_tag" in wk.columns else pd.Series("", index=wk.index)
+    _bkc = wk["is_breakin"].fillna(False) if "is_breakin" in wk.columns else pd.Series(False, index=wk.index)
+    _sfc = wk["is_ssf"].fillna(False) if "is_ssf" in wk.columns else pd.Series(False, index=wk.index)
+    _hard = (_tipe.isin(["NW", "AWS"]) | _catu.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
+             | _rtag.isin(["PRQ", "ORQ"]) | _bkc | _sfc)
+
+    def _ontime_ok(c, d1date):
+        """True bila tanggal tujuan boleh (tak terlalu early). Strict → harus >= min_date;
+        lainnya → boleh sampai early_tol_days sebelum min_date."""
+        _md = _mnd.loc[c]
+        if pd.isna(_md) or pd.isna(d1date):
+            return True
+        _tol = 0 if bool(_hard.loc[c]) else int(early_tol_days)
+        return pd.Timestamp(d1date) >= pd.Timestamp(_md) - pd.Timedelta(days=_tol)
 
     def _unit_ok_for(c, u):
         fu = forced.loc[c]
@@ -2407,8 +2425,8 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                         continue
                     if not _unit_ok_for(c, u1):
                         continue
-                    if pd.notna(_mnd.loc[c]) and pd.notna(d1date) and d1date < _mnd.loc[c]:
-                        continue                             # window belum buka → jangan early
+                    if not _ontime_ok(c, d1date):
+                        continue                             # terlalu early (lewat toleransi) → lewati
                     _same = any(fld.loc[c] == fld.loc[m] for m in slots[(u1, D1)])
                     if not _same:
                         if not coord_ok[c]:
@@ -2457,7 +2475,7 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                         if reason == "noslot": reason = "elig"
                         continue
                     d1date = daydate2.get(D1)
-                    if pd.notna(_mnd.loc[c]) and pd.notna(d1date) and d1date < _mnd.loc[c]:
+                    if not _ontime_ok(c, d1date):
                         reason = "ontime"; continue
                     if not any(fld.loc[c] == fld.loc[m] for m in mem1):
                         _pts = [(float(lat[m]), float(lon[m])) for m in mem1 if coord_ok[m]]
@@ -3458,12 +3476,17 @@ with st.sidebar:
                  "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
                  "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
                  "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= batas. "
-                 "Tetap on-time (tak menarik sebelum window buka).")
+                 "Boleh early sampai 'Toleransi early' hari sebelum window (kecuali NW/AWS/Reg A/PRQ/SSF yang strict).")
         pull_fwd_cap = st.number_input("Batas jarak beda-field tarik maju (km)", min_value=5, max_value=10,
             value=7, step=1, disabled=not pull_forward_thin,
             help="Hanya untuk tarik maju LINTAS/BEDA field: sumur beda field ditarik ke klaster hari awal "
                  "bila jarak jalannya <= batas ini (5–10 km). Sumur SE-FIELD selalu bebas ditarik tanpa "
                  "batas. Ketik angkanya (5,6,7,8,9,10).")
+        pull_fwd_early = st.number_input("Toleransi early tarik maju (hari)", min_value=0, max_value=7,
+            value=3, step=1, disabled=not pull_forward_thin,
+            help="Sumur boleh ditarik maju sampai sekian hari SEBELUM window-nya buka (early). "
+                 "Default 3. KECUALI NW/AWS, Regular A, PRQ/ORQ, dan break-in/SSF yang tetap strict "
+                 "(tak boleh early). 0 = semua strict on-time.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -4307,7 +4330,7 @@ else:
 # beda field <= 7 km, tetap on-time) supaya Add Manual hanya mengisi sisa kapasitas sesudahnya.
 _pullfwd_info = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), blocked_by_day=unit_blackout_by_day)
+    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early))
     _ckpt(f"pull_forward_thin_days (moved={_pullfwd_info['moved']})")
 
 # ── Pass Add Manual (backlog) ──────────────────────────────────────────────
@@ -4409,7 +4432,7 @@ if man_un:
 # memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
 _pullfwd_diag = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True, blocked_by_day=unit_blackout_by_day)
+    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True, blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early))
     if _pf2.get("moved"):
         _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
     _pullfwd_diag = _pf2.get("diag")
