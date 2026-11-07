@@ -2337,7 +2337,7 @@ def smooth_interday(wk, max_wells, radius_km=0.0, iters=6):
         info["km_akhir"] += _hopsum(members)
     return wk, info
 
-def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True, blocked_by_day=None, early_tol_days=0):
+def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cross_unit=True, blocked_by_day=None, early_tol_days=0, same_fld_cap=15.0):
     """Optimasi Lanjut — TARIK MAJU: padatkan HARI-HARI AWAL hingga kapasitas penuh (max_wells,
     mis. 6 well) dengan menarik sumur dari hari BELAKANGAN. LINTAS UNIT: hari awal yang tipis
     boleh diisi sumur dari hari belakangan unit mana pun, asalkan unit tujuan BERHAK atas sumur
@@ -2435,13 +2435,17 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                     if not _ontime_ok(c, d1date):
                         continue                             # terlalu early (lewat toleransi) → lewati
                     _same = any(fld.loc[c] == fld.loc[m] for m in slots[(u1, D1)])
-                    if not _same:
-                        if not coord_ok[c]:
-                            continue
+                    # Jarak dibatasi utk SE-FIELD juga (field luas spt Bangko/Balam jangan dirangkai
+                    # sembarang jarak): se-field cap = same_fld_cap, beda field = cross_cap.
+                    if coord_ok[c]:
                         _pts = [(float(lat[m]), float(lon[m])) for m in slots[(u1, D1)] if coord_ok[m]]
                         _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if _pts else None
-                        if _dm is None or _dm > cross_cap:
+                        _cap = same_fld_cap if _same else cross_cap
+                        if _dm is None or _dm > _cap:
                             continue
+                    elif not _same:
+                        continue                             # beda field tanpa koordinat → tak terukur
+                    # se-field tanpa koordinat (imputed/field-centroid) → tetap boleh dirangkai
                     slots[(u2, D2)].remove(c); slots[(u1, D1)].append(c)
                     wk.at[c, "plan_unit"] = u1
                     wk.at[c, "day_idx"] = D1
@@ -2484,11 +2488,15 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                     d1date = daydate2.get(D1)
                     if not _ontime_ok(c, d1date):
                         reason = "ontime"; continue
-                    if not any(fld.loc[c] == fld.loc[m] for m in mem1):
+                    _samed = any(fld.loc[c] == fld.loc[m] for m in mem1)
+                    if coord_ok[c]:
                         _pts = [(float(lat[m]), float(lon[m])) for m in mem1 if coord_ok[m]]
-                        _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if (coord_ok[c] and _pts) else None
-                        if _dm is None or _dm > cross_cap:
+                        _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if _pts else None
+                        _cap = same_fld_cap if _samed else cross_cap
+                        if _dm is None or _dm > _cap:
                             reason = "dist"; continue
+                    elif not _samed:
+                        reason = "dist"; continue
                     ok_any = True; break
                 if ok_any: diag["could_move"] += 1
                 elif reason == "elig": diag["blk_elig"] += 1
@@ -3482,7 +3490,7 @@ with st.sidebar:
                  "dengan menarik sumur dari hari BELAKANGAN — LINTAS UNIT (hari awal tipis boleh diisi "
                  "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
                  "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
-                 "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= batas. "
+                 "diulang di jadwal final. Se-field dibatasi 'Batas jarak se-field'; beda field 'Batas jarak beda-field'. "
                  "Boleh early: PRQ/ORQ Compiled tanpa batas, sumur biasa sampai 'Toleransi early' hari; strict NW/AWS/Reg A/break-in-SSF.")
         pull_fwd_cap = st.number_input("Batas jarak beda-field tarik maju (km)", min_value=5, max_value=10,
             value=7, step=1, disabled=not pull_forward_thin,
@@ -3494,6 +3502,11 @@ with st.sidebar:
             help="Sumur biasa (Reg B/C/D, RTN) boleh ditarik maju sampai sekian hari SEBELUM window buka "
                  "(default 3). PRQ/ORQ dari Compiled Schedule boleh early TANPA batas. Strict (tak boleh "
                  "early): NW/AWS, Regular A, serta PRQ/ORQ/SSF dari sheet BreakIn. 0 = semua non-PRQ strict.")
+        pull_fwd_same = st.number_input("Batas jarak SE-field tarik maju (km)", min_value=3, max_value=50,
+            value=15, step=1, disabled=not pull_forward_thin,
+            help="Sumur se-field pun dibatasi jaraknya (field luas spt Bangko/Balam jangan dirangkai "
+                 "sembarang jarak). Sumur se-field ditarik bila jarak jalan ke klaster hari awal <= batas ini. "
+                 "Sumur se-field tanpa koordinat (imputed/NW1) tetap boleh. Default 15 km.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -4337,7 +4350,7 @@ else:
 # beda field <= 7 km, tetap on-time) supaya Add Manual hanya mengisi sisa kapasitas sesudahnya.
 _pullfwd_info = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early))
+    week_df, _pullfwd_info = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early), same_fld_cap=float(pull_fwd_same))
     _ckpt(f"pull_forward_thin_days (moved={_pullfwd_info['moved']})")
 
 # ── Pass Add Manual (backlog) ──────────────────────────────────────────────
@@ -4439,7 +4452,7 @@ if man_un:
 # memindah sumur assign-manual user (tetap jadi anchor), agar konsolidasi berlaku di semua kasus.
 _pullfwd_diag = None
 if pull_forward_thin and mode == "pooled" and "scheduled" in week_df.columns:
-    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True, blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early))
+    week_df, _pf2 = pull_forward_thin_days(week_df, max_wells, cross_cap=float(pull_fwd_cap), skip_manual=True, blocked_by_day=unit_blackout_by_day, early_tol_days=int(pull_fwd_early), same_fld_cap=float(pull_fwd_same))
     if _pf2.get("moved"):
         _pullfwd_info = {"moved": (_pullfwd_info["moved"] if _pullfwd_info else 0) + _pf2["moved"]}
     _pullfwd_diag = _pf2.get("diag")
@@ -4465,7 +4478,7 @@ if interday_smooth and mode == "pooled":
 scheduled_all = week_df[week_df["scheduled"]].copy()
 if _pullfwd_info and _pullfwd_info.get("moved"):
     st.caption(f"⏩ **Tarik maju hari tipis** — {_pullfwd_info['moved']} sumur ditarik ke hari lebih awal "
-               f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field bebas, beda field ≤ {int(pull_fwd_cap)} km, "
+               f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field ≤ {int(pull_fwd_same)} km, beda field ≤ {int(pull_fwd_cap)} km, "
                "unit tujuan tetap berhak atas sumur).")
 if pull_forward_thin and mode == "pooled" and _pullfwd_diag is not None:
     _dg = _pullfwd_diag
@@ -6363,7 +6376,11 @@ with tab_cart:
     _bf_seats = sum(max(0, v) for k, v in _bf_room.items() if k in _bf_rtp)
     _bfcc1, _bfcc2 = st.columns([1, 1])
     _bf_cap = _bfcc1.slider("Batas jarak tarik ke rute trip (km)", 1, 50, 3, key="backfill_cap")
-    _bf_open_new = _bfcc2.checkbox("Boleh buka trip unit-hari baru", value=False, key="backfill_open_new_opt",
+    _bf_ins_cap = _bfcc2.number_input("Maks tambahan rute per sumur (km)", min_value=0.5, max_value=20.0,
+        value=2.0, step=0.5, key="backfill_ins_cap",
+        help="Pengaman km/well: sumur hanya di-backfill bila TAMBAHAN panjang rute trip sebenarnya "
+             "(biaya sisip) <= batas ini. Lebih akurat dari sekadar jarak ke tetangga terdekat. Default 2 km.")
+    _bf_open_new = st.checkbox("Boleh buka trip unit-hari baru", value=False, key="backfill_open_new_opt",
         help="Default MATI demi km/well rendah: backfill hanya mengisi kursi sisa trip yang SUDAH aktif "
              "(sumur dekat rute). Bila dinyalakan, sumur jauh boleh membuka trip baru — menambah cakupan tapi "
              "membengkakkan km/well (lihat Diagnostik Optimasi Tahap Lanjut).")
@@ -6419,6 +6436,16 @@ with tab_cart:
                         _best = _cand
             if _best is None: continue
             _iemp, _dd, _bu, _bd = _best
+            # Pengaman biaya-sisip: tambahan panjang rute SEBENARNYA saat sumur disisipkan ke trip
+            # harus <= _bf_ins_cap (menjaga km/well, lebih akurat dari jarak ke tetangga terdekat).
+            if not _iemp:
+                _tp = _bf_rtp.get((_bu, _bd), [])
+                if len(_tp) >= 1:
+                    _la0 = np.array([p[0] for p in _tp]); _lo0 = np.array([p[1] for p in _tp])
+                    _before = float(route_distance(_la0, _lo0)) if len(_tp) > 1 else 0.0
+                    _after = float(route_distance(np.append(_la0, _wlat), np.append(_lo0, _wlon)))
+                    if (_after - _before) > _bf_ins_cap:
+                        continue                     # sisipan menambah rute terlalu banyak → lewati
             _as[_wn] = {"unit": _bu, "day_idx": int(_bd)}
             _bf_room[(_bu, _bd)] = _room_of((_bu, _bd)) - 1
             _bf_rtp.setdefault((_bu, _bd), []).append((_wlat, _wlon))
