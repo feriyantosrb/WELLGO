@@ -4067,6 +4067,17 @@ for _bk, _order in _ssf_order.items():
             executed.discard(_wk); comp_disp_set.discard(_wk)
             comp_col.discard(_wk); manual_comp.discard(_wk)
 
+# Break-in/SSF: COMP yang tanggalnya SEBELUM window break-in dibuka TIDAK memenuhi kewajiban break-in.
+# Mis. BL001 dites reguler 1 Nov (COMP, masuk executed_log period-scoped), tapi break-in minta tes 7 Nov
+# → tetap wajib dijadwalkan. (Sumur reguler tetap seperti biasa: COMP period-scoped langsung exclude.)
+_bk_any2 = raw["is_breakin"].fillna(False) if "is_breakin" in raw.columns else pd.Series(False, index=raw.index)
+if "is_ssf" in raw.columns:
+    _bk_any2 = _bk_any2 | raw["is_ssf"].fillna(False)
+for _w in set(raw.loc[_bk_any2, "well"]):
+    _lt = _last_test.get(_w); _md = _minmap.get(_w)
+    if _w in executed and pd.notna(_md) and pd.notna(_lt) and pd.Timestamp(_lt) < pd.Timestamp(_md):
+        executed.discard(_w); comp_disp_set.discard(_w)
+
 # PENDING: jadwal sudah ada tapi STATUS belum diisi → disisihkan, jangan dijadwalkan ulang
 pending_col = set(raw.loc[raw["sch_status"].isin(["PENDING", "PEND"]), "well"])
 pending_set = (set(pending_log["well"]) | pending_col) - executed
