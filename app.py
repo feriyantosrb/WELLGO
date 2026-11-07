@@ -3941,6 +3941,9 @@ _maxmap = dict(zip(raw["well"], raw["max_date"]))
 # (di luar window-1) sehingga keliru balik jadi kandidat. Solusi: utk tiap tugas, pakai tanggal
 # tes TERBARU base_well yang tidak melewati max_date tugas itu → test-1 jatuh di window-1, test-2
 # di window-2. Hanya untuk base_well yang punya >=2 tugas break-in.
+_ssf_multi = set()         # base_well dgn >=2 tugas (SSF/break-in 2x)
+_ssf_order = {}            # base_well → daftar nama 'well' tugas urut kronologis (by window)
+_ssf_ndone = {}            # base_well → jumlah tes yang SUDAH dilakukan (dalam rentang tugas)
 if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in raw.columns):
     _bk_m2 = raw["is_breakin"].fillna(False) if "is_breakin" in raw.columns else pd.Series(False, index=raw.index)
     if "is_ssf" in raw.columns:
@@ -3955,13 +3958,28 @@ if "base_well" in raw.columns and ("is_breakin" in raw.columns or "is_ssf" in ra
         for _bb, _dd in _wtr_last.items():
             if _bb in _ssf_multi and pd.notna(_dd):
                 _base_dates.setdefault(_bb, []).append(pd.Timestamp(_dd))
-        for _i in raw.index[raw["base_well"].isin(_ssf_multi)]:
-            _wk = raw.at[_i, "well"]; _bk = raw.at[_i, "base_well"]; _xd = raw.at[_i, "max_date"]
-            _cands = [d for d in _base_dates.get(_bk, []) if pd.isna(_xd) or d <= pd.Timestamp(_xd)]
-            if _cands:
-                _last_test[_wk] = max(_cands)
-            else:
-                _last_test.pop(_wk, None)
+        # Penugasan POSISIONAL: tes ke-k (kronologis, di dalam rentang tugas) menyelesaikan tugas
+        # ke-k (urut window). Jadi tes-1 (mis. 1 Nov) hanya menandai COMP tugas-1; tugas-2 (7 Nov)
+        # TIDAK ikut COMP sampai tes-2 benar-benar dilakukan. Mencegah tes-1 bocor ke tugas-2.
+        for _bk in _ssf_multi:
+            _tasks = sorted(
+                raw.index[raw["base_well"] == _bk],
+                key=lambda i: (pd.Timestamp(raw.at[i, "min_date"]) if pd.notna(raw.at[i, "min_date"]) else pd.Timestamp.max,
+                               pd.Timestamp(raw.at[i, "max_date"]) if pd.notna(raw.at[i, "max_date"]) else pd.Timestamp.max))
+            _mins = [raw.at[i, "min_date"] for i in _tasks if pd.notna(raw.at[i, "min_date"])]
+            _maxs = [raw.at[i, "max_date"] for i in _tasks if pd.notna(raw.at[i, "max_date"])]
+            _lo = min(_mins) if _mins else pd.Timestamp.min
+            _hi = max(_maxs) if _maxs else pd.Timestamp.max
+            _dates = sorted(d for d in _base_dates.get(_bk, [])
+                            if pd.notna(d) and (pd.Timestamp(_lo) <= d <= pd.Timestamp(_hi)))
+            _ssf_order[_bk] = [raw.at[i, "well"] for i in _tasks]
+            _ssf_ndone[_bk] = len(_dates)
+            for _k, _i in enumerate(_tasks):
+                _wk = raw.at[_i, "well"]
+                if _k < len(_dates):
+                    _last_test[_wk] = _dates[_k]       # tes ke-k → tugas ke-k
+                else:
+                    _last_test.pop(_wk, None)            # tes-nya belum ada → bukan COMP
 
 def last_test_str(w):
     """Tanggal tes COMP/executed TERAKHIR sumur dari SCH Database (execution_log) + WTR, '-' bila tak ada."""
@@ -4039,9 +4057,24 @@ if comp_implied:
     executed |= comp_implied
     comp_disp_set |= comp_implied
 
+# SSF/break-in 2x: HANYA k tugas pertama (k = jumlah tes base_well yang sudah dilakukan dlm rentang
+# tugas) yang boleh dianggap selesai. Tugas sisanya WAJIB tetap dijadwalkan walau sch_status / COMP /
+# implied menandainya selesai (mis. tes-1 1 Nov COMP tak boleh mematikan tugas-2 7 Nov).
+for _bk, _order in _ssf_order.items():
+    _ndone = _ssf_ndone.get(_bk, 0)
+    for _k, _wk in enumerate(_order):
+        if _k >= _ndone:
+            executed.discard(_wk); comp_disp_set.discard(_wk)
+            comp_col.discard(_wk); manual_comp.discard(_wk)
+
 # PENDING: jadwal sudah ada tapi STATUS belum diisi → disisihkan, jangan dijadwalkan ulang
 pending_col = set(raw.loc[raw["sch_status"].isin(["PENDING", "PEND"]), "well"])
 pending_set = (set(pending_log["well"]) | pending_col) - executed
+# Tugas SSF/break-in yang belum dites JANGAN diblokir oleh PENDING juga (tetap wajib terjadwal).
+for _bk, _order in _ssf_order.items():
+    for _k, _wk in enumerate(_order):
+        if _k >= _ssf_ndone.get(_bk, 0):
+            pending_set.discard(_wk)
 pending_sched = dict(zip(pending_log["well"], pending_log["plan_date"]))
 
 ncmp_log = ncmp_log[~ncmp_log["well"].isin(executed | pending_set)].copy()
