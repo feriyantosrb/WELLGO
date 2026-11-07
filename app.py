@@ -2364,24 +2364,31 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
     forced = wk["forced_unit"] if "forced_unit" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
     _mnd = pd.to_datetime(wk.get("min_date"), errors="coerce")
     _manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
-    # Sumur "strict" (tak boleh early sama sekali): NW/AWS, Regular A, PRQ/ORQ, break-in/SSF.
-    # Sumur lain (Reg B/C/D, RTN generik) boleh ditarik maju hingga early_tol_days sebelum window.
+    # Tiga tingkat aturan early saat tarik maju:
+    #  • STRICT (tak boleh early): NW/AWS, Regular A, dan PRQ/ORQ/SSF dari sheet BreakIn (is_breakin/is_ssf).
+    #  • UNLIMITED early (boleh ditarik ke tanggal mana pun): PRQ/ORQ dari Compiled Schedule (bukan break-in),
+    #    karena permintaan boleh dipenuhi sepanjang periode.
+    #  • NORMAL: sumur lain (Reg B/C/D, RTN) boleh early hingga early_tol_days sebelum window.
     _tipe = wk["tipe"].astype(str) if "tipe" in wk.columns else pd.Series("", index=wk.index)
     _catu = wk["category"].astype(str).str.upper() if "category" in wk.columns else pd.Series("", index=wk.index)
     _rtag = wk["req_tag"].astype(str).str.upper() if "req_tag" in wk.columns else pd.Series("", index=wk.index)
     _bkc = wk["is_breakin"].fillna(False) if "is_breakin" in wk.columns else pd.Series(False, index=wk.index)
     _sfc = wk["is_ssf"].fillna(False) if "is_ssf" in wk.columns else pd.Series(False, index=wk.index)
-    _hard = (_tipe.isin(["NW", "AWS"]) | _catu.str.contains(r"REGULAR\s*A\b", regex=True, na=False)
-             | _rtag.isin(["PRQ", "ORQ"]) | _bkc | _sfc)
+    _bk_any = _bkc | _sfc
+    _strict = (_tipe.isin(["NW", "AWS"]) | _catu.str.contains(r"REGULAR\s*A\b", regex=True, na=False) | _bk_any)
+    _unlimited = _rtag.isin(["PRQ", "ORQ"]) & ~_bk_any
 
     def _ontime_ok(c, d1date):
-        """True bila tanggal tujuan boleh (tak terlalu early). Strict → harus >= min_date;
-        lainnya → boleh sampai early_tol_days sebelum min_date."""
+        """True bila tanggal tujuan boleh. STRICT → harus >= min_date; UNLIMITED (PRQ/ORQ Compiled)
+        → selalu boleh; lainnya → boleh sampai early_tol_days sebelum min_date."""
         _md = _mnd.loc[c]
         if pd.isna(_md) or pd.isna(d1date):
             return True
-        _tol = 0 if bool(_hard.loc[c]) else int(early_tol_days)
-        return pd.Timestamp(d1date) >= pd.Timestamp(_md) - pd.Timedelta(days=_tol)
+        if bool(_strict.loc[c]):
+            return pd.Timestamp(d1date) >= pd.Timestamp(_md)
+        if bool(_unlimited.loc[c]):
+            return True
+        return pd.Timestamp(d1date) >= pd.Timestamp(_md) - pd.Timedelta(days=int(early_tol_days))
 
     def _unit_ok_for(c, u):
         fu = forced.loc[c]
@@ -3476,7 +3483,7 @@ with st.sidebar:
                  "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
                  "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
                  "diulang di jadwal final. Se-field bebas; beda field hanya bila jarak jalan <= batas. "
-                 "Boleh early sampai 'Toleransi early' hari sebelum window (kecuali NW/AWS/Reg A/PRQ/SSF yang strict).")
+                 "Boleh early: PRQ/ORQ Compiled tanpa batas, sumur biasa sampai 'Toleransi early' hari; strict NW/AWS/Reg A/break-in-SSF.")
         pull_fwd_cap = st.number_input("Batas jarak beda-field tarik maju (km)", min_value=5, max_value=10,
             value=7, step=1, disabled=not pull_forward_thin,
             help="Hanya untuk tarik maju LINTAS/BEDA field: sumur beda field ditarik ke klaster hari awal "
@@ -3484,9 +3491,9 @@ with st.sidebar:
                  "batas. Ketik angkanya (5,6,7,8,9,10).")
         pull_fwd_early = st.number_input("Toleransi early tarik maju (hari)", min_value=0, max_value=7,
             value=3, step=1, disabled=not pull_forward_thin,
-            help="Sumur boleh ditarik maju sampai sekian hari SEBELUM window-nya buka (early). "
-                 "Default 3. KECUALI NW/AWS, Regular A, PRQ/ORQ, dan break-in/SSF yang tetap strict "
-                 "(tak boleh early). 0 = semua strict on-time.")
+            help="Sumur biasa (Reg B/C/D, RTN) boleh ditarik maju sampai sekian hari SEBELUM window buka "
+                 "(default 3). PRQ/ORQ dari Compiled Schedule boleh early TANPA batas. Strict (tak boleh "
+                 "early): NW/AWS, Regular A, serta PRQ/ORQ/SSF dari sheet BreakIn. 0 = semua non-PRQ strict.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -6908,7 +6915,8 @@ with tab_cart:
             f"- **Status Exclude**: {len(is_comp)} COMP, {len(is_off)} OFF, {len(is_woff)} NCMP-WOFF.")
 
 with tab_sch:
-    ui.section("Dashboard Status Realisasi", eyebrow=f"Periode {per_lo} s/d {per_hi}")
+    # SCH Database dibaca sejak H-1 awal periode, jadi rentangnya per_lo-1 s/d per_hi.
+    ui.section("Dashboard Status Realisasi", eyebrow=f"Periode {per_lo - timedelta(days=1)} s/d {per_hi} (SCH dibaca sejak H-1)")
     
     tot_comp = len(comp_wells)
     tot_ncmp = len(ncmp_df[ncmp_df["well"].isin(ncmp_set)])
