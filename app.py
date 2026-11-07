@@ -6331,11 +6331,16 @@ with tab_cart:
             _i = int(_d) - 1 - day_offset
             _bf_daydate[int(_d)] = days[_i] if 0 <= _i < len(days) else None
     _bf_seats = sum(max(0, v) for k, v in _bf_room.items() if k in _bf_rtp)
-    _bf_cap = st.slider("Batas jarak tarik ke rute trip (km)", 2, 50, 7, key="backfill_cap")
+    _bfcc1, _bfcc2 = st.columns([1, 1])
+    _bf_cap = _bfcc1.slider("Batas jarak tarik ke rute trip (km)", 1, 50, 3, key="backfill_cap")
+    _bf_open_new = _bfcc2.checkbox("Boleh buka trip unit-hari baru", value=False, key="backfill_open_new_opt",
+        help="Default MATI demi km/well rendah: backfill hanya mengisi kursi sisa trip yang SUDAH aktif "
+             "(sumur dekat rute). Bila dinyalakan, sumur jauh boleh membuka trip baru — menambah cakupan tapi "
+             "membengkakkan km/well (lihat Diagnostik Optimasi Tahap Lanjut).")
     st.caption(f"**{len(_bf_pool)}** sumur tertunda (belum terjadwal, berkoordinat) · **{_bf_seats}** kursi "
-               "sisa pada trip aktif. Tombol menarik sumur terdekat ke rute trip (≤ batas); bila tak ada trip "
-               "dekat, unit-hari kosong boleh dibuka. Boleh lebih awal dari window-nya (tercatat di log). "
-               "Zona & mapping dihormati.")
+               f"sisa pada trip aktif. Tombol menarik sumur terdekat ke rute trip (≤ {_bf_cap} km). "
+               + ("Unit-hari kosong boleh dibuka. " if _bf_open_new else "Tidak membuka trip baru (jaga km/well). ")
+               + "Boleh lebih awal dari window-nya (tercatat di log). Zona & mapping dihormati.")
     _bfc1, _bfc2 = st.columns(2)
     _do_backfill = _bfc1.button("🪄 Jalankan Backfill Kapasitas", type="primary",
                                 disabled=(not len(_bf_pool)), key="btn_backfill")
@@ -6376,8 +6381,10 @@ with tab_cart:
                         _dist = road_min_to_pts(_wlat, _wlon, _pts)
                         if _dist > _bf_cap: continue
                         _cand = (0, _dist, _u, int(_d))
+                    elif _bf_open_new:
+                        _cand = (1, 0.0, _u, int(_d))   # unit-hari kosong → buka hanya bila diizinkan
                     else:
-                        _cand = (1, 0.0, _u, int(_d))   # unit-hari kosong → boleh dibuka
+                        continue                         # jaga km/well: tak membuka trip baru utk sumur jauh
                     if _best is None or _cand[:2] < _best[:2]:
                         _best = _cand
             if _best is None: continue
