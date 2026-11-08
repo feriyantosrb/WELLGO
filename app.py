@@ -279,8 +279,22 @@ def norm_unit_name(u):
 
 def xl_sheet(writer, df, sheet, name=None):
     """Tulis df ke sheet SEBAGAI Excel Table (ListObject), bukan range biasa:
-    langsung ada autofilter, baris belang, dan header beku. Nama tabel dibersihkan
-    (Excel menolak spasi/simbol & nama > 30 char)."""
+    langsung ada autofilter, baris belang, dan header beku. Header di-unik-kan (Excel Table
+    menolak header kosong/duplikat → table gagal diam-diam) & displayName dijamin unik."""
+    df = df.copy()
+    # Header jadi string unik & tak kosong.
+    _seen, _cols = {}, []
+    for _c0 in df.columns:
+        _c = str(_c0).strip() or "Kolom"
+        if _c in _seen:
+            _n = _seen[_c] + 1
+            while f"{_c}_{_n}" in _seen:
+                _n += 1
+            _seen[_c] = _n
+            _c = f"{_c}_{_n}"
+        _seen[_c] = 1
+        _cols.append(_c)
+    df.columns = _cols
     df.to_excel(writer, sheet_name=sheet, index=False)
     try:
         from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -295,7 +309,19 @@ def xl_sheet(writer, df, sheet, name=None):
             ws.column_dimensions[get_column_letter(i)].width = min(max(wdt, 10), 42)
         ws.freeze_panes = "A2"
         if nr:  # Excel Table butuh minimal 1 baris data
-            nm = re.sub(r"\W", "_", str(name or sheet))[:30].strip("_") or "Tabel"
+            _base = re.sub(r"\W", "_", str(name or sheet))[:28].strip("_") or "Tabel"
+            if _base[0].isdigit():
+                _base = "T_" + _base
+            _existing = set()
+            for _wn in writer.sheets:
+                try:
+                    _existing |= set(writer.sheets[_wn].tables.keys())
+                except Exception:
+                    pass
+            nm, _k = _base, 1
+            while nm in _existing:
+                _k += 1
+                nm = f"{_base}_{_k}"[:30]
             t = Table(displayName=nm, ref=f"A1:{get_column_letter(nc)}{nr + 1}")
             t.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
             ws.add_table(t)
@@ -354,6 +380,29 @@ def canon_category(cat):
     if s == "AWS":
         return "AWS"
     return str(cat)
+
+def early_tol_for(cat, tipe, rtag, is_bk, base_tol):
+    """Toleransi EARLY (hari) yang diizinkan per sumur saat tarik-maju / rapikan trip:
+      • break-in PRQ/ORQ/SSF  → 0 (strict)
+      • PRQ/ORQ Compiled      → tak terbatas (boleh digeser sepanjang periode)
+      • Regular A             → 0 (strict, TAK boleh early)
+      • NW1 / AWS1            → 0 (strict)
+      • NW2/NW3 / AWS2        → 1 hari
+      • lainnya (Reg B/C/D, RTN) → base_tol (default 3)
+    Return int hari (10**6 = tak terbatas)."""
+    if is_bk:
+        return 0
+    if str(rtag).upper().strip() in ("PRQ", "ORQ"):
+        return 10**6
+    s = str(cat).upper()
+    if re.search(r"REGULAR\s*A\b", s):
+        return 0
+    if str(tipe) in ("NW", "AWS"):
+        if (re.search(r"NEW\s*WELL\s*1\b", s) or re.search(r"\bNW\s*1\b", s)
+                or re.search(r"\bAWS\s*1\b", s) or re.search(r"\bAS\s*1\b", s)):
+            return 0            # NW1 / AWS1 strict
+        return 1                # NW2/NW3 / AWS2 → maks 1 hari early
+    return int(base_tol)
 
 def classify_status(stat):
     s = str(stat).strip().upper().replace("-", " ").replace("_", " ")
@@ -1122,7 +1171,10 @@ def _rk(lat, lon):
 _URG_MODE = "deadline"
 # Dasar urutan rangkai sumur SE-FIELD di _grow: False = deadline dulu (urgensi), True = kedekatan
 # (jarak) dulu. Kedekatan bikin rute lebih rapat; deadline bikin sumur mendesak didahulukan.
-_SAMEFLD_BY_DIST = False
+_SAMEFLD_BY_DIST = True
+# Pengali relaksasi radius saat mengisi minimum sumur/trip. Dulu 1.8 → bisa menggandakan pelonggaran
+# layer prioritas (Jaminan Deadline) jadi trip belasan km. Default 1.3 agar rute lebih rapat.
+_MINWELLS_RELAX = 1.3
 TIER_TIEBREAK = 0.001    # bobot nudge kategori di mode hybrid; sangat kecil agar tak pernah melompati
                          # jenjang skor deadline, jadi deadline tetap dominan dan miss tetap minimal.
 # NW/AWS & REG A yang window-nya overlap periode tapi deadline di luar periode: bila True, jangan
@@ -2036,11 +2088,12 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             if target_fld in _thin_fields: continue
             f_wells = [w for w in unassigned if field_arr[w] == target_fld and not has_fu[w]]
             if not f_wells: continue
+            # Anchor (seed): NW/AWS didahulukan bila ada di field (not nwaws → 0 utk NW/AWS, 1 lainnya),
+            # baru yang paling urgent (deadline), lalu kategori/durasi.
             if _URG_MODE in ("hybrid", "tier"):
-                # Seed = paling urgent (deadline), lalu kategori tertinggi, lalu durasi terpendek.
-                f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], int(tier_arr[x]), dur_arr[x]))
+                f_wells_sorted = sorted(f_wells, key=lambda x: (not nwaws_arr[x], urg_arr[x], int(tier_arr[x]), dur_arr[x]))
             else:
-                f_wells_sorted = sorted(f_wells, key=lambda x: (urg_arr[x], dur_arr[x]))
+                f_wells_sorted = sorted(f_wells, key=lambda x: (not nwaws_arr[x], urg_arr[x], dur_arr[x]))
             seed = f_wells_sorted[0]
             zone = "remote" if area_arr[seed] in REMOTE_AREAS else "nonremote"
 
@@ -2088,7 +2141,7 @@ def plan(elig, mode, max_wells, n_remote, n_nonremote, time_budget, speed, use_u
             _grow(u, target_fld)
 
             if min_wells > 1 and len(unit_clusters[u]) < min_wells:
-                _grow(u, target_fld, elim=_EL_BASE * 1.8)
+                _grow(u, target_fld, elim=_EL_BASE * _MINWELLS_RELAX)
             if min_wells > 1 and len(unit_clusters[u]) < min_wells \
                and not any(nwaws_arr[i] or prqorq_arr[i] or urg_arr[i] <= KEEP_THIN_URG
                            for i in unit_clusters[u]):
@@ -2382,20 +2435,16 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
     _bkc = wk["is_breakin"].fillna(False) if "is_breakin" in wk.columns else pd.Series(False, index=wk.index)
     _sfc = wk["is_ssf"].fillna(False) if "is_ssf" in wk.columns else pd.Series(False, index=wk.index)
     _bk_any = _bkc | _sfc
-    _strict = (_tipe.isin(["NW", "AWS"]) | _catu.str.contains(r"REGULAR\s*A\b", regex=True, na=False) | _bk_any)
-    _unlimited = _rtag.isin(["PRQ", "ORQ"]) & ~_bk_any
-
     def _ontime_ok(c, d1date):
-        """True bila tanggal tujuan boleh. STRICT → harus >= min_date; UNLIMITED (PRQ/ORQ Compiled)
-        → selalu boleh; lainnya → boleh sampai early_tol_days sebelum min_date."""
+        """True bila tanggal tujuan boleh. Toleransi early per sumur (early_tol_for): Reg A & NW1/AWS1
+        & break-in strict (0); NW2/NW3/AWS2 maks 1 hari; PRQ/ORQ Compiled tak terbatas; lainnya base."""
         _md = _mnd.loc[c]
         if pd.isna(_md) or pd.isna(d1date):
             return True
-        if bool(_strict.loc[c]):
-            return pd.Timestamp(d1date) >= pd.Timestamp(_md)
-        if bool(_unlimited.loc[c]):
+        _tol = early_tol_for(_catu.loc[c], _tipe.loc[c], _rtag.loc[c], bool(_bk_any.loc[c]), early_tol_days)
+        if _tol >= 10**6:
             return True
-        return pd.Timestamp(d1date) >= pd.Timestamp(_md) - pd.Timedelta(days=int(early_tol_days))
+        return pd.Timestamp(d1date) >= pd.Timestamp(_md) - pd.Timedelta(days=int(_tol))
 
     def _unit_ok_for(c, u):
         fu = forced.loc[c]
@@ -2511,6 +2560,123 @@ def pull_forward_thin_days(wk, max_wells, cross_cap=7.0, skip_manual=False, cros
                 elif reason == "dist": diag["blk_dist"] += 1
                 else: diag["blk_noslot"] += 1
     info["diag"] = diag
+    return wk, info
+
+def refine_spread_trips(wk, max_wells, per_hi_ts, blocked_by_day=None, route_cap=10.0, ins_cap=7.0, early_tol_days=0):
+    """Optimasi AKHIR (setelah semua tahap): rapikan trip yang RUTE-nya > route_cap km (biasanya
+    lintas-field menyebar). Untuk tiap trip begitu: cari FIELD DOMINAN (terbanyak di trip); sumur
+    dari field MINORITAS dicoba dipindah ke trip lain yang (a) se-field, atau (b) jarak jalan ke
+    klaster tujuan <= ins_cap, dengan menengok hari maju/mundur, menghormati unit (forced/mapping/
+    zona), kapasitas, window (on-time, boleh early sampai early_tol_days), dan blackout. Bila tak ada
+    tujuan DAN window masih bisa ditunda (max_date > akhir periode) → DROP (tunda ke periode depan).
+    Sumur assign-manual user tak diutak-atik. Return (wk_baru, info) dgn info['moved']/['dropped']."""
+    info = {"moved": [], "dropped": []}
+    if not len(wk) or "plan_unit" not in wk.columns or "day_idx" not in wk.columns:
+        return wk, info
+    wk = wk.copy()
+    sched = wk["scheduled"].fillna(False) if "scheduled" in wk.columns else pd.Series(False, index=wk.index)
+    lat = pd.to_numeric(wk.get("lat"), errors="coerce")
+    lon = pd.to_numeric(wk.get("lon"), errors="coerce")
+    coord_ok = lat.notna() & lon.notna()
+    fld = wk["field"].astype(str) if "field" in wk.columns else pd.Series("", index=wk.index)
+    area = wk["area"].astype(str) if "area" in wk.columns else pd.Series("", index=wk.index)
+    allow = wk["allow_units"] if "allow_units" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
+    forced = wk["forced_unit"] if "forced_unit" in wk.columns else pd.Series([None] * len(wk), index=wk.index)
+    _mnd = pd.to_datetime(wk.get("min_date"), errors="coerce")
+    _mxd = pd.to_datetime(wk.get("max_date"), errors="coerce")
+    _manual = wk["manual"].fillna(False) if "manual" in wk.columns else pd.Series(False, index=wk.index)
+    _well = wk["well"].astype(str) if "well" in wk.columns else pd.Series("", index=wk.index)
+    _tipe = wk["tipe"].astype(str) if "tipe" in wk.columns else pd.Series("", index=wk.index)
+    _catu = wk["category"].astype(str) if "category" in wk.columns else pd.Series("", index=wk.index)
+    _rtag = wk["req_tag"].astype(str) if "req_tag" in wk.columns else pd.Series("", index=wk.index)
+    _bkc = wk["is_breakin"].fillna(False) if "is_breakin" in wk.columns else pd.Series(False, index=wk.index)
+    _sfc = wk["is_ssf"].fillna(False) if "is_ssf" in wk.columns else pd.Series(False, index=wk.index)
+    _bk_any = _bkc | _sfc
+
+    def _unit_ok_for(c, u):
+        fu = forced.loc[c]
+        if fu is not None and pd.notna(fu) and str(fu) != "":
+            return u == fu
+        a = allow.loc[c]
+        if isinstance(a, (list, tuple)) and len(a):
+            return u in a
+        wz = "remote" if area.loc[c] in REMOTE_AREAS else "non-remote"
+        uz = "remote" if u in REMOTE_UNITS else "non-remote"
+        return wz == uz
+
+    trips, daydate = {}, {}
+    for i in wk.index[sched]:
+        u = wk.at[i, "plan_unit"]
+        if u is None or (isinstance(u, float) and pd.isna(u)):
+            continue
+        d = int(wk.at[i, "day_idx"])
+        trips.setdefault((u, d), []).append(i)
+        daydate.setdefault(d, pd.Timestamp(wk.at[i, "plan_day"]))
+
+    def _route_km(mem):
+        _p = [i for i in mem if coord_ok[i]]
+        if len(_p) < 2:
+            return 0.0
+        return float(route_distance(lat.loc[_p].values, lon.loc[_p].values))
+
+    def _blk(u, dd):
+        return bool(blocked_by_day) and pd.notna(dd) and (u in blocked_by_day.get(pd.Timestamp(dd).strftime("%Y-%m-%d"), set()))
+
+    for (u0, d0) in list(trips.keys()):
+        mem = trips.get((u0, d0), [])
+        if len(mem) < 2 or _route_km(mem) <= route_cap:
+            continue
+        # Field dominan = terbanyak di trip (seri → paling banyak sumur).
+        _fc = {}
+        for i in mem:
+            _fc[fld.loc[i]] = _fc.get(fld.loc[i], 0) + 1
+        _dom = max(_fc.items(), key=lambda kv: kv[1])[0]
+        _minority = [i for i in list(mem) if fld.loc[i] != _dom and not bool(_manual.loc[i])]
+        for c in _minority:
+            _best = None
+            for (u2, d2), mem2 in trips.items():
+                if (u2, d2) == (u0, d0) or len(mem2) >= int(max_wells):
+                    continue
+                if not _unit_ok_for(c, u2):
+                    continue
+                _dd = daydate.get(d2)
+                _tol_c = early_tol_for(_catu.loc[c], _tipe.loc[c], _rtag.loc[c], bool(_bk_any.loc[c]), early_tol_days)
+                if _tol_c < 10**6 and pd.notna(_mnd.loc[c]) and pd.notna(_dd) and pd.Timestamp(_dd) < pd.Timestamp(_mnd.loc[c]) - pd.Timedelta(days=int(_tol_c)):
+                    continue                                    # terlalu early (lewat toleransi per sumur)
+                if pd.notna(_mxd.loc[c]) and pd.notna(_dd) and pd.Timestamp(_dd) > pd.Timestamp(_mxd.loc[c]):
+                    continue                                    # lewat deadline
+                if _blk(u2, _dd):
+                    continue
+                _same = any(fld.loc[c] == fld.loc[m] for m in mem2)
+                _dm = None
+                if coord_ok[c]:
+                    _pts = [(float(lat[m]), float(lon[m])) for m in mem2 if coord_ok[m]]
+                    _dm = road_min_to_pts(float(lat[c]), float(lon[c]), _pts) if _pts else None
+                if not _same and (_dm is None or _dm > ins_cap):
+                    continue
+                _cost = (0 if _same else 1, _dm if _dm is not None else 1e9, abs(int(d2) - int(d0)))
+                if _best is None or _cost < _best[0]:
+                    _best = (_cost, (u2, d2))
+            if _best is not None:
+                (u2, d2) = _best[1]
+                trips[(u0, d0)].remove(c)
+                trips[(u2, d2)].append(c)
+                wk.at[c, "plan_unit"] = u2
+                wk.at[c, "day_idx"] = d2
+                wk.at[c, "plan_day"] = daydate.get(d2)
+                info["moved"].append({"Well": _well.loc[c], "Dari": f"{u0}·H{int(d0)}",
+                                      "Ke": f"{u2}·H{int(d2)}", "Field": fld.loc[c]})
+            elif pd.notna(_mxd.loc[c]) and pd.Timestamp(_mxd.loc[c]) > pd.Timestamp(per_hi_ts):
+                # Tak ada tujuan & window masih bisa ditunda → drop ke periode depan.
+                trips[(u0, d0)].remove(c)
+                wk.at[c, "scheduled"] = False
+                wk.at[c, "plan_unit"] = None
+                wk.at[c, "day_idx"] = 0
+                wk.at[c, "plan_day"] = pd.NaT
+                info["dropped"].append({"Well": _well.loc[c], "Dari": f"{u0}·H{int(d0)}",
+                                        "Field": fld.loc[c],
+                                        "Deadline": pd.Timestamp(_mxd.loc[c]).strftime("%Y-%m-%d")})
+            # else: tak bisa dipindah & tak bisa ditunda (deadline periode ini) → biarkan.
     return wk, info
 
 def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
@@ -3461,11 +3627,16 @@ with st.sidebar:
         min_wells = st.slider(
             "Minimum Sumur / Trip", 1, 4, 4,
             help="Cegah unit berangkat seharian cuma untuk 1–2 sumur. Kalau klaster sebuah unit "
-                 "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius 1,8×; kalau tetap "
-                 "tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
+                 "tak mencapai angka ini, WELLGO coba dulu mengisinya dgn radius longgar (pengali di bawah); "
+                 "kalau tetap tipis, trip dibatalkan dan unitnya dikembalikan untuk lapangan lain. "
                  "Sumur mendesak DIKECUALIKAN — NW/AWS & PRQ/ORQ selalu, plus REG yang deadline-nya "
                  "sudah mepet (H-2/kurang) — trip 1 sumur tetap jalan kalau memang wajib supaya tidak "
                  "lenyap jadi miss deadline. Set 1 = perilaku lama.")
+        _MINWELLS_RELAX = st.number_input("Pengali radius saat isi min sumur/trip", min_value=1.0, max_value=2.0,
+            value=1.3, step=0.1, disabled=(min_wells <= 1),
+            help="Saat mengisi minimum sumur/trip, radius Elastic Limit dilonggarkan sebesar pengali ini. "
+                 "Default 1.3 (dulu 1.8). Angka besar bikin trip lebih mudah penuh tapi RUTE MELAR, apalagi "
+                 "bila digabung 'Jaminan Deadline' yang juga melonggarkan. Turunkan ke 1.0-1.2 utk rute paling rapat.")
         schedule_backlog = st.checkbox(
             "Jadwalkan Backlog (Add Manual late/early)", value=False,
             help="Default MATI: sumur backlog (test_category Add Manual A/B/C/D di luar PRQ) TIDAK "
@@ -3498,7 +3669,7 @@ with st.sidebar:
                  "sumur hari belakang unit mana pun, asalkan unit tujuan berhak atas sumur itu: "
                  "forced_unit/mapping/zona dihormati). Dijalankan sebelum pengisian Add Manual lalu "
                  "diulang di jadwal final. Se-field dibatasi 'Batas jarak se-field'; beda field 'Batas jarak beda-field'. "
-                 "Boleh early: PRQ/ORQ Compiled tanpa batas, sumur biasa sampai 'Toleransi early' hari; strict NW/AWS/Reg A/break-in-SSF.")
+                 "Early per kategori: PRQ/ORQ Compiled tanpa batas; NW2/NW3/AWS2 maks 1 hari; sumur biasa s/d 'Toleransi early'; strict 0 utk Reg A, NW1/AWS1, break-in/SSF.")
         pull_fwd_cap = st.number_input("Batas jarak beda-field tarik maju (km)", min_value=5, max_value=10,
             value=7, step=1, disabled=not pull_forward_thin,
             help="Hanya untuk tarik maju LINTAS/BEDA field: sumur beda field ditarik ke klaster hari awal "
@@ -3506,15 +3677,25 @@ with st.sidebar:
                  "batas. Ketik angkanya (5,6,7,8,9,10).")
         pull_fwd_early = st.number_input("Toleransi early tarik maju (hari)", min_value=0, max_value=7,
             value=3, step=1, disabled=not pull_forward_thin,
-            help="Sumur biasa (Reg B/C/D, RTN) boleh ditarik maju sampai sekian hari SEBELUM window buka "
-                 "(default 3). PRQ/ORQ dari Compiled Schedule boleh early TANPA batas. Strict (tak boleh "
-                 "early): NW/AWS, Regular A, serta PRQ/ORQ/SSF dari sheet BreakIn. 0 = semua non-PRQ strict.")
+            help="Hari maksimum sumur BIASA (Reg B/C/D, RTN) boleh ditarik maju SEBELUM window buka (default 3). "
+                 "Aturan khusus (tak terpengaruh angka ini): PRQ/ORQ Compiled = tanpa batas; NW2/NW3/AWS2 = maks "
+                 "1 hari; STRICT 0 hari = Regular A, NW1/AWS1, dan PRQ/ORQ/SSF dari BreakIn.")
         pull_fwd_same = st.number_input("Batas jarak SE-field tarik maju (km)", min_value=3, max_value=50,
             value=7, step=1, disabled=not pull_forward_thin,
             help="Sumur se-field pun dibatasi jaraknya (field luas spt Bangko/Balam jangan dirangkai "
                  "sembarang jarak). Sumur se-field ditarik bila jarak jalan ke klaster hari awal <= batas ini. "
                  "Sumur se-field tanpa koordinat (imputed/NW1) tetap boleh. Default 7 km (turun dari 15 agar "
                  "rute lebih rapat; naikkan bila ingin konsolidasi lebih agresif).")
+
+        refine_spread = st.checkbox("Optimasi akhir: rapikan trip menyebar (>ambang km)", value=True,
+            help="Setelah semua tahap, trip yang RUTE-nya melebihi ambang (biasanya lintas-field menyebar) "
+                 "dirapikan: sumur dari FIELD MINORITAS dipindah ke trip se-field/terdekat (cek hari maju & "
+                 "mundur, hormati window/unit/blackout). Bila tak ada tujuan DAN window masih bisa ditunda "
+                 "(deadline setelah periode) → sumur di-drop untuk periode depan. Sumur assign-manual user tak "
+                 "diutak-atik. Daftar sumur yang dipindah/di-drop ditampilkan & diekspor.")
+        refine_route_cap = st.number_input("Ambang rute trip menyebar (km)", min_value=5, max_value=40,
+            value=10, step=1, disabled=not refine_spread,
+            help="Trip dengan total rute > angka ini dianggap menyebar dan dirapikan. Default 10 km.")
 
         pad_promote_km = st.slider(
             "Promosi tetangga sepad ke Lapis 1 (radius km, 0 = mati)", 0.0, 5.0, 1.0, 0.5,
@@ -3537,7 +3718,7 @@ with st.sidebar:
                      "Hybrid (deadline + tiebreak kategori)": "hybrid",
                      "Tier penuh (eksperimen)": "tier"}[_urg_mode_lbl]
 
-        _SAMEFLD_BY_DIST = st.checkbox("Rangkai se-field berdasarkan KEDEKATAN (bukan deadline)", value=False,
+        _SAMEFLD_BY_DIST = st.checkbox("Rangkai se-field berdasarkan KEDEKATAN (bukan deadline)", value=True,
             help="Saat satu unit merangkai sumur SE-FIELD: bila dicentang, pilih sumur TERDEKAT dulu "
                  "(rute lebih rapat, km/well lebih rendah); bila tidak, pilih yang paling dekat DEADLINE dulu "
                  "(sumur mendesak didahulukan). Keduanya tetap dibatasi Elastic Limit & urutan hari.")
@@ -4447,6 +4628,14 @@ if man:
             zone_rejects.append((w, _wzone, _u, _uzone))
             st.session_state.get("manual_assign", {}).pop(w, None)  # buang assignment lintas-zona (self-heal)
             continue
+        # Unit TIDAK TERSEDIA (blackout) pada tanggal tujuan → tolak. Berlaku utk SEMUA penugasan
+        # termasuk tahap lanjut (backfill/konsolidasi/rescue/addman) yang lewat manual_assign, supaya
+        # unit yang ditandai tak tersedia tetap kosong di tanggal itu.
+        _di_eff0 = max(0, min(len(days) - 1, di - 1 - day_offset))
+        _ddk0 = pd.Timestamp(days[_di_eff0]).strftime("%Y-%m-%d")
+        if _u in unit_blackout_by_day.get(_ddk0, set()):
+            st.session_state.get("manual_assign", {}).pop(w, None)
+            continue
         week_df.loc[m, "scheduled"] = True
         week_df.loc[m, "plan_unit"] = info["unit"]
         # di relatif periode → indeks ke dalam days window (clamp bila di luar window planning).
@@ -4498,7 +4687,29 @@ if interday_smooth and mode == "pooled":
     week_df, _interday_info = smooth_interday(week_df, max_wells, radius_km=float(area_cont_km))
     _ckpt("smooth_interday")
 
+# ── Optimasi AKHIR: rapikan trip menyebar (>route_cap km) ──────────────────────
+# Sumur field-minoritas di trip boros dipindah ke trip se-field/terdekat (cek hari maju/mundur),
+# atau di-drop (tunda periode depan) bila tak ada tujuan & window masih bisa ditunda.
+_refine_info = None
+if refine_spread and mode == "pooled" and "scheduled" in week_df.columns:
+    week_df, _refine_info = refine_spread_trips(week_df, max_wells, per_hi_ts,
+                                                blocked_by_day=unit_blackout_by_day,
+                                                route_cap=float(refine_route_cap), ins_cap=float(pull_fwd_cap),
+                                                early_tol_days=int(pull_fwd_early))
+    _ckpt(f"refine_spread_trips (moved={len(_refine_info['moved'])}, dropped={len(_refine_info['dropped'])})")
+
 scheduled_all = week_df[week_df["scheduled"]].copy()
+if _refine_info and (_refine_info["moved"] or _refine_info["dropped"]):
+    _nm, _nd = len(_refine_info["moved"]), len(_refine_info["dropped"])
+    st.caption(f"🧭 **Optimasi akhir (rapikan trip menyebar > {int(refine_route_cap)} km)** — "
+               f"{_nm} sumur dipindah ke trip lebih dekat, {_nd} sumur di-drop (ditunda periode depan).")
+    with st.expander(f"Rincian penyusunan ulang trip menyebar ({_nm} pindah · {_nd} drop)", expanded=(_nd > 0)):
+        if _refine_info["moved"]:
+            st.markdown("**Dipindah ke trip lain (se-field / lebih dekat):**")
+            st.dataframe(pd.DataFrame(_refine_info["moved"]), width='stretch', hide_index=True)
+        if _refine_info["dropped"]:
+            st.markdown("**Di-drop (ditunda ke periode depan — tak ada trip cocok & window masih bisa ditunda):**")
+            st.dataframe(pd.DataFrame(_refine_info["dropped"]), width='stretch', hide_index=True)
 if _pullfwd_info and _pullfwd_info.get("moved"):
     st.caption(f"⏩ **Tarik maju hari tipis** — {_pullfwd_info['moved']} sumur ditarik ke hari lebih awal "
                f"(padatkan hari awal s/d {max_wells}/unit, lintas unit; se-field ≤ {int(pull_fwd_same)} km, beda field ≤ {int(pull_fwd_cap)} km, "
@@ -5591,9 +5802,14 @@ with tab_cart:
                    "Yang lain tetap dites & rute efisien, tapi penempatan Early/Late tercatat **tidak on-time**.")
 
     def _cand_days_tol(_w):
-        """Hari kandidat (day_idx relatif periode) dalam [Min − tolEarly, Max + tolLate].
-        REG A DIKECUALIKAN dari toleransi: wajib di dalam window [Min, Max], tak boleh Early/Late."""
-        _e, _l = (pd.Timedelta(0), pd.Timedelta(0)) if bool(_w.get("is_reg_a", False)) else (_te, _tl)
+        """Hari kandidat (day_idx relatif periode) dalam [Min − tolEarly(kategori), Max + tolLate].
+        Toleransi early per kategori: Reg A & NW1/AWS1 strict (0), NW2/NW3/AWS2 maks 1 hari,
+        PRQ/ORQ fleksibel, sisanya ikut slider. Late tetap _tl, kecuali Reg A yang strict."""
+        _is_bk = bool(_w.get("is_breakin", False)) or bool(_w.get("is_ssf", False))
+        _etol = min(early_tol_for(_w.get("category"), _w.get("tipe"), _w.get("req_tag"),
+                                  _is_bk, _tol_early), horizon + 1)
+        _e = pd.Timedelta(days=int(_etol))
+        _l = pd.Timedelta(0) if bool(_w.get("is_reg_a", False)) else _tl
         return [di + day_offset for di in range(1, horizon + 1)
                 if (pd.isna(_w["min_date"]) or days[di - 1] >= _w["min_date"] - _e)
                 and (pd.isna(_w["max_date"]) or days[di - 1] <= _w["max_date"] + _l)]
@@ -6426,6 +6642,12 @@ with tab_cart:
     if (_do_backfill or _auto == 6) and len(_bf_pool):
         _act_rem_bf = list(REMOTE_UNITS)[:n_remote]; _act_non_bf = list(NONREMOTE_UNITS)[:n_nonremote]
         _mind = _bf_pool.set_index("well")["min_date"].to_dict() if "min_date" in _bf_pool.columns else {}
+        _catd = _bf_pool.set_index("well")["category"].to_dict() if "category" in _bf_pool.columns else {}
+        _tipd = _bf_pool.set_index("well")["tipe"].to_dict() if "tipe" in _bf_pool.columns else {}
+        _rqd = _bf_pool.set_index("well")["req_tag"].to_dict() if "req_tag" in _bf_pool.columns else {}
+        _bk_or_ssf = (_bf_pool.get("is_breakin", pd.Series(False, index=_bf_pool.index)).fillna(False)
+                      | _bf_pool.get("is_ssf", pd.Series(False, index=_bf_pool.index)).fillna(False))
+        _bkd = dict(zip(_bf_pool["well"], _bk_or_ssf))
         def _room_of(_k): return _bf_room.get(_k, max_wells)
         # urut: paling mendesak dulu (urgency kecil = deadline dekat), lalu BOPD besar
         _sort_df = _bf_pool.copy()
@@ -6443,6 +6665,12 @@ with tab_cart:
                 _elig = _act_rem_bf if str(_w.get("area", "")).upper() in REMOTE_AREAS else _act_non_bf
             _best = None  # (is_empty, dist, unit, day) — trip aktif terdekat diutamakan, lalu buka unit kosong
             for _d in day_nums:
+                _ddate_c = _bf_daydate.get(int(_d)); _mn_c = _mind.get(_wn)
+                if pd.notna(_mn_c) and pd.notna(_ddate_c):
+                    _tol_c = min(early_tol_for(_catd.get(_wn), _tipd.get(_wn), _rqd.get(_wn),
+                                               bool(_bkd.get(_wn)), early_days), len(day_nums) + 1)
+                    if pd.Timestamp(_ddate_c) < pd.Timestamp(_mn_c) - pd.Timedelta(days=int(_tol_c)):
+                        continue   # kategori strict (Reg A, NW1/AWS1) tak boleh early; NW2/NW3/AWS2 maks 1 hari
                 for _u in _elig:
                     _k = (_u, int(_d))
                     if _room_of(_k) <= 0: continue
@@ -6554,6 +6782,12 @@ with tab_cart:
         if _do_consol and len(_pool) and _fill_seats > 0:
             _room = {k: int(max_wells - _ccnt[k]) for k in _thin_act}
             _mind = _pool.set_index("well")["min_date"].to_dict() if "min_date" in _pool.columns else {}
+            _catd = _pool.set_index("well")["category"].to_dict() if "category" in _pool.columns else {}
+            _tipd = _pool.set_index("well")["tipe"].to_dict() if "tipe" in _pool.columns else {}
+            _rqd = _pool.set_index("well")["req_tag"].to_dict() if "req_tag" in _pool.columns else {}
+            _bk_or_ssf = (_pool.get("is_breakin", pd.Series(False, index=_pool.index)).fillna(False)
+                          | _pool.get("is_ssf", pd.Series(False, index=_pool.index)).fillna(False))
+            _bkd = dict(zip(_pool["well"], _bk_or_ssf))
             _d2date = {}
             for _d, _pday in zip(scheduled_all["day_idx"], scheduled_all["plan_day"]):
                 _d2date.setdefault(int(_d), _pday)
@@ -6567,6 +6801,12 @@ with tab_cart:
                     if isinstance(_al, (list, tuple)) and len(_al) and k[0] not in _al: continue
                     _pts = _crtp.get(k)
                     if not _pts: continue
+                    _ddate_k = _d2date.get(int(k[1])); _mn_k = _mind.get(_wn)
+                    if pd.notna(_mn_k) and pd.notna(_ddate_k):
+                        _tol_k = min(early_tol_for(_catd.get(_wn), _tipd.get(_wn), _rqd.get(_wn),
+                                                   bool(_bkd.get(_wn)), early_days), len(day_nums) + 1)
+                        if pd.Timestamp(_ddate_k) < pd.Timestamp(_mn_k) - pd.Timedelta(days=int(_tol_k)):
+                            continue   # kategori strict tak boleh early (Reg A, NW1/AWS1); NW2/NW3/AWS2 maks 1 hari
                     _dd = road_min_to_pts(_wlat, _wlon, _pts)   # jarak ke sumur TERDEKAT di trip
                     if _dd is None or _dd > _KT_RAD: continue
                     _pairs.append((float(_dd), _wn, k))
@@ -7228,18 +7468,29 @@ with tab_diagnostics:
             _trt = float(route_distance(_tla, _tlo)) if _tn > 1 else 0.0
             _tmx = float(np.max(_dist_matrix(_tla, _tlo))) if _tn > 1 else 0.0
             _tdd = _tsub["plan_day"].iloc[0]
+            _tt = _tsub["tipe"].astype(str) if "tipe" in _tsub.columns else pd.Series("", index=_tsub.index)
+            _trt_tag = _tsub["req_tag"].astype(str).str.upper() if "req_tag" in _tsub.columns else pd.Series("", index=_tsub.index)
+            _tcat = _tsub["category"].astype(str).str.upper() if "category" in _tsub.columns else pd.Series("", index=_tsub.index)
+            _n_nwaws = int(_tt.isin(["NW", "AWS"]).sum())
+            _n_prq = int(_trt_tag.isin(["PRQ", "ORQ"]).sum())
+            _n_rega = int(_tcat.str.contains(r"REGULAR\s*A\b", regex=True, na=False).sum())
+            _is_prio = (_n_nwaws + _n_prq + _n_rega) > 0   # trip memuat sumur layer prioritas
             _trip_rows.append({"Unit": _tu, "Hari": int(_tdi),
                                "Tanggal": pd.Timestamp(_tdd).strftime("%Y-%m-%d") if pd.notna(_tdd) else "-",
                                "Sumur": _tn, "Rute (km)": round(_trt, 1),
                                "Jarak terjauh antar sumur (km)": round(_tmx, 1),
+                               "NW/AWS": _n_nwaws, "PRQ/ORQ": _n_prq, "Reg A": _n_rega,
+                               "Prioritas?": "ya" if _is_prio else "-",
                                "> Elastic Limit": "⚠️ ya" if _tmx > float(elastic_limit) + 0.01 else "-"})
         if _trip_rows:
             _tripdf = pd.DataFrame(_trip_rows).sort_values("Jarak terjauh antar sumur (km)", ascending=False)
             _n_over = int((_tripdf["> Elastic Limit"] == "⚠️ ya").sum())
-            st.caption(f"Elastic Limit aktif: **{elastic_limit} km**. Trip yang 'jarak terjauh antar sumur'-nya "
-                       f"MELEBIHI Elastic Limit ({_n_over} trip) TIDAK dibentuk oleh grow optimasi dasar (yang "
-                       "dibatasi Elastic Limit), melainkan oleh tarik-maju / regroup / backfill. Itu trip yang "
-                       "rutenya cenderung membengkak.")
+            _n_over_prio = int(((_tripdf["> Elastic Limit"] == "⚠️ ya") & (_tripdf["Prioritas?"] == "ya")).sum())
+            st.caption(f"Elastic Limit aktif: **{elastic_limit} km**. {_n_over} trip melebihi Elastic Limit; "
+                       f"**{_n_over_prio}** di antaranya memuat sumur PRIORITAS (NW/AWS/PRQ/ORQ/Reg A). Trip "
+                       "prioritas yang melar biasanya karena 'Jaminan Deadline' melonggarkan batas persebaran "
+                       "(elastic × pengali) ditambah relaksasi min_wells (×1.8). Trip NON-prioritas yang melebihi "
+                       "Elastic Limit berasal dari tarik-maju / backfill. (Regroup tak pernah menambah km.)")
             st.dataframe(_tripdf, width='stretch', hide_index=True)
         else:
             st.caption("Belum ada trip terjadwal untuk dianalisis.")
@@ -7520,6 +7771,10 @@ with tab_export:
             xl_sheet(w, hold_wells[_hold_cols].rename(columns={"skip_reason": "sebab", "min_date": "earliest", "max_date": "deadline"}), "Hold-Completed", "HoldCompleted")
         if len(nwaws_trans):   # transisi fase AWS1→AWS2 / NW1→NW2→NW3 (kapan fase ke-n dijadwalkan)
             xl_sheet(w, nwaws_trans, "Transisi-AWS-NW", "TransisiAWSNW")
+        if _refine_info and _refine_info.get("moved"):   # sumur dipindah oleh optimasi akhir
+            xl_sheet(w, pd.DataFrame(_refine_info["moved"]), "Rapikan-Pindah", "RapikanPindah")
+        if _refine_info and _refine_info.get("dropped"):  # sumur di-drop (ditunda periode depan)
+            xl_sheet(w, pd.DataFrame(_refine_info["dropped"]), "Rapikan-Drop", "RapikanDrop")
     ex1.download_button("⬇️ Unduh Master Mingguan (.xlsx)", out_w.getvalue(), file_name=f"jadwal_mingguan_{week_lo.date()}_{week_hi.date()}.xlsx", mime=XLSX_MIME)
 
     if view_day is not None:
