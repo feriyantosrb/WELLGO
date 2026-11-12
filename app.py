@@ -123,6 +123,7 @@ REMOTE_UNITS = ["MPAS_444", "MPAS_768", "MPAS_523", "MPAS_445", "MPAS_534"]
 NONREMOTE_UNITS = ["MPAS_535", "MPAS_524", "MPAS_525", "MPAS_767"]
 ALL_UNITS = REMOTE_UNITS + NONREMOTE_UNITS
 ADDMAN_URG = 1_000_000   # urgensi sentinel utk Add Manual → paling bawah (isi slot sisa, jangan geser yang lain)
+FILL_EARLY_CAP = 3       # isi sisa kapasitas unit: Reg B/C/D/RTN boleh early maks 3 hari (Reg A/NW1/AWS1=0, NW2/NW3/AWS2/AWS3=2, PRQ BreakIn=0, PRQ Compiled bebas)
 INERTIA_SLACK_DAYS = 5   # kontinuitas area: hanya sumur dgn slack deadline >= ini yang boleh ditunda demi tetap di area
 INERTIA_PENALTY    = 4   # tambahan "hari" urgensi utk sumur low-urgency yang JAUH dari footprint fleet kemarin
 KEEP_THIN_URG = 2        # REG dengan urgensi <= ini (H-2/kurang) dianggap "deadline mepet": tripnya tak
@@ -382,13 +383,14 @@ def canon_category(cat):
     return str(cat)
 
 def early_tol_for(cat, tipe, rtag, is_bk, base_tol):
-    """Toleransi EARLY (hari) yang diizinkan per sumur saat tarik-maju / rapikan trip:
+    """Toleransi EARLY (hari) yang diizinkan per sumur saat tarik-maju / rapikan trip /
+    isi sisa kapasitas:
       • break-in PRQ/ORQ/SSF  → 0 (strict)
       • PRQ/ORQ Compiled      → tak terbatas (boleh digeser sepanjang periode)
       • Regular A             → 0 (strict, TAK boleh early)
       • NW1 / AWS1            → 0 (strict)
-      • NW2/NW3 / AWS2        → 1 hari
-      • lainnya (Reg B/C/D, RTN) → base_tol (default 3)
+      • NW2/NW3 / AWS2/AWS3   → 2 hari
+      • lainnya (Reg B/C/D, RTN) → base_tol (isi kapasitas default 3)
     Return int hari (10**6 = tak terbatas)."""
     if is_bk:
         return 0
@@ -401,7 +403,7 @@ def early_tol_for(cat, tipe, rtag, is_bk, base_tol):
         if (re.search(r"NEW\s*WELL\s*1\b", s) or re.search(r"\bNW\s*1\b", s)
                 or re.search(r"\bAWS\s*1\b", s) or re.search(r"\bAS\s*1\b", s)):
             return 0            # NW1 / AWS1 strict
-        return 1                # NW2/NW3 / AWS2 → maks 1 hari early
+        return 2                # NW2/NW3 / AWS2/AWS3 → maks 2 hari early
     return int(base_tol)
 
 def classify_status(stat):
@@ -2735,10 +2737,14 @@ def build_elig(raw, ncmp_df, per_lo_ts, per_hi_ts, week_lo, week_hi,
     # Out-of-window (deadline sudah lewat SEBELUM periode, atau window belum buka) → JANGAN dibuang.
     # Diperlakukan sebagai kandidat DITUNDA: masuk pool dgn urgensi fleksibel (prioritas rendah, isi
     # celah / bisa ditarik backfill), bukan menyerobot sumur in-periode. Berlaku utk NW/AWS & reguler.
+    # PRQ/ORQ Compiled (bukan break-in) TIDAK ditunda walau window belum buka / deadline lampau:
+    # permintaan boleh dipenuhi sepanjang periode (via force_week/bypass_reg), bukan sekadar isi celah.
+    _prq_compiled = raw["req_tag"].isin(["PRQ", "ORQ"]) & ~prq_breakin
     _outside_defer = (~in_range
                       & ((raw["max_date"].notna() & (raw["max_date"] < batch_lo))
                          | (raw["min_date"].notna() & (raw["min_date"] > batch_hi)))
-                      & ~raw["well"].isin(executed | pending_set))
+                      & ~raw["well"].isin(executed | pending_set)
+                      & ~_prq_compiled)
     comp_wells = raw[raw["well"].isin(comp_disp_set)].copy()
     pending_wells = raw[raw["well"].isin(pending_set)].copy()
     pending_nodata = sorted(pending_set - set(pending_wells["well"]))
@@ -4614,7 +4620,10 @@ if man:
         m = week_df["well"] == w
         if not m.any(): continue
         di = int(info["day_idx"])
-        if di < 1 or di > horizon: continue
+        # day_idx dalam ruang GLOBAL [1+day_offset .. horizon+day_offset] (day_nums). Saat planning
+        # mulai di tengah periode (day_offset>0), guard lama "di > horizon" salah menolak hari-hari
+        # akhir window → sumur rescue/backfill di hari akhir tak jadi terjadwal (tetap miss).
+        if di < 1 or di > horizon + day_offset: continue
         # Batasan zona: unit remote (Bangko/Balam) hanya utk sumur remote; non-remote utk Bekasap/Libo dst.
         _u = info["unit"]
         _uzone = "remote" if _u in REMOTE_UNITS else "non-remote"
@@ -6668,7 +6677,7 @@ with tab_cart:
                 _ddate_c = _bf_daydate.get(int(_d)); _mn_c = _mind.get(_wn)
                 if pd.notna(_mn_c) and pd.notna(_ddate_c):
                     _tol_c = min(early_tol_for(_catd.get(_wn), _tipd.get(_wn), _rqd.get(_wn),
-                                               bool(_bkd.get(_wn)), early_days), len(day_nums) + 1)
+                                               bool(_bkd.get(_wn)), FILL_EARLY_CAP), len(day_nums) + 1)
                     if pd.Timestamp(_ddate_c) < pd.Timestamp(_mn_c) - pd.Timedelta(days=int(_tol_c)):
                         continue   # kategori strict (Reg A, NW1/AWS1) tak boleh early; NW2/NW3/AWS2 maks 1 hari
                 for _u in _elig:
@@ -6804,7 +6813,7 @@ with tab_cart:
                     _ddate_k = _d2date.get(int(k[1])); _mn_k = _mind.get(_wn)
                     if pd.notna(_mn_k) and pd.notna(_ddate_k):
                         _tol_k = min(early_tol_for(_catd.get(_wn), _tipd.get(_wn), _rqd.get(_wn),
-                                                   bool(_bkd.get(_wn)), early_days), len(day_nums) + 1)
+                                                   bool(_bkd.get(_wn)), FILL_EARLY_CAP), len(day_nums) + 1)
                         if pd.Timestamp(_ddate_k) < pd.Timestamp(_mn_k) - pd.Timedelta(days=int(_tol_k)):
                             continue   # kategori strict tak boleh early (Reg A, NW1/AWS1); NW2/NW3/AWS2 maks 1 hari
                     _dd = road_min_to_pts(_wlat, _wlon, _pts)   # jarak ke sumur TERDEKAT di trip
