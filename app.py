@@ -728,9 +728,20 @@ def load_unit_blackout(file_bytes):
     diag["sheet"] = _sh
     if df is None or not len(df):
         return out, diag
+    # Baris yang memuat sel 'BOOKING' → header 'Unit MWT' di sekitarnya milik matriks BOOKING UNIT,
+    # BUKAN blackout. Dilewati supaya pembaca blackout tak salah ambil matriks booking.
+    _booking_rows = set()
+    for r in range(len(df)):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if isinstance(v, str) and "BOOKING" in v.strip().upper():
+                _booking_rows.update(range(r, r + 4))
+                break
     # Cari sel 'UNIT MWT' PERSIS (bukan 'Unit MWT Tidak Tersedia') → baris & kolom header matriks.
     hr = hc = None
     for r in range(len(df)):
+        if r in _booking_rows:
+            continue
         for c in range(df.shape[1]):
             v = df.iat[r, c]
             if isinstance(v, str) and v.strip().upper() == "UNIT MWT":
@@ -770,6 +781,73 @@ def load_unit_blackout(file_bytes):
     diag["n_units"] = _units
     diag["n_true"] = sum(len(v) for v in out.values())
     diag["sample"] = _sample
+    return out, diag
+
+@st.cache_data(show_spinner=False)
+def load_unit_booking(file_bytes):
+    """Baca matriks 'BOOKING UNIT' dari sheet READ ME file kandidat. Layout: sel 'BOOKING UNIT' =
+    judul seksi; di bawahnya header 'Unit MWT' + tanggal di kanan; baris di bawah = nama unit, isi
+    sel = nama FIELD yang dibooking unit itu pada tanggal itu. Artinya: paksa unit tsb berada di
+    field tsb pada tanggal tsb. Return (out, diag): out = {(date_key '%Y-%m-%d', unit): field}."""
+    diag = {"sheet": None, "header_found": False, "n_dates": 0, "n_book": 0, "sample": None}
+    out = {}
+    _sh, df = _read_readme_grid(file_bytes)
+    diag["sheet"] = _sh
+    if df is None or not len(df):
+        return out, diag
+    # Cari sel yang memuat 'BOOKING' → seksi booking.
+    br = bc = None
+    for r in range(len(df)):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if isinstance(v, str) and "BOOKING" in v.strip().upper():
+                br, bc = r, c
+                break
+        if br is not None:
+            break
+    if br is None:
+        return out, diag
+    # Header 'Unit MWT' di baris br atau beberapa baris di bawahnya.
+    hr = hc = None
+    for r in range(br, min(br + 4, len(df))):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if isinstance(v, str) and v.strip().upper() == "UNIT MWT":
+                hr, hc = r, c
+                break
+        if hr is not None:
+            break
+    if hr is None:
+        return out, diag
+    diag["header_found"] = True
+    # Tanggal di kanan header.
+    date_cols = {}
+    for c in range(hc + 1, df.shape[1]):
+        dt = pd.to_datetime(df.iat[hr, c], errors="coerce", dayfirst=True)
+        if pd.notna(dt):
+            date_cols[c] = pd.Timestamp(dt).strftime("%Y-%m-%d")
+    diag["n_dates"] = len(date_cols)
+    if not date_cols:
+        return out, diag
+    # Baris unit di bawah header; sel = nama field yang dibooking.
+    for r in range(hr + 1, len(df)):
+        u = df.iat[r, hc]
+        if u is None or (isinstance(u, float) and pd.isna(u)):
+            continue
+        u = norm_unit(str(u).strip())
+        if not u or str(u).upper() == "NAN":
+            continue
+        for c, dk in date_cols.items():
+            _cell = df.iat[r, c]
+            if _cell is None or (isinstance(_cell, float) and pd.isna(_cell)):
+                continue
+            _fld = str(_cell).strip().upper()
+            if not _fld or _fld == "NAN":
+                continue
+            out[(dk, u)] = _fld
+            if diag["sample"] is None:
+                diag["sample"] = f"{u} × {dk} → {_fld}"
+    diag["n_book"] = len(out)
     return out, diag
 
 @st.cache_data(show_spinner=False)
@@ -896,9 +974,18 @@ def load_candidates(file_bytes, sheet):
     fld_ = df["field"].astype(str).str.upper().str.strip()
     
     df["forced_unit"] = None
-    # Aturan Mutlak GP tetap dipertahankan
-    df.loc[st_.eq("GP") & area_.eq("BEKASAP"), "forced_unit"] = "MPAS_525"
-    df.loc[st_.eq("GP") & area_.isin(["BANGKO", "BALAM"]), "forced_unit"] = "MPAS_768"
+    # Area efektif utk aturan GP: kolom AREA kerap kosong di master (mis. seluruh sub-area BEKASAPC),
+    # sehingga pengecekan area=="BEKASAP" meleset dan gas well malah bebas berkompetisi (mis. BK034
+    # gas Bekasap jatuh ke MP535). Turunkan area dari prefix SUB-AREA bila AREA kosong/tak dikenal.
+    _sub_u = (df["subarea"] if "subarea" in df.columns else pd.Series("", index=df.index)).astype(str).str.upper().str.strip()
+    _area_eff = area_.copy()
+    _blank = ~_area_eff.isin(["BEKASAP", "BANGKO", "BALAM"])
+    _area_eff = _area_eff.mask(_blank & _sub_u.str.startswith("BEKASAP"), "BEKASAP")
+    _area_eff = _area_eff.mask(_blank & _sub_u.str.startswith("BANGKO"), "BANGKO")
+    _area_eff = _area_eff.mask(_blank & _sub_u.str.startswith("BALAM"), "BALAM")
+    # Aturan Mutlak GP (gas well) tetap dipertahankan, kini pakai area efektif.
+    df.loc[st_.eq("GP") & _area_eff.eq("BEKASAP"), "forced_unit"] = "MPAS_525"
+    df.loc[st_.eq("GP") & _area_eff.isin(["BANGKO", "BALAM"]), "forced_unit"] = "MPAS_768"
     # REVISI: Aturan mutlak "BENAR -> 534" DIHAPUS. BENAR akan ikut kompetisi deadline di Remote Area.
 
     # Override alokasi Balam_South (Revisi X-Ray)
@@ -3611,7 +3698,24 @@ with st.sidebar:
             if st.button("Bersihkan semua blokir", key="clr_blk", width='stretch'):
                 st.session_state["unit_blackout"] = []
                 st.rerun()
-                                    
+
+    with st.expander("d. 📌 Booking Unit (unit × tanggal → field)", expanded=False):
+        st.caption("Matriks **BOOKING UNIT** di sheet READ ME: isi sel (unit × tanggal) dengan nama "
+                   "**field**. WELLGO akan memaksa unit tsb berada di field tsb pada tanggal tsb "
+                   "(sumur field itu dijadikan seed rute unit-hari tsb, menghormati mapping unit).")
+        _bk_show, _bk_dg = load_unit_booking(up.getvalue())
+        if _bk_show:
+            _bk_tbl = pd.DataFrame(
+                [{"Tanggal": _dk, "Unit": _u, "Field": _f} for (_dk, _u), _f in sorted(_bk_show.items())])
+            st.caption(f"📄 Dari sheet **READ ME**: **{len(_bk_show)}** booking terbaca "
+                       f"({_bk_dg['n_dates']} tanggal) dan langsung dipakai.")
+            st.dataframe(_bk_tbl, width='stretch', hide_index=True)
+        else:
+            st.caption("📄 Belum ada booking terbaca. Pastikan ada sel **BOOKING UNIT**, lalu header "
+                       "**Unit MWT** dengan tanggal di kanannya, dan sel diisi nama field.")
+            st.caption(f"🔎 Diagnostik: sheet={_bk_dg['sheet']!r}, header ketemu={_bk_dg['header_found']}, "
+                       f"kolom tanggal={_bk_dg['n_dates']}, booking={_bk_dg['n_book']}. Contoh: {_bk_dg['sample']}")
+
     st.divider()
     
     with st.form("opt_form"):
@@ -4461,7 +4565,31 @@ for (_u, _dk) in st.session_state.get("unit_blackout", []):
     unit_blackout_by_day.setdefault(_dk, set()).add(_u)
 
 # ── Rollout Execution Framework ────────────────────────────────────────────
-route_anchors = st.session_state.get("route_anchors", {}) or None
+# Booking Unit (matriks BOOKING UNIT di sheet READ ME): paksa unit tsb berada di FIELD tsb pada
+# TANGGAL tsb. Diterjemahkan jadi anchor: sumur field itu (yang berhak utk unit itu) dijadikan
+# seed unit-hari tsb, sehingga rute hari itu dibangun di field yang dibooking. Dibaca ulang tiap run.
+_booking, _bk_diag = load_unit_booking(up.getvalue())
+booking_anchors = {}
+if _booking and len(elig):
+    _date2di = {pd.Timestamp(days[_k]).strftime("%Y-%m-%d"): (1 + day_offset + _k) for _k in range(len(days))}
+    _fld_e = elig["field"].astype(str).str.upper().str.strip()
+    _nw_e = elig["is_nwaws"].fillna(False) if "is_nwaws" in elig.columns else pd.Series(False, index=elig.index)
+    for (_dk, _bu), _bfld in _booking.items():
+        _bdi = _date2di.get(_dk)
+        if _bdi is None:                       # tanggal booking di luar window planning → lewati
+            continue
+        _sel = elig[(_fld_e == str(_bfld).upper().strip()) & elig["lat"].notna()]
+        if "allow_units" in _sel.columns:      # hormati mapping unit bila ada
+            _sel = _sel[_sel["allow_units"].map(
+                lambda a: (not isinstance(a, (list, tuple))) or (not len(a)) or (_bu in a))]
+        if not len(_sel):
+            continue
+        # Prioritas seed: NW/AWS dulu, lalu urgensi (deadline terdekat). Batasi s/d kapasitas unit.
+        _sel = _sel.assign(_nwkey=~_nw_e.loc[_sel.index]).sort_values(["_nwkey", "urgency"])
+        for _bw in _sel["well"].head(int(max_wells)).tolist():
+            booking_anchors[_bw] = {"unit": _bu, "day_idx": int(_bdi)}
+# Anchor manual (session) menang atas booking; selebihnya booking memaksa field unit-hari.
+route_anchors = {**booking_anchors, **(st.session_state.get("route_anchors", {}) or {})} or None
 
 # ── Cakupan Jadwal: fokuskan ke sumur ber-deadline di rentang terpilih ─────
 # "Hanya"  → sumur di luar rentang dibuang dari kandidat (latihan kapasitas murni).
